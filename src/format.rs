@@ -37,22 +37,69 @@ struct Pe {
     sections: Vec<Section>,
 }
 
+#[derive(Clone, Copy)]
+struct Raw {
+    base: u64,
+    bits: u32,
+}
+
+impl Raw {
+    fn address(self, offset: u64) -> Result<u64, String> {
+        let address = self
+            .base
+            .checked_add(offset)
+            .ok_or("The raw address exceeds the 64-bit address range.")?;
+        if self.bits != 64 && address > u64::from(u32::MAX) {
+            return Err("The raw address exceeds the 32-bit linear address range.".into());
+        }
+        Ok(address)
+    }
+
+    fn offset(self, address: u64) -> Result<u64, String> {
+        if self.bits != 64 && address > u64::from(u32::MAX) {
+            return Err("The raw address exceeds the 32-bit linear address range.".into());
+        }
+        address
+            .checked_sub(self.base)
+            .ok_or_else(|| "The address is below the raw runtime base.".into())
+    }
+}
+
 pub struct Metadata {
     pe: Option<Pe>,
+    raw: Option<Raw>,
 }
 
 impl Metadata {
     pub fn parse(data: &[u8]) -> Result<Self, String> {
         if data.starts_with(b"\x7fELF") {
-            return Ok(Self { pe: None });
+            return Ok(Self {
+                pe: None,
+                raw: None,
+            });
         }
         let pe = pe_header(data)?
             .map(|header| Pe::read(data, header))
             .transpose()?;
-        Ok(Self { pe })
+        Ok(Self { pe, raw: None })
+    }
+
+    pub fn raw(base: u64, bits: u32) -> Result<Self, String> {
+        if !matches!(bits, 16 | 32 | 64) {
+            return Err("Raw x86 code width must be 16, 32, or 64 bits.".into());
+        }
+        let raw = Raw { base, bits };
+        raw.address(0)?;
+        Ok(Self {
+            pe: None,
+            raw: Some(raw),
+        })
     }
 
     pub fn code_address(&self, file_offset: u64) -> Result<(u64, u32), String> {
+        if let Some(raw) = self.raw {
+            return raw.address(file_offset).map(|address| (address, raw.bits));
+        }
         self.validate_code_machine()?;
         match &self.pe {
             Some(pe) => pe
@@ -64,6 +111,13 @@ impl Metadata {
     }
 
     pub fn navigation_address(&self, data: &[u8], file_offset: u64) -> Result<u64, String> {
+        if let Some(raw) = self.raw {
+            let offset = usize::try_from(file_offset)
+                .map_err(|_| "The branch source exceeds the address range.")?;
+            data.get(offset)
+                .ok_or("The branch source is outside the current buffer.")?;
+            return raw.address(file_offset);
+        }
         self.validate_code_machine()?;
         if self.pe.is_some() || data.starts_with(b"MZ") || data.starts_with(b"ZM") {
             return convert_address(data, AddressKind::File, file_offset)?
@@ -78,6 +132,14 @@ impl Metadata {
     }
 
     pub fn navigation_offset(&self, data: &[u8], address: u64) -> Result<u64, String> {
+        if let Some(raw) = self.raw {
+            let offset = raw.offset(address)?;
+            let index = usize::try_from(offset)
+                .map_err(|_| "The branch target exceeds the address range.")?;
+            data.get(index)
+                .ok_or("The branch target is outside the current buffer.")?;
+            return Ok(offset);
+        }
         if self.pe.is_some() || data.starts_with(b"MZ") || data.starts_with(b"ZM") {
             let offset = convert_address(data, AddressKind::Va, address)?
                 .file_offset
@@ -90,6 +152,43 @@ impl Metadata {
         data.get(offset)
             .map(|_| address)
             .ok_or_else(|| "The branch target is outside the current buffer.".into())
+    }
+
+    pub fn convert_address(
+        &self,
+        data: &[u8],
+        kind: AddressKind,
+        value: u64,
+    ) -> Result<PeAddress, String> {
+        let Some(raw) = self.raw else {
+            return convert_address(data, kind, value);
+        };
+        match kind {
+            AddressKind::File => {
+                let file_offset = usize::try_from(value)
+                    .map_err(|_| "The file offset exceeds the address range.")?;
+                data.get(file_offset)
+                    .ok_or("The file offset has no file byte.")?;
+                Ok(PeAddress {
+                    file_offset: Some(file_offset),
+                    rva: None,
+                    va: Some(raw.address(value)?),
+                })
+            }
+            AddressKind::Va => {
+                let offset = raw.offset(value)?;
+                let file_offset = usize::try_from(offset)
+                    .map_err(|_| "The file offset exceeds the address range.")?;
+                data.get(file_offset)
+                    .ok_or("The converted file offset has no file byte.")?;
+                Ok(PeAddress {
+                    file_offset: Some(file_offset),
+                    rva: None,
+                    va: Some(value),
+                })
+            }
+            AddressKind::Rva => Err("Raw address mode has no RVA.".into()),
+        }
     }
 
     fn validate_code_machine(&self) -> Result<(), String> {
@@ -1359,6 +1458,88 @@ mod tests {
         dos[20] = 2;
         dos[22] = 1;
         assert_eq!(entry_point(&dos), Ok(82));
+    }
+
+    #[test]
+    fn explicit_raw_metadata_overrides_pe_and_maps_all_x86_widths() {
+        let data = fixture(false);
+        let parsed = Metadata::parse(&data).unwrap();
+        assert_eq!(parsed.code_address(0x210), Ok((0x40_1010, 32)));
+
+        for (bits, base) in [
+            (16, 0x1000),
+            (32, u64::from(u32::MAX) - data.len() as u64 + 1),
+            (64, u64::MAX - data.len() as u64 + 1),
+        ] {
+            let metadata = Metadata::raw(base, bits).unwrap();
+            assert_eq!(metadata.code_address(0x210), Ok((base + 0x210, bits)));
+            assert_eq!(metadata.navigation_address(&data, 0), Ok(base));
+            assert_eq!(metadata.navigation_offset(&data, base), Ok(0));
+            assert_eq!(
+                metadata.convert_address(&data, AddressKind::File, 0x210),
+                Ok(PeAddress {
+                    file_offset: Some(0x210),
+                    rva: None,
+                    va: Some(base + 0x210),
+                })
+            );
+            assert_eq!(
+                metadata.convert_address(&data, AddressKind::Va, base + 0x210),
+                Ok(PeAddress {
+                    file_offset: Some(0x210),
+                    rva: None,
+                    va: Some(base + 0x210),
+                })
+            );
+            assert!(
+                metadata
+                    .convert_address(&data, AddressKind::Rva, 0)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_raw_metadata_checks_width_overflow_and_file_bounds() {
+        assert!(Metadata::raw(0, 8).is_err());
+        for bits in [16, 32] {
+            let metadata = Metadata::raw(u64::from(u32::MAX), bits).unwrap();
+            assert_eq!(metadata.code_address(0), Ok((u64::from(u32::MAX), bits)));
+            assert!(metadata.code_address(1).is_err());
+            assert!(Metadata::raw(u64::from(u32::MAX) + 1, bits).is_err());
+        }
+        let metadata = Metadata::raw(u64::MAX, 64).unwrap();
+        assert_eq!(metadata.code_address(0), Ok((u64::MAX, 64)));
+        assert!(metadata.code_address(1).is_err());
+
+        let metadata = Metadata::raw(0x1000, 32).unwrap();
+        let mut data = vec![0x90];
+        assert_eq!(metadata.navigation_address(&data, 0), Ok(0x1000));
+        assert_eq!(metadata.navigation_offset(&data, 0x1000), Ok(0));
+        assert!(metadata.navigation_offset(&data, 0x0fff).is_err());
+        assert!(metadata.navigation_address(&data, 1).is_err());
+        assert!(metadata.navigation_offset(&data, 0x1001).is_err());
+        assert!(
+            metadata
+                .convert_address(&data, AddressKind::File, 1)
+                .is_err()
+        );
+        assert!(
+            metadata
+                .convert_address(&data, AddressKind::Va, 0x1001)
+                .is_err()
+        );
+
+        data.push(0xc3);
+        assert_eq!(metadata.navigation_address(&data, 1), Ok(0x1001));
+        assert_eq!(metadata.navigation_offset(&data, 0x1001), Ok(1));
+        data.clear();
+        assert!(metadata.navigation_address(&data, 0).is_err());
+        assert!(
+            metadata
+                .convert_address(&data, AddressKind::File, 0)
+                .is_err()
+        );
     }
 
     #[test]

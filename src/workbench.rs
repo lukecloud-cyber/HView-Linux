@@ -1,4 +1,8 @@
-use crate::{console::Console, editor::Editor, editor::Mode, format, inspect, operations};
+use crate::{
+    console::Console,
+    editor::{ByteOrder, Editor, Mode, RawModel},
+    format, inspect, operations,
+};
 use std::{fs, io};
 
 pub fn jump(view: &mut Editor, offset: usize, rows: usize) {
@@ -68,7 +72,8 @@ pub fn help(console: &Console) -> io::Result<()> {
         " Shift+F7 Next match  Ctrl+F7 Previous match",
         " Code: Enter Follow direct relative branch/call  Backspace Return",
         " Ctrl+T Analysis tools:",
-        "   A  Convert a PE file offset, RVA, or preferred ImageBase VA",
+        "   A  Convert a file offset, RVA, or VA",
+        "   R  Set AUTO or an x86 raw dump model",
         "   S  Browse ASCII and UTF-16 ASCII strings",
         "   P  Browse PE structures and jump to their bytes",
         "   E  Browse the entropy map",
@@ -77,7 +82,7 @@ pub fn help(console: &Console) -> io::Result<()> {
         "   X  Apply a repeating XOR mask in edit mode",
         "   F  Fill a range with a repeating pattern in edit mode",
         " Tools use the current editor buffer, including unsaved edits.",
-        " Address conversion uses the PE preferred ImageBase.",
+        " AUTO uses PE metadata. A raw model uses its runtime base.",
         " Range offsets and lengths use hexadecimal numbers.",
         " Press Esc or Enter to return.",
     ];
@@ -124,12 +129,76 @@ fn address_input(text: &str) -> Result<(format::AddressKind, u64), String> {
     Ok((kind, value))
 }
 
+fn raw_model_input(text: &str) -> Result<Option<RawModel>, String> {
+    const ERROR: &str = "Enter AUTO or X86 16|32|64 LE|BE HEXBASE.";
+    if text == "AUTO" {
+        return Ok(None);
+    }
+    let fields: Vec<_> = text.split(' ').collect();
+    if fields.len() != 4
+        || fields[0] != "X86"
+        || fields[3].is_empty()
+        || !fields[3].bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(ERROR.into());
+    }
+    let bits = match fields[1] {
+        "16" => 16,
+        "32" => 32,
+        "64" => 64,
+        _ => return Err(ERROR.into()),
+    };
+    let byte_order = match fields[2] {
+        "LE" => ByteOrder::Little,
+        "BE" => ByteOrder::Big,
+        _ => return Err(ERROR.into()),
+    };
+    let base = u64::from_str_radix(fields[3], 16)
+        .map_err(|_| "The raw runtime base exceeds the 64-bit address range.".to_string())?;
+    Ok(Some(RawModel {
+        base,
+        bits,
+        byte_order,
+    }))
+}
+
+fn set_raw_model(console: &Console, view: &mut Editor, base: &[String]) -> io::Result<bool> {
+    let Some(input) = console.prompt(base, "Raw model: AUTO or X86 16|32|64 LE|BE HEXBASE")? else {
+        return Ok(false);
+    };
+    let model = match raw_model_input(&input) {
+        Ok(model) => model,
+        Err(error) => {
+            console.modal(base, &error)?;
+            return Ok(false);
+        }
+    };
+    let before = view.raw_model;
+    if let Err(error) = view.set_raw_model(model) {
+        console.modal(base, &error)?;
+        return Ok(false);
+    }
+    Ok(match (before, model) {
+        (None, None) => false,
+        (Some(old), Some(new)) => old.base != new.base || old.bits != new.bits,
+        _ => true,
+    })
+}
+
 fn convert_address(console: &Console, view: &mut Editor, base: &[String]) -> io::Result<()> {
-    let Some(input) = console.prompt(base, "PE address: F file, R RVA, or V VA (hex)")? else {
+    let raw = view.raw_model.is_some();
+    let Some(input) = console.prompt(
+        base,
+        if raw {
+            "RAW address: F file or V VA (hex)"
+        } else {
+            "PE address: F file, R RVA, or V VA (hex)"
+        },
+    )?
+    else {
         return Ok(());
     };
-    let address = address_input(&input)
-        .and_then(|(kind, value)| format::convert_address(&view.data, kind, value));
+    let address = address_input(&input).and_then(|(kind, value)| view.convert_address(kind, value));
     let address = match address {
         Ok(address) => address,
         Err(error) => {
@@ -154,7 +223,11 @@ fn convert_address(console: &Console, view: &mut Editor, base: &[String]) -> io:
         Some(offset) if view.data.get(offset).is_some() => {
             if let Some(offset) = browse(
                 console,
-                "PE address | current buffer, preferred ImageBase",
+                if raw {
+                    "RAW address | current buffer, runtime base"
+                } else {
+                    "PE address | current buffer, preferred ImageBase"
+                },
                 &[(offset, text)],
             )? {
                 jump(view, offset, console.height().saturating_sub(2));
@@ -226,13 +299,14 @@ fn change_range(
     Ok(())
 }
 
-pub fn tools(console: &Console, view: &mut Editor, base: &[String]) -> io::Result<()> {
+pub fn tools(console: &Console, view: &mut Editor, base: &[String]) -> io::Result<bool> {
     let key = loop {
         let (_width, height) = console.dimensions();
         let mut lines = vec![String::new(); height];
         for (line, text) in lines.iter_mut().skip(2).zip([
             " Analysis tools",
-            " A  Address: convert a PE file offset, RVA, or preferred ImageBase VA",
+            " A  Address: convert a file offset, RVA, or VA",
+            " R  Raw model: AUTO or X86 16|32|64 LE|BE HEXBASE",
             " S  Strings: ASCII and UTF-16 ASCII, minimum 4 characters",
             " P  PE structures: sections, directories, imports, exports, overlay",
             " E  Entropy map: locate compressed or repetitive regions",
@@ -250,9 +324,14 @@ pub fn tools(console: &Console, view: &mut Editor, base: &[String]) -> io::Resul
             break key;
         }
     };
+    let mut clear_return_history = false;
     let items = match key.character.to_ascii_uppercase() {
         'A' => {
             convert_address(console, view, base)?;
+            None
+        }
+        'R' => {
+            clear_return_history = set_raw_model(console, view, base)?;
             None
         }
         'S' => {
@@ -290,7 +369,7 @@ pub fn tools(console: &Console, view: &mut Editor, base: &[String]) -> io::Resul
         }
         'D' => {
             let Some(path) = console.prompt(base, "Compare file")? else {
-                return Ok(());
+                return Ok(false);
             };
             match fs::read(path.trim().trim_matches('"')) {
                 Ok(other) => {
@@ -310,10 +389,14 @@ pub fn tools(console: &Console, view: &mut Editor, base: &[String]) -> io::Resul
             }
         }
         'I' => {
-            let rows = inspect::integers(&view.data, view.offset as usize)
-                .into_iter()
-                .map(|text| (view.offset as usize, text))
-                .collect();
+            let rows = inspect::integers(
+                &view.data,
+                view.offset as usize,
+                view.raw_model.map(|model| model.byte_order),
+            )
+            .into_iter()
+            .map(|text| (view.offset as usize, text))
+            .collect();
             Some(("Integers at cursor", rows))
         }
         'X' | 'F' => {
@@ -332,7 +415,7 @@ pub fn tools(console: &Console, view: &mut Editor, base: &[String]) -> io::Resul
     {
         jump(view, offset, console.height().saturating_sub(2));
     }
-    Ok(())
+    Ok(clear_return_history)
 }
 
 #[cfg(test)]
@@ -364,6 +447,30 @@ mod tests {
             "A 400",
         ] {
             assert!(address_input(input).is_err(), "accepted {input:?}");
+        }
+    }
+
+    #[test]
+    fn raw_model_input_requires_the_complete_strict_grammar() {
+        let model = raw_model_input("X86 32 BE 123456789ABCDEF0")
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.base, 0x123456789abcdef0);
+        assert_eq!(model.bits, 32);
+        assert_eq!(model.byte_order, ByteOrder::Big);
+        assert!(raw_model_input("AUTO").unwrap().is_none());
+        for input in [
+            "auto",
+            "AUTO ",
+            "X86 8 LE 0",
+            "X86 16 ME 0",
+            "X86 64 LE 0x10",
+            "X86 64 LE 10 ",
+            "X86  64 LE 10",
+            "X86 64 LE 10000000000000000",
+            "ARM64 64 LE 10",
+        ] {
+            assert!(raw_model_input(input).is_err(), "accepted {input:?}");
         }
     }
 }

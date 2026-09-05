@@ -103,8 +103,12 @@ pub fn entropy_map(data: &[u8], block_size: usize) -> Vec<(usize, String)> {
         .collect()
 }
 
-/// Return integer values that fit at the selected offset.
-pub fn integers(data: &[u8], offset: usize) -> Vec<String> {
+/// Return integer values that fit at the selected offset and byte order.
+pub fn integers(
+    data: &[u8],
+    offset: usize,
+    byte_order: Option<crate::editor::ByteOrder>,
+) -> Vec<String> {
     let Some(tail) = data.get(offset..) else {
         return Vec::new();
     };
@@ -119,17 +123,27 @@ pub fn integers(data: &[u8], offset: usize) -> Vec<String> {
         ($size:literal, $unsigned:ty, $signed:ty) => {
             if let Some(bytes) = tail.get(..$size) {
                 let bytes: [u8; $size] = bytes.try_into().unwrap();
-                for (order, value) in [
-                    ("LE", <$unsigned>::from_le_bytes(bytes)),
-                    ("BE", <$unsigned>::from_be_bytes(bytes)),
+                for (selected_order, order, value) in [
+                    (
+                        crate::editor::ByteOrder::Little,
+                        "LE",
+                        <$unsigned>::from_le_bytes(bytes),
+                    ),
+                    (
+                        crate::editor::ByteOrder::Big,
+                        "BE",
+                        <$unsigned>::from_be_bytes(bytes),
+                    ),
                 ] {
-                    rows.push(format!(
-                        "{}-bit {order}: unsigned {value}, signed {}, hex {:0width$X}",
-                        $size * 8,
-                        value as $signed,
-                        value,
-                        width = $size * 2
-                    ));
+                    if byte_order.is_none_or(|selected| selected == selected_order) {
+                        rows.push(format!(
+                            "{}-bit {order}: unsigned {value}, signed {}, hex {:0width$X}",
+                            $size * 8,
+                            value as $signed,
+                            value,
+                            width = $size * 2
+                        ));
+                    }
                 }
             }
         };
@@ -205,7 +219,8 @@ mod tests {
 
     #[test]
     fn integers_handle_endianness_signed_values_and_bounds() {
-        let rows = integers(&[0xff, 0x80, 0, 0, 0, 0, 0, 0], 0);
+        let data = [0xff, 0x80, 0, 0, 0, 0, 0, 0];
+        let rows = integers(&data, 0, None);
         assert_eq!(rows.len(), 7);
         assert_eq!(rows[0], "8-bit: unsigned 255, signed -1, hex FF");
         assert_eq!(
@@ -214,8 +229,16 @@ mod tests {
         );
         assert_eq!(rows[2], "16-bit BE: unsigned 65408, signed -128, hex FF80");
         assert!(rows[6].contains("signed -36028797018963968"));
-        assert_eq!(integers(&[1, 2, 3], 2).len(), 1);
-        assert!(integers(&[1], 1).is_empty());
-        assert!(integers(&[1], usize::MAX).is_empty());
+        assert_eq!(
+            integers(&data, 0, Some(crate::editor::ByteOrder::Little)).len(),
+            4
+        );
+        assert_eq!(
+            integers(&data, 0, Some(crate::editor::ByteOrder::Big)).len(),
+            4
+        );
+        assert_eq!(integers(&[1, 2, 3], 2, None).len(), 1);
+        assert!(integers(&[1], 1, None).is_empty());
+        assert!(integers(&[1], usize::MAX, None).is_empty());
     }
 }

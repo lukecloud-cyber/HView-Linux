@@ -7,6 +7,28 @@ pub enum Mode {
     Code,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ByteOrder {
+    Little,
+    Big,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawModel {
+    pub base: u64,
+    pub bits: u32,
+    pub byte_order: ByteOrder,
+}
+
+impl RawModel {
+    fn validate(self, file_len: usize) -> Result<(), String> {
+        let last = u64::try_from(file_len.saturating_sub(1))
+            .map_err(|_| "The raw file size exceeds the address range.")?;
+        crate::format::Metadata::raw(self.base, self.bits)?.code_address(last)?;
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum Key {
     Left,
@@ -37,6 +59,7 @@ pub struct Editor {
     pub is_text: bool,
     pub code_bits: u32,
     pub real_mode: bool,
+    pub raw_model: Option<RawModel>,
     pub syntax: crate::decoder::Syntax,
     pub invalid_code_bytes: bool,
     pub opcode_bytes: usize,
@@ -67,6 +90,7 @@ impl Editor {
             is_text: false,
             code_bits: 16,
             real_mode: false,
+            raw_model: None,
             syntax: crate::decoder::Syntax::Intel,
             invalid_code_bytes: false,
             opcode_bytes: 15,
@@ -74,6 +98,47 @@ impl Editor {
             pack_int3: true,
             backup: None,
         }
+    }
+
+    pub fn set_raw_model(&mut self, raw_model: Option<RawModel>) -> Result<(), String> {
+        if let Some(model) = raw_model {
+            model.validate(self.data.len())?;
+        }
+        self.raw_model = raw_model;
+        Ok(())
+    }
+
+    pub fn validate_raw_len(&self, new_len: usize) -> Result<(), String> {
+        if let Some(model) = self.raw_model {
+            model.validate(new_len)?;
+        }
+        Ok(())
+    }
+
+    pub fn decode_bits(&self) -> u32 {
+        self.raw_model.map_or(self.code_bits, |model| model.bits)
+    }
+
+    pub fn decode_real_mode(&self) -> bool {
+        self.raw_model.is_none() && self.real_mode
+    }
+
+    pub fn metadata(&self) -> Result<crate::format::Metadata, String> {
+        match self.raw_model {
+            Some(model) => {
+                self.validate_raw_len(self.data.len())?;
+                crate::format::Metadata::raw(model.base, model.bits)
+            }
+            None => crate::format::Metadata::parse(&self.data),
+        }
+    }
+
+    pub fn convert_address(
+        &self,
+        kind: crate::format::AddressKind,
+        value: u64,
+    ) -> Result<crate::format::PeAddress, String> {
+        self.metadata()?.convert_address(&self.data, kind, value)
     }
 
     pub fn goto(&mut self, offset: u64, rows: usize) {
@@ -141,6 +206,12 @@ impl Editor {
             return Err("The offset exceeds the file size.".into());
         }
         if index == self.data.len() {
+            let new_len = self
+                .data
+                .len()
+                .checked_add(1)
+                .ok_or("The edit buffer exceeds the address range.")?;
+            self.validate_raw_len(new_len)?;
             self.data
                 .try_reserve(1)
                 .map_err(|_| "Cannot allocate the edit buffer.")?;
@@ -468,6 +539,78 @@ mod tests {
         assert_eq!(text_line(b"abcde", 0, 3, false, b"\r\n"), ("abc".into(), 3));
         for byte in 0..=255 {
             assert_ne!(cp437(byte), '\0');
+        }
+    }
+
+    #[test]
+    fn raw_model_is_atomic_and_auto_restores_the_underlying_mode() {
+        let mut editor = Editor::new(vec![0x90, 0xc3], Mode::Code, 0);
+        editor.code_bits = 16;
+        editor.real_mode = true;
+        let raw = RawModel {
+            base: 0x401000,
+            bits: 32,
+            byte_order: ByteOrder::Little,
+        };
+        editor.set_raw_model(Some(raw)).unwrap();
+        assert_eq!(editor.raw_model, Some(raw));
+        assert_eq!(editor.decode_bits(), 32);
+        assert!(!editor.decode_real_mode());
+        assert_eq!(
+            editor.metadata().unwrap().code_address(1),
+            Ok((0x401001, 32))
+        );
+
+        assert!(
+            editor
+                .set_raw_model(Some(RawModel {
+                    base: u64::from(u32::MAX),
+                    bits: 32,
+                    byte_order: ByteOrder::Big,
+                }))
+                .is_err()
+        );
+        assert_eq!(editor.raw_model, Some(raw));
+
+        editor.set_raw_model(None).unwrap();
+        assert_eq!(editor.raw_model, None);
+        assert_eq!(editor.decode_bits(), 16);
+        assert!(editor.decode_real_mode());
+    }
+
+    #[test]
+    fn raw_model_checks_empty_buffers_and_hex_growth_without_mutation() {
+        let mut empty = Editor::new(Vec::new(), Mode::Code, 0);
+        empty
+            .set_raw_model(Some(RawModel {
+                base: u64::from(u32::MAX),
+                bits: 16,
+                byte_order: ByteOrder::Little,
+            }))
+            .unwrap();
+        assert!(
+            empty
+                .convert_address(crate::format::AddressKind::File, 0)
+                .is_err()
+        );
+
+        for (base, bits) in [(u64::from(u32::MAX), 32), (u64::MAX, 64)] {
+            let mut editor = Editor::new(vec![0x90], Mode::Hex, 1);
+            let raw = RawModel {
+                base,
+                bits,
+                byte_order: ByteOrder::Little,
+            };
+            editor.set_raw_model(Some(raw)).unwrap();
+            editor.toggle_edit().unwrap();
+            let before = editor.data.clone();
+
+            assert!(editor.hex_digit('f').is_err());
+            assert_eq!(editor.data, before);
+            assert_eq!(editor.raw_model, Some(raw));
+            assert_eq!(editor.offset, 1);
+            assert!(!editor.low_nibble);
+            assert!(!editor.dirty);
         }
     }
 }

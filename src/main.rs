@@ -74,6 +74,11 @@ fn frame(
         ),
     );
     lines[0] = header.into_iter().collect();
+    if view.raw_model.is_some() {
+        let mut header: Vec<char> = lines[0].chars().collect();
+        put(&mut header, width.saturating_sub(31), "RAW");
+        lines[0] = header.into_iter().collect();
+    }
     if view.mode == Mode::Code
         && let Ok((address, _bits)) = code_address(metadata, view.offset)
     {
@@ -81,15 +86,17 @@ fn frame(
         put(
             &mut code_header,
             width.saturating_sub(40),
-            if view.real_mode {
+            if view.decode_real_mode() {
                 "Real16".to_owned()
             } else {
-                format!("a{}", view.code_bits)
+                format!("a{}", view.decode_bits())
             }
             .as_str(),
         );
-        if address != view.offset {
-            put(&mut code_header, width.saturating_sub(31), "PE");
+        if view.raw_model.is_some() || address != view.offset {
+            if view.raw_model.is_none() {
+                put(&mut code_header, width.saturating_sub(31), "PE");
+            }
             put(
                 &mut code_header,
                 width.saturating_sub(28),
@@ -187,8 +194,13 @@ fn decode_at(
     decoder: &mut Option<decoder::Decoder>,
 ) -> Result<(u64, decoder::Instruction), String> {
     let (address, _) = code_address(metadata, offset)?;
-    let decoded = decoder_for(decoder, view.code_bits, view.syntax, view.real_mode)?
-        .decode(&view.data, offset, address);
+    let decoded = decoder_for(
+        decoder,
+        view.decode_bits(),
+        view.syntax,
+        view.decode_real_mode(),
+    )?
+    .decode(&view.data, offset, address);
     let mut instruction = match decoded {
         Ok(instruction) => instruction,
         Err(_) if view.invalid_code_bytes => {
@@ -233,9 +245,14 @@ fn direct_target_offset(
         .get(start..)
         .filter(|bytes| !bytes.is_empty())
         .ok_or("The branch source is outside the current buffer.")?;
-    let target = decoder_for(decoder, view.code_bits, view.syntax, view.real_mode)?
-        .direct_target(bytes, address)?
-        .ok_or("The instruction has no direct relative branch or call target.")?;
+    let target = decoder_for(
+        decoder,
+        view.decode_bits(),
+        view.syntax,
+        view.decode_real_mode(),
+    )?
+    .direct_target(bytes, address)?
+    .ok_or("The instruction has no direct relative branch or call target.")?;
     metadata.navigation_offset(&view.data, target)
 }
 
@@ -266,8 +283,38 @@ fn assembly_seed(
     metadata: &Result<format::Metadata, String>,
 ) -> Result<String, String> {
     let (address, _) = code_address(metadata, view.offset)?;
-    decoder::decode(&view.data, view.offset, view.code_bits, address)
-        .map(|instruction| instruction.text)
+    decoder::Decoder::with_mode(
+        view.decode_bits(),
+        decoder::Syntax::Intel,
+        view.decode_real_mode(),
+    )?
+    .decode(&view.data, view.offset, address)
+    .map(|instruction| instruction.text)
+}
+
+fn cycle_code_mode(view: &mut Editor) -> Result<(), String> {
+    if let Some(mut model) = view.raw_model {
+        model.bits = match model.bits {
+            16 => 32,
+            32 => 64,
+            _ => 16,
+        };
+        return view.set_raw_model(Some(model));
+    }
+    if view.real_mode {
+        view.real_mode = false;
+        view.code_bits = 16;
+    } else {
+        match view.code_bits {
+            16 => view.code_bits = 32,
+            32 => view.code_bits = 64,
+            _ => {
+                view.code_bits = 16;
+                view.real_mode = true;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn code_rows(
@@ -536,7 +583,7 @@ fn open_editor(
     let mut writable = false;
     let mut decoder = None;
     loop {
-        let metadata = format::Metadata::parse(&view.data);
+        let metadata = view.metadata();
         let lines = frame(
             &view,
             &path,
@@ -582,7 +629,9 @@ fn open_editor(
             continue;
         }
         if ctrl && key.code == 84 {
-            workbench::tools(console, &mut view, &lines)?;
+            if workbench::tools(console, &mut view, &lines)? {
+                return_history.clear();
+            }
             step_history.clear();
             continue;
         }
@@ -731,7 +780,7 @@ fn open_editor(
                 }
             }
             13 | 113 if view.editing && view.mode == Mode::Code => loop {
-                let metadata = format::Metadata::parse(&view.data);
+                let metadata = view.metadata();
                 let lines = frame(
                     &view,
                     &path,
@@ -746,13 +795,19 @@ fn open_editor(
                     break;
                 };
                 let assembled = code_address(&metadata, view.offset)
-                    .and_then(|(address, _)| assembler::assemble(&text, view.code_bits, address));
-                match assembled {
-                    Ok(bytes) => {
+                    .and_then(|(address, _)| {
+                        assembler::assemble(&text, view.decode_bits(), address)
+                    })
+                    .and_then(|bytes| {
                         let start = view.offset as usize;
-                        let end = start.checked_add(bytes.len()).ok_or_else(|| {
-                            io::Error::other("The instruction exceeds the address range.")
-                        })?;
+                        let end = start
+                            .checked_add(bytes.len())
+                            .ok_or("The instruction exceeds the address range.")?;
+                        view.validate_raw_len(view.data.len().max(end))?;
+                        Ok((bytes, start, end))
+                    });
+                match assembled {
+                    Ok((bytes, start, end)) => {
                         if end > view.data.len() {
                             view.data.resize(end, 0);
                         }
@@ -792,12 +847,24 @@ fn open_editor(
                 if let Some(mode) = console.prompt(&lines, "Mode: T Text, H Hex, C Code")? {
                     match mode.to_ascii_uppercase().as_str() {
                         "T" | "1" => {
+                            let raw_model = view.raw_model;
+                            let code_bits = view.code_bits;
+                            let real_mode = view.real_mode;
                             view = new_view(view.data, Mode::Text, view.offset, config)
-                                .map_err(io::Error::other)?
+                                .map_err(io::Error::other)?;
+                            view.code_bits = code_bits;
+                            view.real_mode = real_mode;
+                            view.set_raw_model(raw_model).map_err(io::Error::other)?;
                         }
                         "H" | "2" => {
+                            let raw_model = view.raw_model;
+                            let code_bits = view.code_bits;
+                            let real_mode = view.real_mode;
                             view = new_view(view.data, Mode::Hex, view.offset, config)
                                 .map_err(io::Error::other)?;
+                            view.code_bits = code_bits;
+                            view.real_mode = real_mode;
+                            view.set_raw_model(raw_model).map_err(io::Error::other)?;
                             view.goto(view.offset, console.height().saturating_sub(2));
                         }
                         "C" | "3" => {
@@ -813,22 +880,16 @@ fn open_editor(
                 && view.mode == Mode::Code
                 && key.character.eq_ignore_ascii_case(&'o') =>
             {
-                if view.real_mode {
-                    view.real_mode = false;
-                    view.code_bits = 16;
-                } else {
-                    match view.code_bits {
-                        16 => view.code_bits = 32,
-                        32 => view.code_bits = 64,
-                        _ => {
-                            view.code_bits = 16;
-                            view.real_mode = true;
-                        }
+                match cycle_code_mode(&mut view) {
+                    Ok(()) => {
+                        decoder = None;
+                        step_history.clear();
+                        return_history.clear();
+                    }
+                    Err(error) => {
+                        console.modal(&lines, &error)?;
                     }
                 }
-                decoder = None;
-                step_history.clear();
-                return_history.clear();
             }
             116 if !view.editing => {
                 if let Some(value) = console.prompt(&lines, "Goto")? {
@@ -1260,6 +1321,19 @@ mod tests {
         view.invalid_code_bytes = true;
         let metadata = format::Metadata::parse(&view.data);
         assert!(direct_target_offset(&view, &metadata, &mut decoder).is_err());
+
+        let mut view = Editor::new(vec![0xeb, 2, 0x90, 0x90, 0xc3], Mode::Code, 0);
+        view.code_bits = 16;
+        view.real_mode = true;
+        view.set_raw_model(Some(editor::RawModel {
+            base: 0x10000,
+            bits: 32,
+            byte_order: editor::ByteOrder::Little,
+        }))
+        .unwrap();
+        let metadata = view.metadata();
+        assert_eq!(direct_target_offset(&view, &metadata, &mut decoder), Ok(4));
+        assert!(!view.decode_real_mode());
     }
 
     #[test]
@@ -1295,12 +1369,51 @@ mod tests {
 
     #[test]
     fn assembly_seed_stays_intel_with_att_display() {
-        let mut view = Editor::new(vec![0x89, 0xd8], Mode::Code, 0);
-        view.code_bits = 32;
+        let mut view = Editor::new(vec![0x48, 0x89, 0xd8], Mode::Code, 0);
+        view.code_bits = 16;
+        view.real_mode = true;
         view.syntax = decoder::Syntax::Att;
-        let seed = assembly_seed(&view, &format::Metadata::parse(&view.data)).unwrap();
-        assert!(seed.contains("eax, ebx"));
+        view.set_raw_model(Some(editor::RawModel {
+            base: 0x1_0000_0000,
+            bits: 64,
+            byte_order: editor::ByteOrder::Little,
+        }))
+        .unwrap();
+        let seed = assembly_seed(&view, &view.metadata()).unwrap();
+        assert!(seed.contains("rax, rbx"));
         assert!(!seed.contains('%'));
+    }
+
+    #[test]
+    fn raw_width_cycle_is_separate_from_the_underlying_real16_mode() {
+        let mut view = Editor::new(vec![0x90], Mode::Code, 0);
+        view.code_bits = 16;
+        view.real_mode = true;
+        view.set_raw_model(Some(editor::RawModel {
+            base: 0x1000,
+            bits: 32,
+            byte_order: editor::ByteOrder::Big,
+        }))
+        .unwrap();
+
+        cycle_code_mode(&mut view).unwrap();
+        assert_eq!(view.decode_bits(), 64);
+        cycle_code_mode(&mut view).unwrap();
+        assert_eq!(view.decode_bits(), 16);
+        assert!(!view.decode_real_mode());
+        view.set_raw_model(None).unwrap();
+        assert_eq!(view.decode_bits(), 16);
+        assert!(view.decode_real_mode());
+
+        view.set_raw_model(Some(editor::RawModel {
+            base: u64::from(u32::MAX) + 1,
+            bits: 64,
+            byte_order: editor::ByteOrder::Little,
+        }))
+        .unwrap();
+        let before = view.raw_model;
+        assert!(cycle_code_mode(&mut view).is_err());
+        assert_eq!(view.raw_model, before);
     }
 
     #[test]

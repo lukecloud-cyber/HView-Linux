@@ -10,12 +10,12 @@ Read [UPSTREAM_REVIEW.md](UPSTREAM_REVIEW.md) for the subsequent Windows D04 thr
 
 - Completed: project analysis, repository rename, branch creation, plan, and tracker.
 - Application implementation: the original D03 release passed all six phases and Astra review.
-- Active work: prepare the reviewed D04 direct-navigation candidate.
+- Active work: prepare the D05 raw address model for Astra review.
 - Core owner: `sol_linux_baseline` owns source adapters, fixtures, core tests, and terminal checks.
 - Native owner: `native_package` owns `lib`, package scripts, native probes, and native metadata.
 - Save owner: `save_backend` owns `src/save.rs` and its inline tests.
-- Next task: have Astra review the exact D04 candidate commit.
-- Next acceptance check: have Astra review the exact D04 candidate commit.
+- Next task: have Astra review the exact D05 candidate commit.
+- Next acceptance check: close all D05 review findings before D06 starts.
 - Upstream review: Windows `a3b7240` supplies the approved D04 through D07 source baseline.
 - Application blockers: none confirmed.
 - Current branch: `rust-rewrite`.
@@ -116,8 +116,8 @@ Finish each stage before dependent source changes.
 
 | ID | Task | Status | Evidence |
 |---|---|---|---|
-| D04 | Direct branch navigation, checked targets, return history, and F5 history correction | Implemented | Group targets, syntax, Real16, checked PE machines and mappings, raw/ELF, 256 returns, and F5 clearing pass; Astra recheck remains |
-| D05 | Transient raw runtime base, x86 width, integer byte order, and checked growth | Pending | Depends on D04 address handling |
+| D04 | Direct branch navigation, checked targets, return history, and F5 history correction | Complete | Astra accepted `1793755`; unit and PTY checks pass group targets, mappings, machines, syntax, Real16, histories, and F5 clearing |
+| D05 | Transient raw runtime base, x86 width, integer byte order, and checked growth | Implemented | Raw/AUTO, checked mappings, widths, byte order, growth, transient state, and Real16 separation pass 76 unit tests and the PTY probe; Astra review remains |
 | D06 | Nonmutating assembly preview with exact-byte confirmation | Pending | Depends on the D05 address model |
 | D07 | Grouped operation undo/redo with record and byte limits | Pending | Includes confirmed D06 patches, hexadecimal edits, fill, and XOR |
 | EXT-VERIFY | Final regression suite, isolated package, documentation, and Astra acceptance | Pending | Run against the complete D07 extension |
@@ -174,6 +174,7 @@ These results do not establish Linux feature parity.
 | `python3 tests/macro_probe.py target/release/hview-linux` | Passed macro, delay, modifier, notice, alias, prompt, and edit workflows |
 | `python3 tests/linux_behavior_probe.py target/release/hview-linux` | Passed Code cycling, Real16, fallback, sessions, syntax, and raw ELF workflows |
 | `python3 tests/navigation_probe.py target/release/hview-linux` | Passed direct branch, return, refusal, mapping, syntax, Real16, mode, and edited-byte workflows in 18.2 seconds |
+| `python3 tests/raw_model_probe.py target/release/hview-linux` | Passed raw grammar, bounds, mapping, widths, byte order, history, transient state, AUTO, session, syntax, assembly, and growth workflows in 19.0 seconds |
 | Six application probes against one release build | Terminal, file, reliability, analysis, macro, and Linux behavior probes passed |
 | Final isolated package | `/home/sweet_cicero/Projects/HView-Linux/target/packages/hview-linux-x86_64-5febcd4`; executable SHA-256 `e0ebf155b1392a955aa1b2d941120889ef4e2511ebf6824a65e116ea696e12c7` |
 | Final release benchmark | Raw median/p95 24180/26064 ns; PE median/p95 29850/31273 ns |
@@ -190,6 +191,8 @@ The Astra Phase 5 review passed at commit `5febcd48d5d71642fd4d6eca7bd67ff273e14
 The Astra Phase 6 and final parity review passed at the same accepted source commit.
 The D04 unit candidate has 70 passing tests and one ignored manual benchmark.
 The D04 navigation probe passes supported and unsupported PE machines, checked mappings, direct targets, and return history.
+The D05 candidate has 76 passing tests and one ignored manual benchmark.
+The affected navigation, analysis, reliability, and Linux behavior probes pass with the D05 release build.
 The advisory-lock, final-rename race, and power-loss limits remain explicit in `src/save.rs`.
 The Phase 4 probe SHA-256 was `bbd48e8a94d359c47618a8f053fbed91870f4bef4381593a856c9379841de90c`.
 The redraw benchmark used 28 rows, five warmups, ten batches, and five preparations per batch.
