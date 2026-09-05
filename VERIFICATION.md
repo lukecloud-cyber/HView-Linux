@@ -12,7 +12,13 @@ See `TRACKER.md` for both hosted run links.
 
 The approved extension adds D04 through D07 from Windows commit `a3b7240ae0288be383f16135fe6a2f31427fc95c`.
 Astra accepted D04 at `1793755`, D05 at `04e5610`, and D06 at `d447c4d`.
-D07 and final extension verification remain active. The original package does not contain these extension functions.
+Astra accepted D07 at `5e4ef682cda663f5f64c0700c6268c16d3850447`.
+The extension package passed every application probe, native hash check, isolation check, and missing-library check.
+The extension package is `target/packages/hview-linux-x86_64-5e4ef68`.
+The extension executable SHA-256 is `b55b91b7d3f0735a0980bf57909b83ddef41bf5388041d4e51f5700c39d8c964`.
+The extension passes formatting, 83 Rust tests, strict Clippy, a fresh release build, and the native self-test.
+The manual decoder preparation benchmark also passed.
+Final Astra package and matrix acceptance remains pending.
 
 ## Commands
 
@@ -46,7 +52,7 @@ The matrix uses these evidence names.
 | NOP and INT3 packing | `src/main.rs` `decode_at` and `code_rows` | Unit `code_packing_respects_limits_and_settings` |
 | Hex editing | `src/editor.rs` `hex_digit`; `src/main.rs` edit input | Unit `recovered_editor_contract`; Reliability |
 | Edit cancellation | `src/editor.rs` `cancel_edit` | Unit `recovered_editor_contract`; Reliability; Analysis |
-| Operation undo and redo | `src/editor.rs` edit records; `src/main.rs` edit input; `src/workbench.rs` transforms | D07 acceptance pending; replaces original current-byte undo |
+| Operation undo and redo | `src/editor.rs` edit records; `src/main.rs` edit input; `src/workbench.rs` transforms | Unit grouping, limits, raw redo, dirty state, and atomic refusal; History; Reliability |
 | Assembly | `src/assembler.rs`; `src/main.rs` `assembly_seed` and edit workflow | Unit `assembler_vectors_and_errors` and `assembly_seed_stays_intel_with_att_display`; Reliability |
 | Replacement save | `src/save.rs` `replace` | Nine `src/save.rs` unit checks; Reliability |
 | Save As | `src/save.rs` `save_as`; `src/main.rs` target switch | Unit `save_as_uses_atomic_destination_refusal`; Reliability |
@@ -91,6 +97,7 @@ The matrix uses these evidence names.
 | Code Enter | Enter and Ctrl+M share a terminal byte. Both follow branches outside editing. F4 and M select modes. | Navigation; Macro |
 | Raw and Real16 | Explicit raw width overrides AUTO. Raw 16-bit mode uses linear addresses and does not use Real16. | Raw; Navigation; Linux |
 | Preview dimensions | The complete summary must fit before Apply. Resize and input checks use current terminal dimensions. | Patch, including immediate resize with Enter |
+| Edit history keys | F3/Ctrl+Z undo during editing. Shift+F3/Ctrl+Y redo. Resize preserves hexadecimal grouping. | Unit input checks; History; Macro |
 | Save operations | Linux staging preserves supported metadata and uses atomic publication operations. | Nine save unit checks; Reliability |
 
 ## Documented limits

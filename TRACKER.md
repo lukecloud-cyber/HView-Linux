@@ -10,12 +10,12 @@ Read [UPSTREAM_REVIEW.md](UPSTREAM_REVIEW.md) for the subsequent Windows D04 thr
 
 - Completed: project analysis, repository rename, branch creation, plan, and tracker.
 - Application implementation: the original D03 release passed all six phases and Astra review.
-- Active work: prepare the verified D07 edit history for Astra review.
+- Active work: obtain final Astra acceptance and publish the extension.
 - Core owner: `sol_linux_baseline` owns source adapters, fixtures, core tests, and terminal checks.
 - Native owner: `native_package` owns `lib`, package scripts, native probes, and native metadata.
 - Save owner: `save_backend` owns `src/save.rs` and its inline tests.
-- Next task: commit the exact D07 candidate and request Astra review.
-- Next acceptance check: have Astra review the exact D07 candidate commit.
+- Next task: record final Astra acceptance or required corrections before publication.
+- Next acceptance check: Astra must review the final extension package and matrix.
 - Upstream review: Windows `a3b7240` supplies the approved D04 through D07 source baseline.
 - Application blockers: none confirmed.
 - Current branch: `rust-rewrite`.
@@ -119,8 +119,8 @@ Finish each stage before dependent source changes.
 | D04 | Direct branch navigation, checked targets, return history, and F5 history correction | Complete | Astra accepted `1793755`; unit and PTY checks pass group targets, mappings, machines, syntax, Real16, histories, and F5 clearing |
 | D05 | Transient raw runtime base, x86 width, integer byte order, and checked growth | Complete | Astra accepted `04e5610`; raw/AUTO, mapping, widths, byte order, growth, transient state, sessions, and Real16 separation pass |
 | D06 | Nonmutating assembly preview with exact-byte confirmation | Complete | Astra accepted `d447c4d`; exact bytes, strict decoding, Real16, raw bounds, wrapping, resize gates, cancellation, and Apply passed |
-| D07 | Grouped operation undo/redo with record and byte limits | Implemented | Grouped hexadecimal edits, assembly, Fill, XOR, limits, shortcuts, failures, save resets, and cancellation pass unit and PTY checks; Astra review remains |
-| EXT-VERIFY | Final regression suite, isolated package, documentation, and Astra acceptance | Pending | Run against the complete D07 extension |
+| D07 | Grouped operation undo/redo with record and byte limits | Complete | Astra accepted `5e4ef68`; grouping, all record types, both limits, atomic refusal, raw redo, shortcuts, save resets, and failures pass |
+| EXT-VERIFY | Final regression suite, isolated package, documentation, and Astra acceptance | Implemented | All local checks and the isolated package passed at `5e4ef68`; final Astra matrix review remains |
 
 ## Completed planning and setup
 
@@ -198,6 +198,22 @@ The D04 navigation probe passes supported and unsupported PE machines, checked m
 The D05 candidate has 76 passing tests and one ignored manual benchmark.
 The affected navigation, analysis, reliability, and Linux behavior probes pass with the D05 release build.
 The D04 through D06 documentation passed Astra review at commit `ff71600`.
+The D07 implementation candidate is `5e4ef682cda663f5f64c0700c6268c16d3850447`.
+The candidate passes 83 Rust tests and all ten application probes.
+Astra accepted D07 at this candidate after independent source, history, limit, raw redo, and terminal checks.
+The fresh extension package passed all ten application probes with its packaged executable.
+Native hashes, ELF tags, isolated loading, and missing-library checks also passed.
+The package is `/home/sweet_cicero/Projects/HView-Linux/target/packages/hview-linux-x86_64-5e4ef68`.
+The executable SHA-256 is `b55b91b7d3f0735a0980bf57909b83ddef41bf5388041d4e51f5700c39d8c964`.
+The command was `python3 scripts/package.py target/packages/hview-linux-x86_64-5e4ef68`.
+Real editor operations verify 256-record eviction, combined 64-MiB byte eviction, and oversized-edit rejection without state changes.
+The final manual benchmark passed with 28 rows, five warmups, ten batches, and five preparations per batch.
+Raw median/p95 was 53361/90678 ns. PE median/p95 was 100642/102425 ns.
+These measurements do not establish a controlled comparison with the original D03 timing results.
+
+Astra found that a resize with Enter could apply a patch after the preview became too small.
+Commit `d447c4d` checks terminal dimensions again after input. Escape retains priority during a simultaneous resize.
+The patch probe and Astra's independent immediate-resize check passed after the correction.
 The advisory-lock, final-rename race, and power-loss limits remain explicit in `src/save.rs`.
 The Phase 4 probe SHA-256 was `bbd48e8a94d359c47618a8f053fbed91870f4bef4381593a856c9379841de90c`.
 The redraw benchmark used 28 rows, five warmups, ten batches, and five preparations per batch.
