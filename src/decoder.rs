@@ -2,7 +2,7 @@ use crate::native::Library;
 use std::ffi::{CStr, c_char, c_void};
 use std::fmt::Write;
 
-// Pinned Zydis 1ba75ae marks these mnemonics as protected-mode only.
+// Pinned Zydis 1ba75ae marks at least one definition for each name as protected-only.
 const REAL16_PROTECTED: [&str; 41] = [
     "arpl",
     "clgi",
@@ -235,7 +235,7 @@ impl Decoder {
                         .unwrap_or(&mnemonic)
                 };
                 if self.real_mode
-                    && (REAL16_PROTECTED.contains(&canonical)
+                    && (real16_protected(bytes, size, canonical)
                         || real16_vector(bytes, size, canonical))
                 {
                     Err(invalid_instruction(offset))
@@ -290,6 +290,19 @@ fn real16_vector(bytes: &[u8], size: usize, mnemonic: &str) -> bool {
         (Some(0x8f), name) => name != "pop",
         _ => false,
     }
+}
+
+fn real16_protected(bytes: &[u8], size: usize, mnemonic: &str) -> bool {
+    // Zydis permits the register VMWRITE definition and rejects its memory definition in Real16.
+    if mnemonic == "vmwrite"
+        && bytes
+            .get(..size)
+            .and_then(|bytes| bytes.last())
+            .is_some_and(|byte| byte & 0xc0 == 0xc0)
+    {
+        return false;
+    }
+    REAL16_PROTECTED.contains(&mnemonic)
 }
 
 impl Drop for Decoder {
@@ -390,6 +403,18 @@ mod tests {
             ] {
                 assert!(decoder.decode(bytes, 0, 0).is_err());
             }
+            for bytes in [&[0x0f, 0x79, 0xc0][..], &[0x67, 0x0f, 0x79, 0xc0]] {
+                assert!(
+                    decoder
+                        .decode(bytes, 0, 0)
+                        .unwrap()
+                        .text
+                        .contains("vmwrite")
+                );
+            }
+            for bytes in [&[0x0f, 0x79, 0x00][..], &[0x67, 0x0f, 0x79, 0x00]] {
+                assert!(decoder.decode(bytes, 0, 0).is_err());
+            }
         }
         for (bytes, name) in [
             (&[0xc4, 0x00][..], "les"),
@@ -432,5 +457,24 @@ mod tests {
             .decode(&[0xea, 0x34, 0x12, 0x78, 0x56], 0, 0x10000)
             .unwrap();
         assert!(far.text.ends_with("0x5678:0x1234"));
+        for (bytes, target) in [
+            (&[0x66, 0xeb, 0xfe][..], "0x1"),
+            (&[0xf2, 0xeb, 0xfe], "0x1"),
+            (&[0x2e, 0xeb, 0xfe], "0x1"),
+            (&[0x67, 0xe3, 0xfe], "0x1"),
+            (&[0x66, 0xe8, 0xfc, 0xff, 0xff, 0xff], "0x2"),
+            (&[0x66, 0x0f, 0x84, 0xff, 0xff, 0xff, 0xff], "0x6"),
+            (&[0x66, 0xc7, 0xf8, 0, 0, 0, 0], "0x7"),
+        ] {
+            for decoder in [&real, &att] {
+                assert!(
+                    decoder
+                        .decode(bytes, 0, 0x10000)
+                        .unwrap()
+                        .text
+                        .ends_with(target)
+                );
+            }
+        }
     }
 }

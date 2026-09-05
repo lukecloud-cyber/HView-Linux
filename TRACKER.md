@@ -3,17 +3,18 @@
 Last update: September 5, 2026.
 Read this file first when a session resumes.
 Read [PLAN.md](PLAN.md) for the complete requirements and source references.
+Read [VERIFICATION.md](VERIFICATION.md) for the final function and Linux-difference matrix.
 
 ## Current state
 
 - Completed: project analysis, repository rename, branch creation, plan, and tracker.
 - Application implementation: Phases 1 through 4 passed Astra review.
-- Active work: the stable Phase 5 candidate and its Astra review.
+- Active work: the Phase 5 VMWRITE correction and final Astra review.
 - Core owner: `sol_linux_baseline` owns source adapters, fixtures, core tests, and terminal checks.
 - Native owner: `native_package` owns `lib`, package scripts, native probes, and native metadata.
 - Save owner: `save_backend` owns `src/save.rs` and its inline tests.
-- Next task: create the stable Phase 5 review commit.
-- Next acceptance check: have Astra review the exact Phase 5 commit.
+- Next task: commit the VMWRITE correction and replayable oracle evidence.
+- Next acceptance check: have Astra review the corrected Phase 5 commit.
 - Application blockers: none confirmed.
 - Current branch: `rust-rewrite`.
 - Project folder: `/home/sweet_cicero/Projects/HView-Linux`.
@@ -67,7 +68,7 @@ Use the Evidence column for implementation locations, checks, and review results
 | P1-02 | Foundation | Add Linux terminal input, frame output, resizing, and state restoration | Complete | PTY passed restoration, idle resize, small help, prompts, key input, CP437, and safe rendering; Astra accepted |
 | P1-03 | Foundation | Add native library loading, version checks, and missing-library behavior | Complete | Self-test and isolated package probe passed; native static review and Astra Phase 1 review passed |
 | P1-04 | Foundation | Connect Text and Hex display, navigation, wrapping, tabs, and CP437 rendering | Complete | PTY passed Text and Hex without native libraries; Astra accepted |
-| P1-05 | Foundation | Connect 16/32/64-bit Code display, movement, decoder reuse, and NOP/INT3 packing | Complete | Native unit and PTY Code checks passed; Astra accepted |
+| P1-05 | Foundation | Connect 16/32/64-bit Code display, movement, decoder reuse, and NOP/INT3 packing | Complete | Native Code checks passed; the focused packing test covers both bytes, settings, and the 15-byte limit; Astra accepted |
 | P1-06 | Foundation | Connect help and prompts; check empty files, EOF, small terminals, and error exits | Complete | Empty-file, invalid-option, small-terminal, and saved-state checks passed; Astra accepted |
 | P2-01 | File workflow | Add Linux arguments, absolute paths, option boundaries, and startup offset selection | Complete | GNU and legacy options; help without a TTY; strict UTF-8 argument error; Astra accepted `cd476bd` |
 | P2-02 | File workflow | Add file picker, multiple files, next/previous selection, masks, and safe recursion | Complete | Picker, view restoration, recursion, Unicode paths, and symlink-cycle checks passed; Astra accepted |
@@ -91,13 +92,13 @@ Use the Evidence column for implementation locations, checks, and review results
 | P5-02 | Macros | Verify long-delay cancellation and preservation of queued input | Implemented | The macro probe passed maximum-delay cancellation and preserved queued prompt input |
 | P5-03 | Linux behavior | Add reachable key alternatives and Linux shortcuts without prompt/edit conflicts | Implemented | The macro probe passed Ctrl+S, Ctrl+Q, M, Enter, O, H/J/K/L, prompt, and edit conflicts |
 | P5-04 | Syntax | Add Intel/AT&T configuration; verify Intel defaults, explicit AT&T, and invalid-setting errors | Implemented | `DisassemblySyntax` tests pass; assembly input and prompt seeds remain Intel |
-| P5-05 | Linux behavior | Retain verified real-mode decoding and optional invalid-byte display | Implemented | Pinned Zydis corpus and Linux behavior probe passed Real16, strict errors, and `InvalidCode=Byte` |
+| P5-05 | Linux behavior | Retain verified real-mode decoding and optional invalid-byte display | Implemented | Replayable pinned Zydis corpus checks register and memory VMWRITE, targets, strict errors, and `InvalidCode=Byte` |
 | P5-06 | Linux behavior | Permit raw ELF Code viewing without claiming ELF structure or address support | Implemented | Linux behavior probe passed raw ELF Code decoding; PE-only address operations still reject ELF |
 | P6-01 | Release | Add Linux packaging, native provenance, hashes, notices, and native self-test | Implemented | Isolated package build, file hashes, ELF checks, and missing-library checks passed |
-| P6-02 | Release | Add Linux CI, user documentation, and installation instructions | Pending | None |
-| P6-03 | Verification | Pass formatting, Rust tests, strict Clippy, and a fresh release build | Implemented | Format passed; 64 tests passed; strict Clippy passed; release build passed |
+| P6-02 | Release | Add Linux CI, user documentation, and installation instructions | Implemented | Release documentation and CI exist at `bc918c9`; Astra review remains |
+| P6-03 | Verification | Pass formatting, Rust tests, strict Clippy, and a fresh release build | Implemented | Format passed; 65 tests passed; strict Clippy passed; release build passed |
 | P6-04 | Verification | Pass terminal, recovery, session, macro, and native-library integration checks | Implemented | Six application probes passed together; final package and review checks remain |
-| P6-05 | Verification | Verify package isolation, missing libraries, and decoder preparation measurements | Implemented | Package isolation passed; release benchmark measured raw and PE redraw preparation |
+| P6-05 | Verification | Verify package isolation, missing libraries, and decoder preparation measurements | Implemented | Package isolation passed; latest raw median/p95 was 24628/26935 ns; PE was 30263/35727 ns |
 | P6-06 | Final review | Have Astra check every function-matrix row and all documented Linux differences | Pending | None |
 
 ## Completed planning and setup
@@ -145,7 +146,8 @@ These results do not establish Linux feature parity.
 | `cargo test --locked --release d01_redraw_preparation_benchmark -- --ignored --nocapture --test-threads=1` | Passed; raw median 23833 ns and PE median 29062 ns |
 | Temporary pinned Zydis C17 oracle | Built commit `1ba75ae` with Zycore `1401fb8`; the finite Real16 corpus passed |
 | Generated Zydis protected-mode extraction | Returned the exact required set of 41 mnemonics |
-| `cargo test --locked -- --test-threads=1` | 64 passed; one manual benchmark ignored for the Phase 5 candidate |
+| Tracked Zydis oracle replay | Built the tracked C harness; emitted 216 rows; exact 41-name extraction passed |
+| `cargo test --locked --all-targets -- --test-threads=1` | 65 passed; one manual benchmark ignored for the corrected Phase 5 candidate |
 | `cargo clippy --locked --all-targets -- -D warnings` | Passed for the Phase 5 candidate |
 | `cargo build --locked --release` | Passed for the Phase 5 candidate |
 | `python3 tests/macro_probe.py target/release/hview-linux` | Passed macro, delay, modifier, notice, alias, prompt, and edit workflows |
@@ -170,10 +172,13 @@ Real16 now filters the complete protected-mode set and vector encodings.
 Real16 preserves LES, LDS, BOUND, POP, MOV control-register instructions, and far pointers.
 The session keeps the legacy 16-bit width and stores a versioned 24-file Real16 bitmap.
 The session refuses Real16 persistence when unknown data occupies the extension area.
+The Real16 policy preserves register VMWRITE and rejects memory VMWRITE.
+The tracked harness records formatter targets and numeric target differences.
 
 Astra found that Ctrl-modified macro letters could insert printable text.
 The input adapter now gives Ctrl-modified macro letters control characters and keeps their action codes.
 Focused edit and prompt workflows pass with the corrected input adapter.
+The macro probe labels now match the imported Shift and Alt modifier bits.
 
 The Phase 2 candidate adds GNU options and keeps explicit legacy forms.
 The native configuration format uses `[HView-Linux 1]`, UTF-8, and LF line endings.

@@ -16,9 +16,9 @@ F3 = b"\x1b[13~"
 F9 = b"\x1b[20~"
 RIGHT = 0xFF4D
 F7 = 0xFF41
-ALT_F7 = 0xFF5A
+SHIFT_F7 = 0xFF5A
 CTRL_F7 = 0xFF64
-SHIFT_F7 = 0xFF6E
+ALT_F7 = 0xFF6E
 
 
 def macro_file(
@@ -118,9 +118,9 @@ def main() -> None:
                 [
                     (2, CTRL_F7),
                     (0, ord("x")),
-                    (4, ALT_F7),
+                    (4, SHIFT_F7),
                     (0, ord("x")),
-                    (1, SHIFT_F7),
+                    (1, ALT_F7),
                 ]
             )
         )
@@ -131,11 +131,11 @@ def main() -> None:
         )
         repeat_notice = b"Press F7 to enter a search pattern first."
         if output.count(repeat_notice) != 2:
-            raise AssertionError("The Ctrl and Alt macro modifiers did not run F7 repeat.")
+            raise AssertionError("The Ctrl and Shift macro modifiers did not run F7 repeat.")
         require(
             output,
             b"ASCII: _",
-            "The Shift macro modifier did not run the F7 search prompt.",
+            "The Alt macro modifier did not run the F7 search prompt.",
         )
 
         notice_file = root / "notice.mac"

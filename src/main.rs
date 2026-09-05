@@ -1173,6 +1173,33 @@ mod tests {
     }
 
     #[test]
+    fn code_packing_respects_limits_and_settings() {
+        for byte in [0x90, 0xcc] {
+            let mut view = Editor::new(vec![byte; 20], Mode::Code, 0);
+            let metadata = format::Metadata::parse(&view.data);
+            let mut decoder = None;
+            let packed = decode_at(&view, 0, &metadata, &mut decoder).unwrap().1;
+            assert_eq!((packed.size, packed.hex.len()), (15, 30));
+            assert_eq!(
+                decode_at(&view, 15, &metadata, &mut decoder)
+                    .unwrap()
+                    .1
+                    .size,
+                5
+            );
+            if byte == 0x90 {
+                view.pack_nops = false;
+            } else {
+                view.pack_int3 = false;
+            }
+            assert_eq!(
+                decode_at(&view, 0, &metadata, &mut decoder).unwrap().1.size,
+                1
+            );
+        }
+    }
+
+    #[test]
     fn restored_paths_reject_windows_syntax() {
         assert_eq!(
             restored_path("/tmp/file.bin").unwrap(),
