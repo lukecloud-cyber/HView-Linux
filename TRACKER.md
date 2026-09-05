@@ -7,13 +7,13 @@ Read [PLAN.md](PLAN.md) for the complete requirements and source references.
 ## Current state
 
 - Completed: project analysis, repository rename, branch creation, plan, and tracker.
-- Application implementation: Phase 1 passed Astra review.
-- Active work: the independent Phase 4 analysis probe.
+- Application implementation: Phase 1 passed Astra review; Phase 2 has a tested candidate.
+- Active work: Phase 2 review; the independent Phase 4 analysis probe.
 - Core owner: `sol_linux_baseline` owns source adapters, fixtures, core tests, and terminal checks.
 - Native owner: `native_package` owns `lib`, package scripts, native probes, and native metadata.
 - Save owner: `save_backend` owns `src/save.rs` and its inline tests.
-- Next task: continue the assigned next-phase implementation work.
-- Next acceptance check: run focused checks for the next implemented task.
+- Next task: complete Astra review of the stable Phase 2 candidate.
+- Next acceptance check: rerun required checks after Astra review.
 - Application blockers: none confirmed.
 - Current branch: `rust-rewrite`.
 - Project folder: `/home/sweet_cicero/Projects/HView-Linux`.
@@ -69,12 +69,12 @@ Use the Evidence column for implementation locations, checks, and review results
 | P1-04 | Foundation | Connect Text and Hex display, navigation, wrapping, tabs, and CP437 rendering | Complete | PTY passed Text and Hex without native libraries; Astra accepted |
 | P1-05 | Foundation | Connect 16/32/64-bit Code display, movement, decoder reuse, and NOP/INT3 packing | Complete | Native unit and PTY Code checks passed; Astra accepted |
 | P1-06 | Foundation | Connect help and prompts; check empty files, EOF, small terminals, and error exits | Complete | Empty-file, invalid-option, small-terminal, and saved-state checks passed; Astra accepted |
-| P2-01 | File workflow | Add Linux arguments, absolute paths, option boundaries, and startup offset selection | Active | Absolute paths and `--` have tests; complete Unicode argument work remains |
-| P2-02 | File workflow | Add file picker, multiple files, next/previous selection, masks, and safe recursion | Active | Linux picker and wildcard traversal exist; symlink-cycle test passes; focused review remains |
-| P2-03 | Configuration | Port configuration parsing and discovery; preserve implemented legacy settings | Active | Imported parser runs; Linux default names and focused discovery checks remain |
+| P2-01 | File workflow | Add Linux arguments, absolute paths, option boundaries, and startup offset selection | Implemented | GNU and legacy options; help without a TTY; strict UTF-8 argument error; native offset PTY checks passed |
+| P2-02 | File workflow | Add file picker, multiple files, next/previous selection, masks, and safe recursion | Implemented | Picker, restart, previous-file, recursion, Unicode path, hyphen path, and symlink-cycle checks passed |
+| P2-03 | Configuration | Port configuration parsing and discovery; preserve implemented legacy settings | Implemented | Native LF/UTF-8 header; sibling, XDG, portable, and explicit precedence checks passed; legacy fixtures pass |
 | P2-04 | Configuration | Replace Windows text detection; verify unsupported-text errors and Hex/Code fallback | Implemented | BOM and UTF-16 heuristic tests pass; Hex and Code fallback remains available |
-| P2-05 | Sessions | Port save/restore, active file, view settings, capacity checks, and Linux path handling | Active | Legacy fixtures pass and zero-file sessions fail; Linux Unicode path work remains |
-| P2-06 | Sessions | Preserve compressed imports, checksums, and unknown payloads; reject empty or invalid sessions | Pending | None |
+| P2-05 | Sessions | Port save/restore, active file, view settings, capacity checks, and Linux path handling | Implemented | Session publication, picker synchronization, active-file restart, 1..24 capacity, and path-limit checks passed |
+| P2-06 | Sessions | Preserve compressed imports, checksums, and unknown payloads; reject empty or invalid sessions | Implemented | Legacy compressed fixtures, checksum failures, zero counts, truncation, and unknown payload retention pass |
 | P3-01 | Editing | Connect nibble edits, EOF extension, current-byte undo, and edit cancellation | Pending | None |
 | P3-02 | Editing | Port Intel assembly, address-aware encoding, and buffer extension | Pending | None |
 | P3-03 | Recovery | Add replacement saves, content/identity checks, original backups, and failure recovery | Implemented | `src/save.rs`; Astra accepted the backend after nine strict Btrfs tests |
@@ -131,15 +131,25 @@ These results do not establish Linux feature parity.
 | Check | Result |
 |---|---|
 | `cargo test -- --test-threads=1` | 54 passed; one manual benchmark ignored |
-| `cargo clippy --all-targets --all-features -- -D warnings` | Passed |
-| `cargo fmt --all -- --check` | Passed |
-| `cargo build --release` | Passed |
+| `cargo clippy --locked --all-targets -- -D warnings` | Passed for the Phase 2 candidate |
+| `cargo fmt --all -- --check` | Passed for the Phase 2 candidate |
+| `cargo clean && cargo build --locked --release` | Passed for the Phase 2 candidate |
 | `target/release/hview-linux --self-test` | Passed 16-bit, 32-bit, and 64-bit native checks |
 | `python3 tests/terminal_probe.py target/release/hview-linux` | Passed all Phase 1 PTY checks |
 | `python3 scripts/package.py /tmp/hview-linux-phase1-package-1788619612135433605` | Package and isolated native checks passed |
+| `cargo test --locked -- --test-threads=1` | 59 passed; one manual benchmark ignored for the Phase 2 candidate |
+| `python3 tests/file_workflow_probe.py target/release/hview-linux` | Passed native options, configuration, files, macros, and session workflows |
 
 These checks ran on Linux x86-64 with Rust 1.98.0.
 The Astra Phase 1 review passed at commit `77d4236bc355cdca517c094a45d3a12c766eaef1`.
+
+The Phase 2 candidate adds GNU options and keeps explicit legacy forms.
+The native configuration format uses `[HView-Linux 1]`, UTF-8, and LF line endings.
+Configuration lookup uses an explicit path, an executable sibling, and then XDG configuration.
+Portable mode stops lookup after the executable sibling.
+The candidate keeps legacy CRLF parsing and legacy numeric behavior.
+The saved format still permits 1 to 24 ASCII paths with fewer than 260 bytes.
+Windows saved paths now fail with a Linux path error.
 
 Astra found incomplete CP437 output and idle resize handling.
 The candidate now preserves all CP437 cells and redraws after idle resize.

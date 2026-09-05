@@ -1,4 +1,15 @@
-pub const USAGE: &str = "  hview-linux [options] [/s][filemask]...[/s][filemask]\n\t/O[thc]=[.]offset[th]|OEP|END\n\t/SAV=<save-file>\n\t/INI=<ini-file>\n\t/MACRO0=<macro-file>\n\t-- ends options";
+pub const USAGE: &str = "Usage: hview-linux [options] [--] [filemask ...]\n\
+  --mode text|hex|code   Select the initial view mode.\n\
+  --offset HEX           Start at a file offset.\n\
+  --virtual HEX          Start at a PE virtual address.\n\
+  --entry-point          Start at the PE entry point.\n\
+  --end                  Start at the final byte.\n\
+  --config PATH          Read a configuration file.\n\
+  --session PATH         Read or write a session file.\n\
+  --macro PATH           Play a macro file.\n\
+  --recursive            Recurse for following file masks.\n\
+  --help                  Show this help.\n\
+Legacy /O, /SAV, /INI, /MACRO0, and /s forms remain available.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliError {
@@ -54,8 +65,10 @@ pub struct Options {
     pub ini_file: Option<String>,
     pub macro_file: Option<String>,
     pub offset: Option<Offset>,
+    pub mode: Option<u8>,
     pub file_masks: Vec<FileMask>,
     pub flags: u32,
+    pub help: bool,
 }
 
 fn legacy_option(arg: &str) -> bool {
@@ -72,18 +85,107 @@ fn legacy_option(arg: &str) -> bool {
             && (bytes.len() == 2 || bytes.get(2) == Some(&b'=') || bytes.get(3) == Some(&b'=')))
 }
 
+fn option_value<'a>(
+    args: &'a [String],
+    index: &mut usize,
+    argument: &'a str,
+    name: &str,
+) -> Result<&'a str, CliError> {
+    if argument == name {
+        *index += 1;
+        return args
+            .get(*index)
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or(CliError::InvalidOption);
+    }
+    argument
+        .strip_prefix(name)
+        .and_then(|value| value.strip_prefix('='))
+        .filter(|value| !value.is_empty())
+        .ok_or(CliError::InvalidOption)
+}
+
+fn native_mode(value: &str) -> Result<u8, CliError> {
+    if value.eq_ignore_ascii_case("text") {
+        Ok(1)
+    } else if value.eq_ignore_ascii_case("hex") {
+        Ok(2)
+    } else if value.eq_ignore_ascii_case("code") {
+        Ok(3)
+    } else {
+        Err(CliError::InvalidOption)
+    }
+}
+
+fn native_number(value: &str) -> Result<u64, CliError> {
+    let digits = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(CliError::InvalidOption);
+    }
+    u64::from_str_radix(digits, 16).map_err(|_| CliError::InvalidOption)
+}
+
 /// Parse arguments after the executable name.
 pub fn parse(args: &[String]) -> Result<Options, CliError> {
     let mut options = Options::default();
     let mut recursive = false;
     let mut files_only = false;
-    for (index, arg) in args.iter().enumerate() {
-        if arg.len() >= 260 {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if legacy_option(arg) && arg.len() >= 260 {
             return Err(CliError::ArgumentTooLong);
         }
         let bytes = arg.as_bytes();
         if arg == "--" && !files_only {
             files_only = true;
+        } else if !files_only && matches!(arg.as_str(), "-h" | "--help") {
+            options.help = true;
+        } else if !files_only && matches!(arg.as_str(), "-r" | "--recursive") {
+            recursive = true;
+        } else if !files_only && (arg == "--mode" || arg.starts_with("--mode=")) {
+            options.mode = Some(native_mode(option_value(args, &mut index, arg, "--mode")?)?);
+        } else if !files_only && (arg == "--offset" || arg.starts_with("--offset=")) {
+            let value = native_number(option_value(args, &mut index, arg, "--offset")?)?;
+            options.offset = Some(Offset {
+                mode: options.mode.unwrap_or(0),
+                target: OffsetTarget::File(value),
+            });
+            options.flags |= 16;
+        } else if !files_only && (arg == "--virtual" || arg.starts_with("--virtual=")) {
+            let value = native_number(option_value(args, &mut index, arg, "--virtual")?)?;
+            options.offset = Some(Offset {
+                mode: options.mode.unwrap_or(0),
+                target: OffsetTarget::Virtual(value),
+            });
+            options.flags |= 16;
+        } else if !files_only && arg == "--entry-point" {
+            options.offset = Some(Offset {
+                mode: options.mode.unwrap_or(0),
+                target: OffsetTarget::EntryPoint,
+            });
+            options.flags |= 16;
+        } else if !files_only && arg == "--end" {
+            options.offset = Some(Offset {
+                mode: options.mode.unwrap_or(0),
+                target: OffsetTarget::End,
+            });
+            options.flags |= 16;
+        } else if !files_only && (arg == "--config" || arg.starts_with("--config=")) {
+            options.ini_file = Some(option_value(args, &mut index, arg, "--config")?.into());
+            options.flags |= 2;
+        } else if !files_only && (arg == "--session" || arg.starts_with("--session=")) {
+            options.save_file = Some(option_value(args, &mut index, arg, "--session")?.into());
+            options.flags |= 1;
+        } else if !files_only && (arg == "--macro" || arg.starts_with("--macro=")) {
+            options.macro_file = Some(option_value(args, &mut index, arg, "--macro")?.into());
+            options.flags |= 8;
+        } else if !files_only && arg.starts_with('-') {
+            return Err(CliError::InvalidOption);
         } else if files_only || !arg.starts_with('/') || !legacy_option(arg) {
             options.file_masks.push(FileMask {
                 pattern: arg.clone(),
@@ -105,10 +207,18 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
         } else if bytes.get(1).is_some_and(|byte| byte & 0x5f == b'O') {
             let mode = options.offset.as_ref().map_or(0, |offset| offset.mode);
             options.offset = Some(parse_offset(&bytes[2..], mode)?);
+            if options
+                .offset
+                .as_ref()
+                .is_some_and(|offset| offset.mode != 0)
+            {
+                options.mode = options.offset.as_ref().map(|offset| offset.mode);
+            }
             options.flags |= 16;
         } else {
             return Err(CliError::InvalidOption);
         }
+        index += 1;
     }
     Ok(options)
 }
@@ -297,8 +407,11 @@ mod tests {
         assert_eq!(paths.file_masks[1].pattern, "/opt/sample.bin");
         assert_eq!(paths.file_masks[2].pattern, "/other/file.bin");
         assert_eq!(paths.file_masks[3].pattern, "/s");
-        assert!(parse(&["x".repeat(259)]).is_ok());
-        assert_eq!(parse(&["x".repeat(260)]), Err(CliError::ArgumentTooLong));
+        assert!(parse(&["x".repeat(260)]).is_ok());
+        assert_eq!(
+            parse(&[format!("/SAV={}", "x".repeat(260))]),
+            Err(CliError::ArgumentTooLong)
+        );
         for arg in ["/O=", "/O=garbage"] {
             assert_eq!(
                 parse(&[arg.to_owned()]).unwrap().offset.unwrap().target,
@@ -312,6 +425,62 @@ mod tests {
         };
         assert!(!mask.has_wildcard());
         assert_eq!(mask.split(), ("C:\\a*\\", "literal"));
+    }
+
+    #[test]
+    fn native_options_are_explicit_and_strict() {
+        let options = parse(
+            &[
+                "--mode=code",
+                "--offset",
+                "0x20",
+                "--config=config.ini",
+                "--session",
+                "state.sav",
+                "--macro=keys.mac",
+                "--recursive",
+                "*.bin",
+                "--",
+                "-literal.bin",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(options.mode, Some(3));
+        assert_eq!(
+            options.offset,
+            Some(Offset {
+                mode: 3,
+                target: OffsetTarget::File(0x20)
+            })
+        );
+        assert_eq!(options.ini_file.as_deref(), Some("config.ini"));
+        assert_eq!(options.save_file.as_deref(), Some("state.sav"));
+        assert_eq!(options.macro_file.as_deref(), Some("keys.mac"));
+        assert!(options.file_masks[0].recursive);
+        assert_eq!(options.file_masks[1].pattern, "-literal.bin");
+
+        for arguments in [
+            vec!["--mode=bytes"],
+            vec!["--offset=10junk"],
+            vec!["--virtual"],
+            vec!["--unknown"],
+            vec!["-literal.bin"],
+        ] {
+            assert_eq!(
+                parse(&arguments.into_iter().map(str::to_owned).collect::<Vec<_>>()),
+                Err(CliError::InvalidOption)
+            );
+        }
+        assert!(parse(&["--help".into()]).unwrap().help);
+        assert_eq!(
+            parse(&["--virtual=10".into()])
+                .unwrap()
+                .offset
+                .unwrap()
+                .target,
+            OffsetTarget::Virtual(0x10)
+        );
     }
 
     #[test]

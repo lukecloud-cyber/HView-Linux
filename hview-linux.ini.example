@@ -1,0 +1,15 @@
+[HView-Linux 1]
+StartMode=Text
+Wrap=Auto
+Tab=Auto
+LineFeed=Auto
+AutoCodeSize=On
+DefaultCodeSize=16
+DisassemblySyntax=Intel
+OpcodeShowBytes=15
+HexDelimiterChar=0x2D
+ShowOffset=Local
+PackNops=On
+PackInt3=On
+SaveFileAtExit=Off
+SaveFile="hview-linux.sav"

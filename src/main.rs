@@ -342,6 +342,17 @@ fn new_view(
     config.new_view(data, mode, offset)
 }
 
+fn restored_path(text: &str) -> Result<PathBuf, String> {
+    let bytes = text.as_bytes();
+    let drive = bytes.get(1) == Some(&b':') && bytes.first().is_some_and(u8::is_ascii_alphabetic);
+    if drive || text.contains('\\') {
+        return Err(format!(
+            "The saved path uses Windows syntax and cannot open on Linux: {text}"
+        ));
+    }
+    Ok(PathBuf::from(text))
+}
+
 enum EditorAction {
     Quit,
     Next,
@@ -372,10 +383,11 @@ fn open_editor(
         }
         Err(error) => return Err(error),
     };
-    let mode = match saved_view
+    let selected_mode = saved_view
         .map(|state| state.mode as u8)
-        .unwrap_or_else(|| options.offset.as_ref().map_or(0, |offset| offset.mode))
-    {
+        .or(options.mode)
+        .unwrap_or_else(|| options.offset.as_ref().map_or(0, |offset| offset.mode));
+    let mode = match selected_mode {
         1 => Mode::Text,
         2 => Mode::Hex,
         3 => Mode::Code,
@@ -769,10 +781,8 @@ fn open_editor(
 }
 
 fn run() -> io::Result<()> {
-    if std::env::args_os()
-        .skip(1)
-        .eq([std::ffi::OsStr::new("--self-test")])
-    {
+    let raw_args: Vec<_> = std::env::args_os().skip(1).collect();
+    if raw_args == [std::ffi::OsString::from("--self-test")] {
         for (bits, text, bytes) in [
             (16, "ret", &[0xc3][..]),
             (32, "nop", &[0x90][..]),
@@ -787,6 +797,19 @@ fn run() -> io::Result<()> {
         println!("Native self-test passed.");
         return Ok(());
     }
+    let args: Vec<String> = raw_args
+        .into_iter()
+        .map(|argument| {
+            argument
+                .into_string()
+                .map_err(|_| io::Error::other("A command argument is not valid UTF-8."))
+        })
+        .collect::<io::Result<_>>()?;
+    let options = cli::parse(&args).map_err(|error| io::Error::other(error.to_string()))?;
+    if options.help {
+        println!("{}", cli::USAGE);
+        return Ok(());
+    }
     if console::redirected() {
         return Err(io::Error::other(
             "HView-Linux needs an interactive terminal.",
@@ -794,15 +817,19 @@ fn run() -> io::Result<()> {
     }
     let console = Console::new()?;
     let executable = std::env::current_exe()?;
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let options = cli::parse(&args).map_err(|error| io::Error::other(error.to_string()))?;
-    let ini = options
-        .ini_file
-        .as_ref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| executable.with_file_name("hview-linux.ini"));
-    let config = if options.ini_file.is_some() || ini.is_file() {
-        config::load(&ini).map_err(io::Error::other)?
+    let portable = std::env::var_os("HVIEW_PORTABLE").as_deref() == Some(std::ffi::OsStr::new("1"));
+    let ini = options.ini_file.as_ref().map(PathBuf::from).or_else(|| {
+        config::configuration_paths(
+            &executable,
+            portable,
+            std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        )
+        .into_iter()
+        .find(|path| path.is_file())
+    });
+    let config = if let Some(path) = ini {
+        config::load(&path).map_err(io::Error::other)?
     } else {
         config::Config::default()
     };
@@ -811,7 +838,8 @@ fn run() -> io::Result<()> {
         .as_ref()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(&config.savefile));
-    let saved_bytes = if config.savefile_at_exit || options.save_file.is_some() {
+    let session_enabled = config.savefile_at_exit || options.save_file.is_some();
+    let saved_bytes = if session_enabled {
         match fs::read(&save_path) {
             Ok(bytes) => Some(bytes),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -821,7 +849,7 @@ fn run() -> io::Result<()> {
         None
     };
     let mut saved_state =
-        if options.file_masks.is_empty() && options.save_file.is_some() && saved_bytes.is_some() {
+        if options.file_masks.is_empty() && session_enabled && saved_bytes.is_some() {
             Some(config::parse_saved(saved_bytes.as_deref().unwrap()).map_err(io::Error::other)?)
         } else {
             None
@@ -840,8 +868,17 @@ fn run() -> io::Result<()> {
         state
             .files
             .iter()
-            .map(|file| PathBuf::from(&file.path))
-            .collect()
+            .map(|file| {
+                let path = restored_path(&file.path).map_err(io::Error::other)?;
+                if !path.is_file() {
+                    return Err(io::Error::other(format!(
+                        "The saved file does not exist on Linux: {}",
+                        path.display()
+                    )));
+                }
+                Ok(path)
+            })
+            .collect::<io::Result<Vec<_>>>()?
     } else if options.file_masks.is_empty() {
         match select_file(&console, std::env::current_dir()?)? {
             Some(path) => vec![path],
@@ -884,7 +921,7 @@ fn run() -> io::Result<()> {
             } else {
                 None
             },
-            saved_state.is_some() || config.savefile_at_exit,
+            session_enabled,
         )?;
         if let Some((path, view)) = view {
             paths[index] = path;
@@ -899,7 +936,7 @@ fn run() -> io::Result<()> {
                         .map_err(io::Error::other)?;
                 }
                 state.update_view(index, &view).map_err(io::Error::other)?;
-            } else if config.savefile_at_exit {
+            } else if session_enabled {
                 saved_state = Some(
                     config::SavedState::new_files(&paths, index, &view, &config)
                         .map_err(io::Error::other)?,
@@ -919,10 +956,10 @@ fn run() -> io::Result<()> {
                             .is_some_and(|target| p.canonicalize().ok().as_ref() == Some(target))
                 }) {
                     index = found;
-                } else if (saved_state.is_some() || config.savefile_at_exit) && paths.len() >= 24 {
+                } else if session_enabled && paths.len() >= 24 {
                     console.modal(&[], "A save state supports no more than 24 files.")?;
                 } else {
-                    if (saved_state.is_some() || config.savefile_at_exit)
+                    if session_enabled
                         && let Err(error) =
                             config::SavedState::validate_path(path.to_str().unwrap_or("\0"))
                     {
@@ -935,9 +972,7 @@ fn run() -> io::Result<()> {
             }
         }
     }
-    if config.savefile_at_exit
-        && let Some(state) = saved_state
-    {
+    if session_enabled && let Some(state) = saved_state {
         let bytes = config::encode_saved(&state.payload).map_err(io::Error::other)?;
         if let Some(before) = saved_bytes {
             save::replace(&save_path, &before, &bytes)?;
@@ -1070,5 +1105,15 @@ mod tests {
         let seed = assembly_seed(&view, &format::Metadata::parse(&view.data)).unwrap();
         assert!(seed.contains("eax, ebx"));
         assert!(!seed.contains('%'));
+    }
+
+    #[test]
+    fn restored_paths_reject_windows_syntax() {
+        assert_eq!(
+            restored_path("/tmp/file.bin").unwrap(),
+            Path::new("/tmp/file.bin")
+        );
+        assert!(restored_path("C:\\file.bin").is_err());
+        assert!(restored_path("folder\\file.bin").is_err());
     }
 }

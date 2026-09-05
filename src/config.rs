@@ -1,6 +1,8 @@
-use std::path::Path;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 
 const SAVE_HEADER: &[u8; 16] = b"HViewSav\0\x04\0\0\0\0\x08\x20";
+const NATIVE_INI_HEADER: &str = "[HView-Linux 1]";
 // These signatures permit imports from the frozen legacy INI and SAV formats.
 const LEGACY_INI_HEADER: &[u8] = &[
     0x5b, 0x48, 0x69, 0x65, 0x77, 0x49, 0x6e, 0x69, 0x20, 0x35, 0x2e, 0x30, 0x33, 0x5d,
@@ -205,14 +207,61 @@ pub fn load(path: &Path) -> Result<Config, String> {
     parse(&data)
 }
 
+pub fn configuration_paths(
+    executable: &Path,
+    portable: bool,
+    xdg_config_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Vec<PathBuf> {
+    let mut paths = vec![executable.with_file_name("hview-linux.ini")];
+    if portable {
+        return paths;
+    }
+    if let Some(root) = xdg_config_home.filter(|root| !root.is_empty()) {
+        paths.push(PathBuf::from(root).join("hview-linux/config.ini"));
+    } else if let Some(root) = home.filter(|root| !root.is_empty()) {
+        paths.push(PathBuf::from(root).join(".config/hview-linux/config.ini"));
+    }
+    paths
+}
+
 pub fn parse(data: &[u8]) -> Result<Config, String> {
-    let text: String = data.iter().map(|&byte| byte as char).collect();
+    let native = data.starts_with(NATIVE_INI_HEADER.as_bytes());
+    if !native
+        && data
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| *byte == b'\n' && (index == 0 || data[index - 1] != b'\r'))
+    {
+        return Err(
+            "ini-file (line 0): Use [HView-Linux 1] for UTF-8 and LF configuration files.".into(),
+        );
+    }
+    let text = if native {
+        std::str::from_utf8(data)
+            .map_err(|_| "configuration (line 0): The file is not valid UTF-8.".to_owned())?
+            .to_owned()
+    } else {
+        data.iter().map(|&byte| byte as char).collect()
+    };
+    if native && text.contains('\0') {
+        return Err("configuration (line 0): The file contains a null character.".into());
+    }
     let mut config = Config::default();
     let mut header = false;
     // The original reader splits physical lines only at CRLF. An isolated LF ends the parsed text.
-    for (index, physical) in text.split("\r\n").enumerate() {
+    let physical_lines: Vec<&str> = if native {
+        text.split('\n').collect()
+    } else {
+        text.split("\r\n").collect()
+    };
+    for (index, physical) in physical_lines.into_iter().enumerate() {
         let line_no = index + 1;
-        let physical = physical.split(['\r', '\n', '\0']).next().unwrap_or("");
+        let physical = if native {
+            physical.strip_suffix('\r').unwrap_or(physical)
+        } else {
+            physical.split(['\r', '\n', '\0']).next().unwrap_or("")
+        };
         let mut quoted = false;
         let end = physical
             .char_indices()
@@ -227,9 +276,17 @@ pub fn parse(data: &[u8]) -> Result<Config, String> {
         if line.is_empty() {
             continue;
         }
-        let error = |reason: &str| format!("ini-file (line {line_no}): {reason}");
+        let error = |reason: &str| {
+            let name = if native { "configuration" } else { "ini-file" };
+            format!("{name} (line {line_no}): {reason}")
+        };
         if !header {
-            if line != "[HViewIni 5.03]" && line.as_bytes() != LEGACY_INI_HEADER {
+            let valid = if native {
+                line == NATIVE_INI_HEADER
+            } else {
+                line == "[HViewIni 5.03]" || line.as_bytes() == LEGACY_INI_HEADER
+            };
+            if !valid {
                 return Err(error("Invalid header"));
             }
             header = true;
@@ -347,10 +404,10 @@ pub fn parse(data: &[u8]) -> Result<Config, String> {
                 if end + 1 != value.len() {
                     return Err(error("Syntax error"));
                 }
-                if end - 1 > 260 {
+                if !native && end - 1 > 260 {
                     return Err(error("Illegal value"));
                 }
-                if !value[1..end].is_ascii() {
+                if !native && !value[1..end].is_ascii() {
                     return Err(error("Non-ASCII save paths are not reconstructed."));
                 }
                 config.savefile = value[1..end].into();
@@ -359,7 +416,8 @@ pub fn parse(data: &[u8]) -> Result<Config, String> {
         }
     }
     if !header {
-        return Err("ini-file (line 0): Invalid header".into());
+        let name = if native { "configuration" } else { "ini-file" };
+        return Err(format!("{name} (line 0): Invalid header"));
     }
     Ok(config)
 }
@@ -818,11 +876,10 @@ mod tests {
             ),
             ("Hex", 16, b'|', 3)
         );
-        assert_eq!(
+        assert!(
             parse(b"[HViewIni 5.03]\nStartMode=Hex\n")
-                .unwrap()
-                .start_mode,
-            "Text"
+                .unwrap_err()
+                .contains("HView-Linux 1")
         );
         assert_eq!(
             parse(b"[HViewIni 5.03]\r\nStartMode=Hex\r\nStartMode=Text")
@@ -888,6 +945,55 @@ mod tests {
         let config = parse(b"[HViewIni 5.03]\r\nDisassemblySyntax=ATT").unwrap();
         assert_eq!(config.disassembly_syntax, crate::decoder::Syntax::Att);
         assert!(parse(b"[HViewIni 5.03]\r\nDisassemblySyntax=MASM").is_err());
+    }
+
+    #[test]
+    fn native_configuration_uses_utf8_and_lf() {
+        let config = parse(
+            "[HView-Linux 1]\nStartMode=Code\nDisassemblySyntax=ATT\nSaveFile=\"résumé.sav\"\n"
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(config.start_mode, "Code");
+        assert_eq!(config.disassembly_syntax, crate::decoder::Syntax::Att);
+        assert_eq!(config.savefile, "résumé.sav");
+        assert!(parse(b"[HView-Linux 1]\nDisassemblySyntax=MASM\n").is_err());
+        let mut invalid = b"[HView-Linux 1]\n;".to_vec();
+        invalid.push(0xff);
+        assert!(parse(&invalid).unwrap_err().contains("valid UTF-8"));
+    }
+
+    #[test]
+    fn configuration_paths_use_defined_precedence() {
+        let executable = Path::new("/opt/hview-linux/bin/hview-linux");
+        assert_eq!(
+            configuration_paths(
+                executable,
+                false,
+                Some(OsStr::new("/xdg")),
+                Some(OsStr::new("/home/user")),
+            ),
+            [
+                PathBuf::from("/opt/hview-linux/bin/hview-linux.ini"),
+                PathBuf::from("/xdg/hview-linux/config.ini"),
+            ]
+        );
+        assert_eq!(
+            configuration_paths(executable, false, None, Some(OsStr::new("/home/user"))),
+            [
+                PathBuf::from("/opt/hview-linux/bin/hview-linux.ini"),
+                PathBuf::from("/home/user/.config/hview-linux/config.ini"),
+            ]
+        );
+        assert_eq!(
+            configuration_paths(
+                executable,
+                true,
+                Some(OsStr::new("/xdg")),
+                Some(OsStr::new("/home/user")),
+            ),
+            [PathBuf::from("/opt/hview-linux/bin/hview-linux.ini")]
+        );
     }
 
     #[test]
@@ -1007,6 +1113,31 @@ mod tests {
         assert_eq!(parsed.files[1].offset, 64);
         assert_eq!(parsed.files[1].mode, 2);
         assert!(SavedState::new_files(&[], 0, &view, &Config::default()).is_err());
+    }
+
+    #[test]
+    fn saved_state_accepts_one_to_twenty_four_files() {
+        use crate::editor::{Editor, Mode};
+        let config = Config::default();
+        let view = Editor::new(vec![0], Mode::Hex, 0);
+        let mut state = SavedState::new_single("file-00.bin", &view, &config).unwrap();
+        for index in 1..24 {
+            state
+                .add_file(&format!("file-{index:02}.bin"), &view, &config)
+                .unwrap();
+        }
+        for count in 1..=24 {
+            put32(&mut state.payload, 4, count);
+            assert_eq!(
+                parse_saved(&encode_saved(&state.payload).unwrap())
+                    .unwrap()
+                    .files
+                    .len(),
+                count as usize
+            );
+        }
+        put32(&mut state.payload, 4, 24);
+        assert!(state.add_file("file-24.bin", &view, &config).is_err());
     }
 
     #[test]
