@@ -10,11 +10,11 @@ Read [UPSTREAM_REVIEW.md](UPSTREAM_REVIEW.md) for the subsequent Windows D04 thr
 
 - Completed: project analysis, repository rename, branch creation, plan, and tracker.
 - Application implementation: the original D03 release and the D04 through D07 extension passed all required checks and Astra review.
-- Active work: publish the accepted extension and check hosted CI.
+- Active work: none. The approved extension is complete and published.
 - Source owner: Sol xhigh completed all implementation and test tasks.
 - Checker: Astra High accepted source `5e4ef68` and the final package.
 - Record owner: the main task maintains final verification and publication evidence.
-- Next task: push the accepted branch and record the remote hash and hosted CI result.
+- Next task: wait for a new user request before adding backlog functions.
 - Remaining application work: none within the approved scope.
 - Upstream review: Windows `a3b7240` supplies the approved D04 through D07 source baseline.
 - Application blockers: none confirmed.
@@ -121,6 +121,15 @@ Finish each stage before dependent source changes.
 | D06 | Nonmutating assembly preview with exact-byte confirmation | Complete | Astra accepted `d447c4d`; exact bytes, strict decoding, Real16, raw bounds, wrapping, resize gates, cancellation, and Apply passed |
 | D07 | Grouped operation undo/redo with record and byte limits | Complete | Astra accepted `5e4ef68`; grouping, all record types, both limits, atomic refusal, raw redo, shortcuts, save resets, and failures pass |
 | EXT-VERIFY | Final regression suite, isolated package, documentation, and Astra acceptance | Complete | Astra accepted source `5e4ef68`, records `56484b0`, all matrix rows, Linux differences, and the isolated package |
+
+### Extension publication
+
+The push published `72c68bf5d8c2bdf9d21aca449390a1a71ae0ad08` to `origin/rust-rewrite`.
+The remote hash matched after publication. The application source remains the accepted `5e4ef68` source.
+The Windows reference remains clean at `a3b7240`. The Linux default branch remains `main`.
+Hosted CI passed for [72c68bf](https://github.com/lukecloud-cyber/HView-Linux/actions/runs/33989620026).
+The hosted run passed formatting, 83 Rust tests, strict Clippy, release/native checks, ten application probes, and the isolated package.
+The final publication record changes documentation only. The accepted application source and checked package remain unchanged.
 
 ## Completed planning and setup
 
@@ -289,7 +298,7 @@ The findings and limits above remain the persistent evidence summary.
 8. Run the required checks for that task.
 9. Record results and the next action in this tracker.
 
-Current resume action: check publication and hosted CI evidence before selecting any new work.
+Current resume action: read the completed extension and publication evidence before selecting new work.
 The approved application scope is complete. D08 and later backlog items require a new user request.
 
 ## Subsequent Windows update review

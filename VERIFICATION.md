@@ -20,6 +20,7 @@ The extension passes formatting, 83 Rust tests, strict Clippy, a fresh release b
 The manual decoder preparation benchmark also passed.
 Astra accepted the final package, complete matrix, and Linux differences after reviewing records at `56484b0`.
 Astra independently reran the package probe and verified the executable hash and packaged README.
+Hosted CI passed the complete extension checks for [72c68bf](https://github.com/lukecloud-cyber/HView-Linux/actions/runs/33989620026).
 
 ## Commands
 
