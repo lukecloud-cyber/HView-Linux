@@ -12,6 +12,10 @@ Install Rust 1.98.0 and Cargo to build the application. Install Python 3, `binut
 
 The repository contains the required Capstone and Keystone shared libraries. The build does not require a system installation of these libraries.
 
+The current checked package references GLIBC_2.34 as its highest glibc symbol version. Later builds can change this measured floor.
+
+The package needs compatible system `libc`, dynamic loader, `libgcc_s`, `libm`, and `libstdc++` libraries. This GNU package does not support musl-only systems.
+
 ## Build and run
 
 Build the release executable from the locked dependencies:
