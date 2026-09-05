@@ -146,7 +146,7 @@ These results do not establish Linux feature parity.
 | `cargo test --locked --release d01_redraw_preparation_benchmark -- --ignored --nocapture --test-threads=1` | Passed; raw median 23833 ns and PE median 29062 ns |
 | Temporary pinned Zydis C17 oracle | Built commit `1ba75ae` with Zycore `1401fb8`; the finite Real16 corpus passed |
 | Generated Zydis protected-mode extraction | Returned the exact required set of 41 mnemonics |
-| Tracked Zydis oracle replay | Built the tracked C harness; emitted 216 rows; exact 41-name extraction passed |
+| Tracked Zydis oracle replay | Built the tracked C harness; emitted 228 rows; exact 41-name extraction passed |
 | `cargo test --locked --all-targets -- --test-threads=1` | 65 passed; one manual benchmark ignored for the corrected Phase 5 candidate |
 | `cargo clippy --locked --all-targets -- -D warnings` | Passed for the Phase 5 candidate |
 | `cargo build --locked --release` | Passed for the Phase 5 candidate |

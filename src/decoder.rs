@@ -277,12 +277,7 @@ fn number(text: &str) -> Option<u64> {
 }
 
 fn real16_vector(bytes: &[u8], size: usize, mnemonic: &str) -> bool {
-    let opcode = bytes[..size].iter().copied().find(|byte| {
-        !matches!(
-            byte,
-            0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3
-        )
-    });
+    let opcode = after_prefixes(bytes, size).first().copied();
     match (opcode, mnemonic) {
         (Some(0xc4), name) => name != "les",
         (Some(0xc5), name) => name != "lds",
@@ -295,14 +290,27 @@ fn real16_vector(bytes: &[u8], size: usize, mnemonic: &str) -> bool {
 fn real16_protected(bytes: &[u8], size: usize, mnemonic: &str) -> bool {
     // Zydis permits the register VMWRITE definition and rejects its memory definition in Real16.
     if mnemonic == "vmwrite"
-        && bytes
-            .get(..size)
-            .and_then(|bytes| bytes.last())
-            .is_some_and(|byte| byte & 0xc0 == 0xc0)
+        && after_prefixes(bytes, size)
+            .get(..3)
+            .is_some_and(|opcode| opcode.starts_with(&[0x0f, 0x79]) && opcode[2] & 0xc0 == 0xc0)
     {
         return false;
     }
     REAL16_PROTECTED.contains(&mnemonic)
+}
+
+fn after_prefixes(bytes: &[u8], size: usize) -> &[u8] {
+    bytes
+        .get(..size)
+        .unwrap_or_default()
+        .iter()
+        .position(|byte| {
+            !matches!(
+                byte,
+                0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3
+            )
+        })
+        .map_or(&[], |start| &bytes[start..size])
 }
 
 impl Drop for Decoder {
@@ -412,7 +420,13 @@ mod tests {
                         .contains("vmwrite")
                 );
             }
-            for bytes in [&[0x0f, 0x79, 0x00][..], &[0x67, 0x0f, 0x79, 0x00]] {
+            for bytes in [
+                &[0x0f, 0x79, 0x00][..],
+                &[0x67, 0x0f, 0x79, 0x00],
+                &[0x0f, 0x79, 0x46, 0xc0],
+                &[0x0f, 0x79, 0x86, 0xc0, 0xc0],
+                &[0x67, 0x0f, 0x79, 0x44, 0x24, 0xc0],
+            ] {
                 assert!(decoder.decode(bytes, 0, 0).is_err());
             }
         }

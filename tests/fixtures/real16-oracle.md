@@ -31,6 +31,7 @@ cc -std=c17 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -DZYDIS_STATIC_BUILD -DZYCOR
 The build completed without a compiler warning.
 The comparison ran 86 original combinations against each decoder mode.
 The follow-up ran eight VMWRITE combinations against each decoder mode.
+The VMWRITE displacement follow-up ran six combinations against each decoder mode.
 The second follow-up ran 14 prefixed-branch combinations against each decoder mode.
 
 ## Valid instruction results
@@ -134,6 +135,9 @@ Both results remain the same with an address override and both syntax settings.
 | `0F 79 00` | Error |
 | `67 0F 79 C0` | VMWRITE with two 32-bit registers |
 | `67 0F 79 00` | Error |
+| `0F 79 46 C0` | Error; memory with an 8-bit displacement |
+| `0F 79 86 C0 C0` | Error; memory with a 16-bit displacement |
+| `67 0F 79 44 24 C0` | Error; memory with SIB and displacement |
 
 ## Complete protected-mode policy
 
@@ -156,7 +160,8 @@ python3 -c 'from pathlib import Path; import re; text=Path("src/Generated/Instru
 The Real16 policy checks the canonical Capstone mnemonic against the complete set.
 INVEPT, INVVPID, VMREAD, and VMWRITE have mixed generated definitions.
 Zydis rejects decoded Real16 forms for the first three names in the finite corpus.
-The policy uses the ModRM form to preserve valid register VMWRITE.
+The policy locates the ModR/M byte after prefixes and opcode bytes.
+The policy preserves register VMWRITE and rejects memory forms with displacement bytes.
 The vector check also uses the canonical mnemonic.
 The vector check therefore preserves LES, LDS, BOUND, and POP.
 The policy keeps MOV control-register instructions valid.
