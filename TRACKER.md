@@ -4,17 +4,19 @@ Last update: September 5, 2026.
 Read this file first when a session resumes.
 Read [PLAN.md](PLAN.md) for the complete requirements and source references.
 Read [VERIFICATION.md](VERIFICATION.md) for the final function and Linux-difference matrix.
+Read [UPSTREAM_REVIEW.md](UPSTREAM_REVIEW.md) for the subsequent Windows D04 through D07 comparison.
 
 ## Current state
 
 - Completed: project analysis, repository rename, branch creation, plan, and tracker.
-- Application implementation: Phases 1 through 6 passed Astra review.
-- Active work: none in the approved scope.
+- Application implementation: the original D03 release passed all six phases and Astra review.
+- Active work: implement the approved Windows D04 through D07 extension.
 - Core owner: `sol_linux_baseline` owns source adapters, fixtures, core tests, and terminal checks.
 - Native owner: `native_package` owns `lib`, package scripts, native probes, and native metadata.
 - Save owner: `save_backend` owns `src/save.rs` and its inline tests.
-- Next task: none in the approved scope.
-- Next acceptance check: none.
+- Next task: port D04 direct branch navigation and return history.
+- Next acceptance check: verify checked targets, return history, Linux input, and both syntax settings with Astra.
+- Upstream review: Windows `a3b7240` supplies the approved D04 through D07 source baseline.
 - Application blockers: none confirmed.
 - Current branch: `rust-rewrite`.
 - Project folder: `/home/sweet_cicero/Projects/HView-Linux`.
@@ -33,7 +35,7 @@ Use Git status and history to determine the current documentation commit and rem
 
 | Item | Requirement |
 |---|---|
-| Scope | All implemented Windows functions through D03, plus the Linux adaptations in PLAN.md |
+| Scope | All implemented Windows functions through D07, plus the Linux adaptations in PLAN.md |
 | Implementation | Reuse Windows Rust source; do not retain a C application |
 | Product | HView-Linux |
 | Package and executable | `hview-linux` |
@@ -104,6 +106,21 @@ Use the Evidence column for implementation locations, checks, and review results
 | P6-04 | Verification | Pass terminal, recovery, session, macro, and native-library integration checks | Complete | All six application probes passed against the final packaged executable; Astra accepted |
 | P6-05 | Verification | Verify package isolation, missing libraries, and decoder preparation measurements | Complete | Package isolation passed; final raw median/p95 was 24180/26064 ns; PE was 29850/31273 ns; Astra accepted |
 | P6-06 | Final review | Have Astra check every function-matrix row and all documented Linux differences | Complete | Astra passed the 31-row matrix, Linux differences, final package, and branch evidence at `5febcd4` |
+
+## Approved D04 through D07 extension
+
+The user approved this extension after the Windows update review.
+Keep the accepted D03 evidence as the original baseline.
+Use Sol xhigh for implementation and Astra High for each acceptance review.
+Finish each stage before dependent source changes.
+
+| ID | Task | Status | Evidence |
+|---|---|---|---|
+| D04 | Direct branch navigation, checked targets, return history, and F5 history correction | Active | Requirements and Linux integration checks in UPSTREAM_REVIEW.md |
+| D05 | Transient raw runtime base, x86 width, integer byte order, and checked growth | Pending | Depends on D04 address handling |
+| D06 | Nonmutating assembly preview with exact-byte confirmation | Pending | Depends on the D05 address model |
+| D07 | Grouped operation undo/redo with record and byte limits | Pending | Includes confirmed D06 patches, hexadecimal edits, fill, and XOR |
+| EXT-VERIFY | Final regression suite, isolated package, documentation, and Astra acceptance | Pending | Run against the complete D07 extension |
 
 ## Completed planning and setup
 
@@ -242,7 +259,16 @@ The findings and limits above remain the persistent evidence summary.
 8. Run the required checks for that task.
 9. Record results and the next action in this tracker.
 
-Current resume action: inspect the accepted source and final tracker before new work.
+Current resume action: continue the active extension stage after reading UPSTREAM_REVIEW.md and the latest task evidence.
+
+## Subsequent Windows update review
+
+The requested Windows pull completed on September 5, 2026.
+The clean Windows branch advanced from `97a308c` to `a3b7240` through seven commits.
+Astra confirmed four missing Linux feature groups: branch navigation, raw dump addresses, assembly preview, and operation undo/redo.
+The portable Windows format module passed all 13 tests on this Linux host.
+UPSTREAM_REVIEW.md records source references, dependencies, Linux integration requirements, and proposed acceptance checks.
+This review changed no Linux application code. The accepted implementation baseline remains unchanged.
 
 ## Excluded work
 

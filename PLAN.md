@@ -6,7 +6,9 @@ Update the tracker after each implementation change or verification result.
 ## Target and approved direction
 
 Build HView-Linux in Rust from the current HView-Windows application.
-Include all implemented Windows functions through D03.
+Include all implemented Windows functions through D07.
+The user approved the D04 through D07 extension after the original D03 release.
+Use UPSTREAM_REVIEW.md for the extension requirements and integration checks.
 Use the previous Linux application as a behavior reference.
 Keep the previous Linux code in Git history.
 Start the Rust application on a new orphan branch named `rust-rewrite`.
@@ -313,8 +315,9 @@ Verify decoder reuse and record Linux timing evidence.
 
 ## Excluded Windows backlog
 
-Current parity ends at D03.
-Exclude branch following, runtime base selection, assembly preview, general undo/redo, verified patch records, and annotations.
+The original parity release ended at D03.
+The approved extension includes branch following, raw runtime bases, assembly preview, and operation undo/redo through D07.
+Exclude verified patch records and annotations.
 Exclude paged file access, changed-range storage, background analysis workers, headless JSON analysis, and expanded Unicode sessions.
 Exclude signatures, ARM64, full ELF navigation, Mach-O, plugins, a decompiler, and a debugger.
 The Linux adaptations above remain required for the application to work correctly on Linux.
