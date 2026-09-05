@@ -7,13 +7,13 @@ Read [PLAN.md](PLAN.md) for the complete requirements and source references.
 ## Current state
 
 - Completed: project analysis, repository rename, branch creation, plan, and tracker.
-- Application implementation: Phases 1 and 2 passed Astra review; Phase 3 has a tested candidate.
-- Active work: Phase 3 review; the independent Phase 4 analysis probe.
+- Application implementation: Phases 1 through 3 passed Astra review.
+- Active work: the independent Phase 4 analysis probe and its review.
 - Core owner: `sol_linux_baseline` owns source adapters, fixtures, core tests, and terminal checks.
 - Native owner: `native_package` owns `lib`, package scripts, native probes, and native metadata.
 - Save owner: `save_backend` owns `src/save.rs` and its inline tests.
-- Next task: complete Astra review of the Phase 3 integration candidate.
-- Next acceptance check: verify editing, recovery, and Save As workflows.
+- Next task: review the Phase 4 analysis workflow probe.
+- Next acceptance check: verify each analysis workflow against its exact result.
 - Application blockers: none confirmed.
 - Current branch: `rust-rewrite`.
 - Project folder: `/home/sweet_cicero/Projects/HView-Linux`.
@@ -75,11 +75,11 @@ Use the Evidence column for implementation locations, checks, and review results
 | P2-04 | Configuration | Replace Windows text detection; verify unsupported-text errors and Hex/Code fallback | Complete | BOM, zero-heavy, UTF-16, and inactive Hex/Code checks passed; Astra accepted |
 | P2-05 | Sessions | Port save/restore, active file, view settings, capacity checks, and Linux path handling | Complete | Absolute identity, backslash, restart, 1..24 capacity, view, mode, offset, and path-limit checks passed; Astra accepted |
 | P2-06 | Sessions | Preserve compressed imports, checksums, and unknown payloads; reject empty or invalid sessions | Complete | Legacy compressed fixtures, checksum failures, zero counts, truncation, and unknown payload retention passed; Astra accepted |
-| P3-01 | Editing | Connect nibble edits, EOF extension, current-byte undo, and edit cancellation | Implemented | `tests/reliability_probe.py` checks exact file bytes for all four workflows |
-| P3-02 | Editing | Port Intel assembly, address-aware encoding, and buffer extension | Implemented | PTY checks Intel assembly, AT&T display with Intel seed, and EOF extension |
-| P3-03 | Recovery | Add replacement saves, content/identity checks, original backups, and failure recovery | Implemented | `src/save.rs`; Astra accepted the backend after nine strict Btrfs tests |
-| P3-04 | Recovery | Add Save As with atomic destination refusal and correct file/session updates | Implemented | PTY checks target switch, session restart, cancellation, existing destination refusal, and recovery data |
-| P3-05 | Recovery | Verify metadata policy, links, permissions, flushes, save failures, and concurrent-change limits | Implemented | Nine backend tests pass; PTY confirms external-change refusal and original-byte recovery |
+| P3-01 | Editing | Connect nibble edits, EOF extension, current-byte undo, and edit cancellation | Complete | `tests/reliability_probe.py` checks exact file bytes for all four workflows; Astra accepted |
+| P3-02 | Editing | Port Intel assembly, address-aware encoding, and buffer extension | Complete | PTY checks Intel assembly, AT&T display with Intel seed, and EOF extension; Astra accepted |
+| P3-03 | Recovery | Add replacement saves, content/identity checks, original backups, and failure recovery | Complete | Astra accepted the backend and the integrated reliability workflow |
+| P3-04 | Recovery | Add Save As with atomic destination refusal and correct file/session updates | Complete | Target switch, restart, cancellation, refusal, and recovery checks passed; Astra accepted |
+| P3-05 | Recovery | Verify metadata policy, links, permissions, flushes, save failures, and concurrent-change limits | Complete | Nine backend tests and external-change PTY passed; Astra accepted |
 | P4-01 | Analysis | Connect exact and masked search with forward/backward repeat | Pending | None |
 | P4-02 | Analysis | Connect strings, entropy, comparison, and integer inspection | Pending | None |
 | P4-03 | Analysis | Connect repeating XOR and fill with checked edit ranges | Pending | None |
@@ -144,6 +144,8 @@ These results do not establish Linux feature parity.
 These checks ran on Linux x86-64 with Rust 1.98.0.
 The Astra Phase 1 review passed at commit `77d4236bc355cdca517c094a45d3a12c766eaef1`.
 The Astra Phase 2 review passed at commit `cd476bd2354dd30a545197b6d1ba2b674ff975e6`.
+The Astra Phase 3 review passed at commit `1764904fde9a4d0fc8567f7b240c0087511972e2`.
+The advisory-lock, final-rename race, and power-loss limits remain explicit in `src/save.rs`.
 
 The Phase 2 candidate adds GNU options and keeps explicit legacy forms.
 The native configuration format uses `[HView-Linux 1]`, UTF-8, and LF line endings.
