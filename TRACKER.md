@@ -77,7 +77,7 @@ Use the Evidence column for implementation locations, checks, and review results
 | P2-06 | Sessions | Preserve compressed imports, checksums, and unknown payloads; reject empty or invalid sessions | Pending | None |
 | P3-01 | Editing | Connect nibble edits, EOF extension, current-byte undo, and edit cancellation | Pending | None |
 | P3-02 | Editing | Port Intel assembly, address-aware encoding, and buffer extension | Pending | None |
-| P3-03 | Recovery | Add replacement saves, content/identity checks, original backups, and failure recovery | Implemented | `src/save.rs`; nine inline save tests pass; Astra recheck remains |
+| P3-03 | Recovery | Add replacement saves, content/identity checks, original backups, and failure recovery | Implemented | `src/save.rs`; Astra accepted the backend after nine strict Btrfs tests |
 | P3-04 | Recovery | Add Save As with atomic destination refusal and correct file/session updates | Implemented | Atomic destination test and Ctrl+S PTY workflow pass; focused review remains |
 | P3-05 | Recovery | Verify metadata policy, links, permissions, flushes, save failures, and concurrent-change limits | Active | Metadata, link, lock, race, and failure tests exist; focused Phase 3 checks remain |
 | P4-01 | Analysis | Connect exact and masked search with forward/backward repeat | Pending | None |
@@ -136,7 +136,7 @@ These results do not establish Linux feature parity.
 | `cargo build --release` | Passed |
 | `target/release/hview-linux --self-test` | Passed 16-bit, 32-bit, and 64-bit native checks |
 | `python3 tests/terminal_probe.py target/release/hview-linux` | Passed all Phase 1 PTY checks |
-| `python3 scripts/package.py /tmp/hview-linux-phase1-package-1788619456283411585` | Package and isolated native checks passed |
+| `python3 scripts/package.py /tmp/hview-linux-phase1-package-1788619612135433605` | Package and isolated native checks passed |
 
 These checks ran on Linux x86-64 with Rust 1.98.0.
 The full Astra Phase 1 review is not complete.
@@ -147,6 +147,11 @@ Astra found that control keys could insert hexadecimal digits and prompt text.
 The candidate now keeps control characters separate from their action codes.
 Astra found three save-backend access and substitution risks.
 The save backend now uses descriptor metadata changes and rejects read-only or privileged targets.
+Astra accepted the corrected save backend after nine strict Btrfs tests.
+Astra found that resize events could dismiss a modal or the analysis menu.
+The modal and analysis menu now redraw until the user supplies an input key.
+Astra found that a zero-filled binary matched the UTF-16 lane heuristic.
+The heuristic now requires text bytes in the lane opposite the zero-byte lane.
 
 The C probes confirmed a missing-file crash, failed empty-file mapping, and continued execution after `fstat` failure.
 The rendering probe displayed bytes beyond the final row.

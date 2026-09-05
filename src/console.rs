@@ -530,16 +530,21 @@ impl Console {
     }
 
     pub fn modal(&self, base: &[String], text: &str) -> io::Result<Key> {
-        let (width, height) = self.dimensions();
-        let mut lines = base.to_vec();
-        lines.resize(height, String::new());
-        if height != 0 {
-            let label = visible(text, width.saturating_sub(4));
-            let left = width.saturating_sub(label.chars().count().saturating_add(4)) / 2;
-            lines[height / 2] = format!("{}[ {} ]", " ".repeat(left), label);
+        loop {
+            let (width, height) = self.dimensions();
+            let mut lines = base.to_vec();
+            lines.resize(height, String::new());
+            if height != 0 {
+                let label = visible(text, width.saturating_sub(4));
+                let left = width.saturating_sub(label.chars().count().saturating_add(4)) / 2;
+                lines[height / 2] = format!("{}[ {} ]", " ".repeat(left), label);
+            }
+            self.draw(&lines)?;
+            let key = self.key()?;
+            if key.code != 0 || key.character != '\0' {
+                return Ok(key);
+            }
         }
-        self.draw(&lines)?;
-        self.key()
     }
 
     pub fn prompt(&self, base: &[String], label: &str) -> io::Result<Option<String>> {

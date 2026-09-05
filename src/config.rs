@@ -169,7 +169,19 @@ fn utf16_text(data: &[u8]) -> bool {
         .step_by(2)
         .filter(|&&byte| byte == 0)
         .count();
-    even_zero * 4 >= pairs * 3 || odd_zero * 4 >= pairs * 3
+    let text_byte = |byte: &&u8| matches!(**byte, b'\t' | b'\n' | b'\r' | 0x20..=0x7e);
+    let even_text = data[..pairs * 2]
+        .iter()
+        .step_by(2)
+        .filter(text_byte)
+        .count();
+    let odd_text = data[1..pairs * 2]
+        .iter()
+        .step_by(2)
+        .filter(text_byte)
+        .count();
+    (even_zero * 4 >= pairs * 3 && odd_text * 4 >= pairs * 3)
+        || (odd_zero * 4 >= pairs * 3 && even_text * 4 >= pairs * 3)
 }
 
 pub fn detect_line_feed(data: &[u8]) -> LineFeed {
@@ -848,6 +860,12 @@ mod tests {
         assert!(options.wrap && !options.tab && !options.is_text);
         assert!(config.text_options(b"\xff\xfeA\0B\0C\0D\0").is_err());
         assert!(config.text_options(b"A\0B\0C\0D\0").is_err());
+        assert!(!config.text_options(&[0; 32]).unwrap().is_text);
+        assert!(
+            config
+                .new_view(vec![0; 32], crate::editor::Mode::Text, 0)
+                .is_ok()
+        );
         assert_eq!(detect_line_feed(b"a\rb"), LineFeed::Cr);
         assert_eq!(detect_line_feed(b"a\nb"), LineFeed::Lf);
         assert_eq!(detect_line_feed(b"a\r\nb"), LineFeed::CrLf);

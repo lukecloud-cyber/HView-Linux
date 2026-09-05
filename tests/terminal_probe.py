@@ -184,6 +184,23 @@ def main() -> None:
         if b"%ebx" not in att_output or b"%eax" not in att_output:
             raise AssertionError("AT&T configuration did not change the Code display.")
 
+        created_file = root / "created.bin"
+        run_session(
+            binary,
+            [str(created_file)],
+            [(30, 4, b"\x1b[4;1H"), b"c", b"\x11"],
+        )
+        if not created_file.is_file():
+            raise AssertionError("A resize dismissed the file creation question.")
+
+        tool_output = run_session(
+            binary,
+            [str(text_file)],
+            [b"\x14", (30, 5, b"\x1b[5;1H"), b"i", b"\x1b", b"\x11"],
+        )
+        if b"Integers at cursor" not in tool_output:
+            raise AssertionError("A resize dismissed the analysis menu.")
+
         empty_file = root / "empty.bin"
         empty_file.touch()
         run_session(binary, [str(empty_file)], [b"\x11"])

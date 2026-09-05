@@ -227,24 +227,29 @@ fn change_range(
 }
 
 pub fn tools(console: &Console, view: &mut Editor, base: &[String]) -> io::Result<()> {
-    let (_width, height) = console.dimensions();
-    let mut lines = vec![String::new(); height];
-    for (line, text) in lines.iter_mut().skip(2).zip([
-        " Analysis tools",
-        " A  Address: convert a PE file offset, RVA, or preferred ImageBase VA",
-        " S  Strings: ASCII and UTF-16 ASCII, minimum 4 characters",
-        " P  PE structures: sections, directories, imports, exports, overlay",
-        " E  Entropy map: locate compressed or repetitive regions",
-        " D  Compare: browse changed ranges against another file",
-        " I  Integers: signed and unsigned, little and big endian",
-        " X  XOR range: repeat a hexadecimal mask (edit mode)",
-        " F  Fill range: repeat a hexadecimal pattern (edit mode)",
-        " Esc  Return",
-    ]) {
-        *line = text.into();
-    }
-    console.draw(&lines)?;
-    let key = console.key()?;
+    let key = loop {
+        let (_width, height) = console.dimensions();
+        let mut lines = vec![String::new(); height];
+        for (line, text) in lines.iter_mut().skip(2).zip([
+            " Analysis tools",
+            " A  Address: convert a PE file offset, RVA, or preferred ImageBase VA",
+            " S  Strings: ASCII and UTF-16 ASCII, minimum 4 characters",
+            " P  PE structures: sections, directories, imports, exports, overlay",
+            " E  Entropy map: locate compressed or repetitive regions",
+            " D  Compare: browse changed ranges against another file",
+            " I  Integers: signed and unsigned, little and big endian",
+            " X  XOR range: repeat a hexadecimal mask (edit mode)",
+            " F  Fill range: repeat a hexadecimal pattern (edit mode)",
+            " Esc  Return",
+        ]) {
+            *line = text.into();
+        }
+        console.draw(&lines)?;
+        let key = console.key()?;
+        if key.code != 0 || key.character != '\0' {
+            break key;
+        }
+    };
     let items = match key.character.to_ascii_uppercase() {
         'A' => {
             convert_address(console, view, base)?;
