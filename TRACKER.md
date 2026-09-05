@@ -7,13 +7,13 @@ Read [PLAN.md](PLAN.md) for the complete requirements and source references.
 ## Current state
 
 - Completed: project analysis, repository rename, branch creation, plan, and tracker.
-- Application implementation: Phases 1 through 3 passed Astra review.
-- Active work: the stable Phase 4 analysis candidate and its Astra review.
+- Application implementation: Phases 1 through 4 passed Astra review.
+- Active work: Phase 5 macros and Linux behavior.
 - Core owner: `sol_linux_baseline` owns source adapters, fixtures, core tests, and terminal checks.
 - Native owner: `native_package` owns `lib`, package scripts, native probes, and native metadata.
 - Save owner: `save_backend` owns `src/save.rs` and its inline tests.
-- Next task: complete the Astra review of the Phase 4 analysis candidate.
-- Next acceptance check: verify each analysis result against the tested terminal workflow.
+- Next task: implement and verify the Phase 5 Linux behavior.
+- Next acceptance check: compare Real16 decoding against the pinned Zydis oracle.
 - Application blockers: none confirmed.
 - Current branch: `rust-rewrite`.
 - Project folder: `/home/sweet_cicero/Projects/HView-Linux`.
@@ -80,13 +80,13 @@ Use the Evidence column for implementation locations, checks, and review results
 | P3-03 | Recovery | Add replacement saves, content/identity checks, original backups, and failure recovery | Complete | Astra accepted the backend and the integrated reliability workflow |
 | P3-04 | Recovery | Add Save As with atomic destination refusal and correct file/session updates | Complete | Target switch, restart, cancellation, refusal, and recovery checks passed; Astra accepted |
 | P3-05 | Recovery | Verify metadata policy, links, permissions, flushes, save failures, and concurrent-change limits | Complete | Nine backend tests and external-change PTY passed; Astra accepted |
-| P4-01 | Analysis | Connect exact and masked search with forward/backward repeat | Implemented | `tests/analysis_probe.py` passed exact, masked, next, and previous search workflows |
-| P4-02 | Analysis | Connect strings, entropy, comparison, and integer inspection | Implemented | The analysis probe passed checked string, entropy, comparison, and integer results |
-| P4-03 | Analysis | Connect repeating XOR and fill with checked edit ranges | Implemented | The analysis probe passed exact saved bytes and rejected out-of-range changes |
-| P4-04 | Analysis | Connect result browsers, selection jumps, cancellation, and result limits | Implemented | The analysis probe passed browser movement, selected offsets, and cancellation |
-| P4-05 | PE tools | Connect sections, directories, imports, exports, and overlay browsing | Implemented | The analysis probe passed generated PE32 and PE32+ structure fixtures |
-| P4-06 | PE tools | Connect checked offset/RVA/VA conversion; preserve separate legacy address behavior | Implemented | The analysis probe passed PE32 and PE32+ file, RVA, and VA conversions |
-| P4-07 | Analysis | Verify all tools against unsaved buffers, malformed inputs, and range boundaries | Implemented | The analysis probe passed unsaved-buffer, invalid-pattern, cancellation, and boundary workflows |
+| P4-01 | Analysis | Connect exact and masked search with forward/backward repeat | Complete | Exact, masked, next, and previous search workflows passed; Astra accepted `3dbc021` |
+| P4-02 | Analysis | Connect strings, entropy, comparison, and integer inspection | Complete | Checked string, entropy, comparison, and integer results passed; Astra accepted |
+| P4-03 | Analysis | Connect repeating XOR and fill with checked edit ranges | Complete | Exact saved bytes and rejected out-of-range changes passed; Astra accepted |
+| P4-04 | Analysis | Connect result browsers, selection jumps, cancellation, and result limits | Complete | Browser movement, selected offsets, and cancellation passed; Astra accepted |
+| P4-05 | PE tools | Connect sections, directories, imports, exports, and overlay browsing | Complete | Generated PE32 and PE32+ structure fixtures passed; Astra accepted |
+| P4-06 | PE tools | Connect checked offset/RVA/VA conversion; preserve separate legacy address behavior | Complete | PE32 and PE32+ file, RVA, and VA conversions passed; Astra accepted |
+| P4-07 | Analysis | Verify all tools against unsaved buffers, malformed inputs, and range boundaries | Complete | Unsaved-buffer, invalid-pattern, cancellation, and boundary workflows passed; Astra accepted |
 | P5-01 | Macros | Port macro events, startup playback, repeats, modifiers, and stop-on-notice behavior | Pending | None |
 | P5-02 | Macros | Verify long-delay cancellation and preservation of queued input | Pending | None |
 | P5-03 | Linux behavior | Add reachable key alternatives and Linux shortcuts without prompt/edit conflicts | Active | Ctrl+S, Ctrl+Q, M, Enter, O, and H/J/K/L work; focused review remains |
@@ -148,8 +148,9 @@ These checks ran on Linux x86-64 with Rust 1.98.0.
 The Astra Phase 1 review passed at commit `77d4236bc355cdca517c094a45d3a12c766eaef1`.
 The Astra Phase 2 review passed at commit `cd476bd2354dd30a545197b6d1ba2b674ff975e6`.
 The Astra Phase 3 review passed at commit `1764904fde9a4d0fc8567f7b240c0087511972e2`.
+The Astra Phase 4 review passed at commit `3dbc02179d96a782f7061aef07d7c5522189c135`.
 The advisory-lock, final-rename race, and power-loss limits remain explicit in `src/save.rs`.
-The Phase 4 candidate passed its focused analysis probe and now waits for Astra review.
+The Phase 4 probe SHA-256 was `bbd48e8a94d359c47618a8f053fbed91870f4bef4381593a856c9379841de90c`.
 The redraw benchmark used 28 rows, five warmups, ten batches, and five preparations per batch.
 The raw p95 was 27626 ns, and the PE p95 was 30486 ns.
 
