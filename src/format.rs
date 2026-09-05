@@ -53,20 +53,18 @@ impl Metadata {
     }
 
     pub fn code_address(&self, file_offset: u64) -> Result<(u64, u32), String> {
+        self.validate_code_machine()?;
         match &self.pe {
-            Some(pe) => {
-                if !matches!(pe.machine, 332 | 34404) {
-                    return Err("The PE processor is unsupported for code decoding.".into());
-                }
-                pe.file_to_virtual(file_offset)
-                    .map(|address| (address, pe.bits))
-                    .ok_or_else(|| OUTSIDE.into())
-            }
+            Some(pe) => pe
+                .file_to_virtual(file_offset)
+                .map(|address| (address, pe.bits))
+                .ok_or_else(|| OUTSIDE.into()),
             None => Ok((file_offset, 16)),
         }
     }
 
     pub fn navigation_address(&self, data: &[u8], file_offset: u64) -> Result<u64, String> {
+        self.validate_code_machine()?;
         if self.pe.is_some() || data.starts_with(b"MZ") || data.starts_with(b"ZM") {
             return convert_address(data, AddressKind::File, file_offset)?
                 .va
@@ -92,6 +90,15 @@ impl Metadata {
         data.get(offset)
             .map(|_| address)
             .ok_or_else(|| "The branch target is outside the current buffer.".into())
+    }
+
+    fn validate_code_machine(&self) -> Result<(), String> {
+        if let Some(pe) = &self.pe
+            && !matches!(pe.machine, 332 | 34404)
+        {
+            return Err("The PE processor is unsupported for code decoding.".into());
+        }
+        Ok(())
     }
 }
 
@@ -1456,6 +1463,14 @@ mod tests {
         let metadata = Metadata::parse(&malformed).unwrap();
         assert!(metadata.navigation_address(&malformed, 0).is_err());
         assert!(metadata.navigation_offset(&malformed, 0).is_err());
+
+        let mut unsupported = fixture(false);
+        put(&mut unsupported, 132, 0x01c4);
+        let metadata = Metadata::parse(&unsupported).unwrap();
+        assert_eq!(
+            metadata.navigation_address(&unsupported, 0x210),
+            Err("The PE processor is unsupported for code decoding.".into())
+        );
     }
 
     #[test]

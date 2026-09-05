@@ -116,7 +116,7 @@ Finish each stage before dependent source changes.
 
 | ID | Task | Status | Evidence |
 |---|---|---|---|
-| D04 | Direct branch navigation, checked targets, return history, and F5 history correction | Implemented | Capstone group targets, Intel/AT&T, Real16, PE/raw/ELF mappings, 256 returns, and F5 clearing pass unit and PTY checks; Astra review remains |
+| D04 | Direct branch navigation, checked targets, return history, and F5 history correction | Implemented | Group targets, syntax, Real16, checked PE machines and mappings, raw/ELF, 256 returns, and F5 clearing pass; Astra recheck remains |
 | D05 | Transient raw runtime base, x86 width, integer byte order, and checked growth | Pending | Depends on D04 address handling |
 | D06 | Nonmutating assembly preview with exact-byte confirmation | Pending | Depends on the D05 address model |
 | D07 | Grouped operation undo/redo with record and byte limits | Pending | Includes confirmed D06 patches, hexadecimal edits, fill, and XOR |
@@ -189,6 +189,7 @@ The Astra Phase 4 review passed at commit `3dbc02179d96a782f7061aef07d7c5522189c
 The Astra Phase 5 review passed at commit `5febcd48d5d71642fd4d6eca7bd67ff273e149a4`.
 The Astra Phase 6 and final parity review passed at the same accepted source commit.
 The D04 unit candidate has 70 passing tests and one ignored manual benchmark.
+The D04 navigation probe passes supported and unsupported PE machines, checked mappings, direct targets, and return history.
 The advisory-lock, final-rename race, and power-loss limits remain explicit in `src/save.rs`.
 The Phase 4 probe SHA-256 was `bbd48e8a94d359c47618a8f053fbed91870f4bef4381593a856c9379841de90c`.
 The redraw benchmark used 28 rows, five warmups, ten batches, and five preparations per batch.

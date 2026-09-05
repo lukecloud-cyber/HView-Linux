@@ -268,6 +268,23 @@ def check_pe_navigation(binary: Path, root: Path) -> None:
     )
     require(output, b".00401010: E80B000000", b".00401020: C3")
 
+    unsupported = bytearray(mapped)
+    unsupported[0x84:0x86] = (0x01C4).to_bytes(2, "little")
+    unsupported_path = root / "pe-unsupported-machine.bin"
+    unsupported_path.write_bytes(unsupported)
+    output = run_session(
+        binary,
+        ["--mode=code", "--offset=210", str(unsupported_path)],
+        [ENTER, ENTER, BACKSPACE, ENTER, CTRL_Q],
+    )
+    require(
+        output,
+        b"The PE processor is unsupported for code decoding.",
+        b"The branch return history is empty.",
+    )
+    if pe_header(base + 0x1020) in output:
+        raise AssertionError("Follow accepted an unsupported PE processor.")
+
     overlay = bytearray(source_data)
     overlay[0x800:0x802] = b"\xEB\x00"
     overlay_path = root / "pe-overlay.bin"
