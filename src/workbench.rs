@@ -63,7 +63,7 @@ fn browse(console: &Console, title: &str, items: &[(usize, String)]) -> io::Resu
 pub fn help(console: &Console) -> io::Result<()> {
     let help = [
         " Editor controls",
-        " F3 Edit  F9 Save edits  Esc Cancel edits",
+        " F3 Edit/Undo  Shift+F3 Redo  Ctrl+Z/Y Undo/Redo  F9 Save  Esc Cancel",
         " Ctrl+S Save As: save the buffer to a new file",
         " M or Enter Mode  O Code size  Ctrl+Q Quit",
         " H/J/K/L Move  Ctrl+T Analysis tools",
@@ -285,13 +285,32 @@ fn change_range(
     else {
         return Ok(());
     };
-    let result = crate::hex_pattern(&mask)
-        .and_then(|mask| operations::transform(&mut view.data, start, len, &mask, xor));
+    let result = crate::hex_pattern(&mask).and_then(|mask| {
+        let end = start
+            .checked_add(len)
+            .ok_or("The block extends past the file end.")?;
+        let bytes = view
+            .data
+            .get(start..end)
+            .ok_or("The block extends past the file end.")?;
+        let mut replacement = Vec::new();
+        replacement
+            .try_reserve_exact(bytes.len())
+            .map_err(|_| "Cannot allocate the edit history.")?;
+        replacement.extend_from_slice(bytes);
+        operations::transform(&mut replacement, 0, len, &mask, xor)?;
+        let offset = start as u64;
+        let top = if view.mode == Mode::Code {
+            offset
+        } else {
+            let rows = console.height().saturating_sub(2) as u64;
+            let file_rows = (view.data.len() as u64).div_ceil(16);
+            (offset.saturating_sub(rows * 8) / 16 * 16).min(file_rows.saturating_sub(rows) * 16)
+        };
+        view.replace_bytes(start, replacement, (offset, top))
+    });
     match result {
-        Ok(()) => {
-            view.dirty = true;
-            jump(view, start, console.height().saturating_sub(2));
-        }
+        Ok(()) => {}
         Err(error) => {
             console.modal(base, &error)?;
         }

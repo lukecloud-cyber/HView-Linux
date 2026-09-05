@@ -901,6 +901,10 @@ fn open_editor(
         );
         console.draw(&lines)?;
         let key = console.key()?;
+        let hex_digit = view.editing && view.mode == Mode::Hex && key.character.is_ascii_hexdigit();
+        if view.editing && !hex_digit && key.code != 0 {
+            view.end_hex_group();
+        }
         let ctrl = key.control & 12 != 0;
         if ctrl && key.code == 81 && !view.editing {
             return Ok((EditorAction::Quit, Some((path, view))));
@@ -1048,7 +1052,7 @@ fn open_editor(
             }
             continue;
         }
-        if view.editing && view.mode == Mode::Hex && key.character.is_ascii_hexdigit() {
+        if hex_digit {
             if let Err(error) = view.hex_digit(key.character) {
                 console.modal(&lines, &error)?;
             }
@@ -1118,16 +1122,11 @@ fn open_editor(
                         if !confirm_assembly(console, &preview)? {
                             break;
                         }
-                        if let Err(error) = view.validate_raw_len(view.data.len().max(end)) {
+                        if let Err(error) = view.replace_bytes(start, bytes, (end as u64, view.top))
+                        {
                             console.modal(&lines, &error)?;
                             continue;
                         }
-                        if end > view.data.len() {
-                            view.data.resize(end, 0);
-                        }
-                        view.data[start..end].copy_from_slice(&bytes);
-                        view.dirty = true;
-                        view.offset = end as u64;
                     }
                     Err(error) => {
                         console.modal(&lines, &error)?;
@@ -1136,10 +1135,36 @@ fn open_editor(
             },
             27 if view.editing => view.cancel_edit(),
             27 | 121 if !view.editing => break,
+            code if view.editing
+                && ((code == 114 && key.control & 16 != 0)
+                    || (code == 89 && key.control & 8 != 0)) =>
+            {
+                match view.redo() {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        console.modal(&lines, "The redo history is empty.")?;
+                    }
+                    Err(error) => {
+                        console.modal(&lines, &error)?;
+                    }
+                }
+            }
+            code if view.editing
+                && ((code == 114 && key.control & 16 == 0)
+                    || (code == 90 && key.control & 8 != 0)) =>
+            {
+                match view.undo() {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        console.modal(&lines, "The undo history is empty.")?;
+                    }
+                    Err(error) => {
+                        console.modal(&lines, &error)?;
+                    }
+                }
+            }
             114 => {
-                if view.editing {
-                    view.undo_current_byte();
-                } else if let Err(error) = view.toggle_edit() {
+                if let Err(error) = view.toggle_edit() {
                     console.modal(&lines, &error)?;
                 } else {
                     writable = true;

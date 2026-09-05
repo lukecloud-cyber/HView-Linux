@@ -61,8 +61,8 @@ def main() -> None:
         undo = undo_folder / "undo.bin"
         undo.write_bytes(b"\x12\x34")
         run_session(binary, ["--mode=hex", str(undo)], [F3, b"a", F3, b"cd", F9, CTRL_Q])
-        if undo.read_bytes() != b"\x12\xcd":
-            raise AssertionError("Current-byte undo did not restore the selected byte.")
+        if undo.read_bytes() != b"\xcd\x34":
+            raise AssertionError("Grouped undo did not restore the original cursor.")
 
         assembly_folder = root / "assembly"
         assembly_folder.mkdir()

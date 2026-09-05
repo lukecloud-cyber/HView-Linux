@@ -1,4 +1,38 @@
-use std::fmt::Write;
+use std::{collections::VecDeque, fmt::Write};
+
+const EDIT_HISTORY_LIMIT: usize = 256;
+const EDIT_HISTORY_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct EditCursor {
+    offset: u64,
+    top: u64,
+    low_nibble: bool,
+}
+
+struct EditRecord {
+    start: usize,
+    before: Vec<u8>,
+    after: Vec<u8>,
+    before_len: usize,
+    after_len: usize,
+    before_cursor: EditCursor,
+    after_cursor: EditCursor,
+    hex_group: bool,
+}
+
+impl EditRecord {
+    fn bytes(&self) -> usize {
+        self.before.len() + self.after.len()
+    }
+}
+
+fn history_size(before: usize, after: usize) -> Result<usize, String> {
+    before
+        .checked_add(after)
+        .filter(|&bytes| bytes <= EDIT_HISTORY_BYTES)
+        .ok_or("The edit exceeds the 64 MiB undo history limit.".into())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -66,6 +100,11 @@ pub struct Editor {
     pub pack_nops: bool,
     pub pack_int3: bool,
     backup: Option<Vec<u8>>,
+    undo_history: VecDeque<EditRecord>,
+    redo_history: VecDeque<EditRecord>,
+    history_bytes: usize,
+    changed_bytes: usize,
+    hex_start: Option<EditCursor>,
 }
 
 impl Editor {
@@ -97,6 +136,11 @@ impl Editor {
             pack_nops: true,
             pack_int3: true,
             backup: None,
+            undo_history: VecDeque::new(),
+            redo_history: VecDeque::new(),
+            history_bytes: 0,
+            changed_bytes: 0,
+            hex_start: None,
         }
     }
 
@@ -141,7 +185,220 @@ impl Editor {
         self.metadata()?.convert_address(&self.data, kind, value)
     }
 
+    fn cursor(&self) -> EditCursor {
+        EditCursor {
+            offset: self.offset,
+            top: self.top,
+            low_nibble: self.low_nibble,
+        }
+    }
+
+    fn set_cursor(&mut self, cursor: EditCursor) {
+        self.offset = cursor.offset.min(self.data.len() as u64);
+        self.top = cursor.top.min(self.data.len() as u64);
+        self.low_nibble = cursor.low_nibble;
+    }
+
+    fn close_hex_group(&mut self) {
+        if let Some(record) = self.undo_history.back_mut() {
+            record.hex_group = false;
+        }
+        self.hex_start = None;
+    }
+
+    pub fn end_hex_group(&mut self) {
+        self.close_hex_group();
+    }
+
+    fn clear_edit_history(&mut self) {
+        self.undo_history.clear();
+        self.redo_history.clear();
+        self.history_bytes = 0;
+        self.hex_start = None;
+    }
+
+    fn difference_count(&self, start: usize, end: usize) -> usize {
+        let Some(backup) = &self.backup else {
+            return 0;
+        };
+        (start..end)
+            .filter(|&index| self.data.get(index) != backup.get(index))
+            .count()
+    }
+
+    fn apply_record_bytes(
+        &mut self,
+        start: usize,
+        bytes: &[u8],
+        len: usize,
+        cursor: EditCursor,
+        affected_end: usize,
+    ) {
+        let before = self.difference_count(start, affected_end);
+        if len > self.data.len() {
+            self.data.resize(len, 0);
+        }
+        self.data[start..start + bytes.len()].copy_from_slice(bytes);
+        self.data.truncate(len);
+        let after = self.difference_count(start, affected_end);
+        self.changed_bytes = self.changed_bytes.saturating_sub(before) + after;
+        self.dirty = self.changed_bytes != 0;
+        self.set_cursor(cursor);
+    }
+
+    fn record_edit(
+        &mut self,
+        start: usize,
+        replacement: Vec<u8>,
+        before_cursor: EditCursor,
+        after_cursor: EditCursor,
+        hex_group: bool,
+    ) -> Result<bool, String> {
+        if !self.editing {
+            return Err("Press F3 to enter edit mode.".into());
+        }
+        if replacement.is_empty() {
+            return Err("An edit must replace at least one byte.".into());
+        }
+        if start > self.data.len() {
+            return Err("The edit starts past the file end.".into());
+        }
+        let end = start
+            .checked_add(replacement.len())
+            .ok_or("The edit exceeds the address range.")?;
+        let before_len = self.data.len();
+        let after_len = before_len.max(end);
+        if after_cursor.offset > after_len as u64 || after_cursor.top > after_len as u64 {
+            return Err("The edit cursor exceeds the file size.".into());
+        }
+        self.validate_raw_len(after_len)?;
+        let old_end = end.min(before_len);
+        let source = &self.data[start..old_end];
+        if before_len == after_len && source == replacement {
+            return Ok(false);
+        }
+        let record_bytes = history_size(source.len(), replacement.len())?;
+        let mut before = Vec::new();
+        before
+            .try_reserve_exact(source.len())
+            .map_err(|_| "Cannot allocate the edit history.")?;
+        before.extend_from_slice(source);
+        if after_len > before_len {
+            self.data
+                .try_reserve(after_len - before_len)
+                .map_err(|_| "Cannot allocate the edit buffer.")?;
+        }
+        self.undo_history
+            .try_reserve(1)
+            .map_err(|_| "Cannot allocate the edit history.")?;
+
+        while let Some(record) = self.redo_history.pop_front() {
+            self.history_bytes -= record.bytes();
+        }
+        self.close_hex_group();
+        while self.undo_history.len() >= EDIT_HISTORY_LIMIT
+            || self.history_bytes + record_bytes > EDIT_HISTORY_BYTES
+        {
+            let record = self.undo_history.pop_front().unwrap();
+            self.history_bytes -= record.bytes();
+        }
+        let record = EditRecord {
+            start,
+            before,
+            after: replacement,
+            before_len,
+            after_len,
+            before_cursor,
+            after_cursor,
+            hex_group,
+        };
+        let affected_end = start + record.before.len().max(record.after.len());
+        self.apply_record_bytes(start, &record.after, after_len, after_cursor, affected_end);
+        self.history_bytes += record_bytes;
+        self.undo_history.push_back(record);
+        Ok(true)
+    }
+
+    pub fn replace_bytes(
+        &mut self,
+        start: usize,
+        replacement: Vec<u8>,
+        after: (u64, u64),
+    ) -> Result<(), String> {
+        let before = self.cursor();
+        let result = self.record_edit(
+            start,
+            replacement,
+            before,
+            EditCursor {
+                offset: after.0,
+                top: after.1,
+                low_nibble: false,
+            },
+            false,
+        );
+        if result.is_ok() {
+            self.close_hex_group();
+        }
+        result.map(|_| ())
+    }
+
+    pub fn undo(&mut self) -> Result<bool, String> {
+        let Some(record) = self.undo_history.back() else {
+            return Ok(false);
+        };
+        self.validate_raw_len(record.before_len)?;
+        if record.before_len > self.data.len() {
+            self.data
+                .try_reserve(record.before_len - self.data.len())
+                .map_err(|_| "Cannot allocate the edit buffer.")?;
+        }
+        self.redo_history
+            .try_reserve(1)
+            .map_err(|_| "Cannot allocate the edit history.")?;
+        self.close_hex_group();
+        let record = self.undo_history.pop_back().unwrap();
+        let affected_end = record.start + record.before.len().max(record.after.len());
+        self.apply_record_bytes(
+            record.start,
+            &record.before,
+            record.before_len,
+            record.before_cursor,
+            affected_end,
+        );
+        self.redo_history.push_back(record);
+        Ok(true)
+    }
+
+    pub fn redo(&mut self) -> Result<bool, String> {
+        let Some(record) = self.redo_history.back() else {
+            return Ok(false);
+        };
+        self.validate_raw_len(record.after_len)?;
+        if record.after_len > self.data.len() {
+            self.data
+                .try_reserve(record.after_len - self.data.len())
+                .map_err(|_| "Cannot allocate the edit buffer.")?;
+        }
+        self.undo_history
+            .try_reserve(1)
+            .map_err(|_| "Cannot allocate the edit history.")?;
+        self.close_hex_group();
+        let record = self.redo_history.pop_back().unwrap();
+        let affected_end = record.start + record.before.len().max(record.after.len());
+        self.apply_record_bytes(
+            record.start,
+            &record.after,
+            record.after_len,
+            record.after_cursor,
+            affected_end,
+        );
+        self.undo_history.push_back(record);
+        Ok(true)
+    }
+
     pub fn goto(&mut self, offset: u64, rows: usize) {
+        self.close_hex_group();
         self.offset = offset.min(self.data.len() as u64);
         self.low_nibble = false;
         if self.mode == Mode::Text {
@@ -159,29 +416,26 @@ impl Editor {
         }
         if !self.editing {
             // ponytail: The backup uses one file-sized allocation. Use changed ranges for large files.
-            self.backup = Some(self.data.clone());
+            let mut backup = Vec::new();
+            backup
+                .try_reserve_exact(self.data.len())
+                .map_err(|_| "Cannot allocate the edit backup.")?;
+            backup.extend_from_slice(&self.data);
+            self.backup = Some(backup);
+            self.clear_edit_history();
+            self.changed_bytes = 0;
             self.editing = true;
             self.low_nibble = false;
         }
         Ok(())
     }
 
-    pub fn undo_current_byte(&mut self) {
-        if let Some(original) = &self.backup {
-            let index = self.offset as usize;
-            if let (Some(old), Some(current)) = (original.get(index), self.data.get_mut(index)) {
-                *current = *old;
-                self.offset = (self.offset + 1).min(self.data.len() as u64);
-                self.low_nibble = false;
-                self.dirty = self.data != *original;
-            }
-        }
-    }
-
     pub fn cancel_edit(&mut self) {
         if let Some(data) = self.backup.take() {
             self.data = data;
         }
+        self.clear_edit_history();
+        self.changed_bytes = 0;
         self.offset = self.offset.min(self.data.len() as u64);
         self.editing = false;
         self.dirty = false;
@@ -190,6 +444,8 @@ impl Editor {
 
     pub fn saved(&mut self) {
         self.backup = None;
+        self.clear_edit_history();
+        self.changed_bytes = 0;
         self.editing = false;
         self.dirty = false;
         self.low_nibble = false;
@@ -212,21 +468,53 @@ impl Editor {
                 .checked_add(1)
                 .ok_or("The edit buffer exceeds the address range.")?;
             self.validate_raw_len(new_len)?;
-            self.data
-                .try_reserve(1)
-                .map_err(|_| "Cannot allocate the edit buffer.")?;
-            self.data.push(0);
         }
-        self.data[index] = replace_nibble(self.data[index], digit, self.low_nibble);
-        if self.low_nibble {
-            self.offset += 1;
+        let low_nibble = self.low_nibble;
+        let before_cursor = self.hex_start.unwrap_or_else(|| self.cursor());
+        let current = self.data.get(index).copied().unwrap_or(0);
+        let replacement = replace_nibble(current, digit, low_nibble);
+        let after_cursor = EditCursor {
+            offset: self.offset + u64::from(low_nibble),
+            top: self.top,
+            low_nibble: !low_nibble,
+        };
+        let grouped = low_nibble
+            && self
+                .undo_history
+                .back()
+                .is_some_and(|record| record.hex_group && record.start == index);
+        if grouped {
+            let affected_end = index + 1;
+            let before = self.difference_count(index, affected_end);
+            if current != replacement {
+                if index == self.data.len() {
+                    self.data.push(0);
+                }
+                self.data[index] = replacement;
+                let after = self.difference_count(index, affected_end);
+                self.changed_bytes = self.changed_bytes.saturating_sub(before) + after;
+                self.dirty = self.changed_bytes != 0;
+            }
+            let record = self.undo_history.back_mut().unwrap();
+            record.after[0] = replacement;
+            record.after_cursor = after_cursor;
+            record.hex_group = false;
+            self.set_cursor(after_cursor);
+        } else if !self.record_edit(
+            index,
+            vec![replacement],
+            before_cursor,
+            after_cursor,
+            !low_nibble,
+        )? {
+            self.set_cursor(after_cursor);
         }
-        self.low_nibble = !self.low_nibble;
-        self.dirty = true;
+        self.hex_start = (!low_nibble).then_some(before_cursor);
         Ok(())
     }
 
     pub fn navigate(&mut self, key: Key, rows: usize, width: usize) {
+        self.close_hex_group();
         if self.mode == Mode::Text {
             self.navigate_text(key, rows, width);
             return;
@@ -499,10 +787,11 @@ mod tests {
         editor.hex_digit('4').unwrap();
         editor.hex_digit('1').unwrap();
         assert_eq!((editor.data[0], editor.offset), (0x41, 1));
-        editor.offset = 0;
-        editor.undo_current_byte();
+        assert!(editor.undo().unwrap());
         assert_eq!(editor.data[0], 0);
-        assert_eq!(editor.offset, 1);
+        assert_eq!(editor.offset, 0);
+        assert!(editor.redo().unwrap());
+        assert_eq!((editor.data[0], editor.offset), (0x41, 1));
         assert!(editor.editing);
         let mut fitting = Editor::new((0..=255).collect(), Mode::Hex, 255);
         fitting.goto(255, 28);
@@ -612,5 +901,165 @@ mod tests {
             assert!(!editor.low_nibble);
             assert!(!editor.dirty);
         }
+    }
+
+    #[test]
+    fn edit_history_groups_nibbles_and_preserves_redo_on_noop() {
+        let mut editor = Editor::new(vec![0x12], Mode::Hex, 0);
+        editor.toggle_edit().unwrap();
+
+        editor.hex_digit('1').unwrap();
+        editor.hex_digit('3').unwrap();
+        assert_eq!(editor.data, [0x13]);
+        assert_eq!(editor.offset, 1);
+        assert!(editor.undo().unwrap());
+        assert_eq!(editor.data, [0x12]);
+        assert_eq!(
+            (editor.offset, editor.low_nibble, editor.dirty),
+            (0, false, false)
+        );
+
+        editor.replace_bytes(0, vec![0x12], (1, 1)).unwrap();
+        assert_eq!((editor.offset, editor.top), (0, 0));
+        assert!(editor.redo().unwrap());
+        assert_eq!(editor.data, [0x13]);
+        assert_eq!(
+            (editor.offset, editor.low_nibble, editor.dirty),
+            (1, false, true)
+        );
+
+        editor.cancel_edit();
+        editor.goto(0, 1);
+        editor.toggle_edit().unwrap();
+        editor.hex_digit('f').unwrap();
+        assert_eq!((editor.data[0], editor.low_nibble), (0xf2, true));
+        assert!(editor.undo().unwrap());
+        assert_eq!(
+            (editor.data[0], editor.offset, editor.low_nibble),
+            (0x12, 0, false)
+        );
+        assert!(editor.redo().unwrap());
+        assert_eq!(
+            (editor.data[0], editor.offset, editor.low_nibble),
+            (0xf2, 0, true)
+        );
+        editor.hex_digit('4').unwrap();
+        assert!(editor.undo().unwrap());
+        assert_eq!((editor.data[0], editor.low_nibble), (0xf2, true));
+        assert!(editor.undo().unwrap());
+        assert_eq!((editor.data[0], editor.low_nibble), (0x12, false));
+    }
+
+    #[test]
+    fn range_history_handles_growth_dirty_state_and_raw_redo_rejection() {
+        let mut editor = Editor::new(vec![0x90], Mode::Code, 1);
+        editor.toggle_edit().unwrap();
+        editor.replace_bytes(1, vec![0xc3], (2, 1)).unwrap();
+        assert_eq!(editor.data, [0x90, 0xc3]);
+        assert_eq!((editor.offset, editor.top, editor.dirty), (2, 1, true));
+
+        assert!(editor.undo().unwrap());
+        assert_eq!(editor.data, [0x90]);
+        assert_eq!((editor.offset, editor.top, editor.dirty), (1, 0, false));
+        editor
+            .set_raw_model(Some(RawModel {
+                base: u64::from(u32::MAX),
+                bits: 32,
+                byte_order: ByteOrder::Little,
+            }))
+            .unwrap();
+        let state = (editor.data.clone(), editor.offset, editor.top, editor.dirty);
+        assert!(editor.redo().is_err());
+        assert_eq!(
+            (editor.data.clone(), editor.offset, editor.top, editor.dirty),
+            state
+        );
+        editor.set_raw_model(None).unwrap();
+        assert!(editor.redo().unwrap());
+        assert_eq!(editor.data, [0x90, 0xc3]);
+        assert_eq!((editor.offset, editor.top, editor.dirty), (2, 1, true));
+
+        assert!(editor.undo().unwrap());
+        editor.replace_bytes(0, vec![0x91], (1, 0)).unwrap();
+        assert!(!editor.redo().unwrap());
+        editor.replace_bytes(0, vec![0x90], (1, 0)).unwrap();
+        assert!(!editor.dirty);
+        editor.saved();
+        assert!(!editor.undo().unwrap());
+        assert!(!editor.redo().unwrap());
+    }
+
+    #[test]
+    fn edit_history_interrupts_hex_groups_and_evicts_oldest_records() {
+        let mut editor = Editor::new(vec![0x12], Mode::Hex, 0);
+        editor.toggle_edit().unwrap();
+        editor.hex_digit('f').unwrap();
+        editor.replace_bytes(0, vec![0xf2], (0, 0)).unwrap();
+        assert!(editor.low_nibble);
+        editor.hex_digit('4').unwrap();
+        assert!(editor.undo().unwrap());
+        assert_eq!((editor.data[0], editor.low_nibble), (0xf2, true));
+        assert!(editor.undo().unwrap());
+        assert_eq!((editor.data[0], editor.low_nibble), (0x12, false));
+
+        editor.cancel_edit();
+        editor.toggle_edit().unwrap();
+        for index in 0..=EDIT_HISTORY_LIMIT {
+            editor
+                .replace_bytes(0, vec![if index % 2 == 0 { 1 } else { 0 }], (0, 0))
+                .unwrap();
+        }
+        assert_eq!(editor.undo_history.len(), EDIT_HISTORY_LIMIT);
+        for _ in 0..EDIT_HISTORY_LIMIT {
+            assert!(editor.undo().unwrap());
+        }
+        assert_eq!(editor.data, [1]);
+        assert!(!editor.undo().unwrap());
+        assert!(history_size(1, EDIT_HISTORY_BYTES).is_err());
+        editor.cancel_edit();
+        assert_eq!(editor.data, [0x12]);
+        assert!(!editor.undo().unwrap());
+    }
+
+    #[test]
+    fn history_byte_limit_evicts_and_rejects_edits_atomically() {
+        let size = EDIT_HISTORY_BYTES / 4;
+        let mut editor = Editor::new(vec![0; size], Mode::Hex, 0);
+        editor.toggle_edit().unwrap();
+        for byte in [1, 2, 3] {
+            editor.replace_bytes(0, vec![byte; size], (0, 0)).unwrap();
+        }
+        assert_eq!(editor.undo_history.len(), 2);
+        assert_eq!(editor.history_bytes, EDIT_HISTORY_BYTES);
+        assert!(editor.undo().unwrap());
+        assert!(editor.data.iter().all(|&byte| byte == 2));
+        assert!(editor.undo().unwrap());
+        assert!(editor.data.iter().all(|&byte| byte == 1));
+        assert!(!editor.undo().unwrap());
+        drop(editor);
+
+        let size = EDIT_HISTORY_BYTES / 2 + 1;
+        let mut editor = Editor::new(vec![0; size], Mode::Hex, 0);
+        editor.toggle_edit().unwrap();
+        editor.replace_bytes(0, vec![1], (1, 0)).unwrap();
+        assert!(editor.undo().unwrap());
+        let history_bytes = editor.history_bytes;
+        assert!(
+            editor
+                .replace_bytes(0, vec![2; size], (size as u64, 0))
+                .is_err()
+        );
+        assert_eq!(editor.data.len(), size);
+        assert!(editor.data.iter().all(|&byte| byte == 0));
+        assert_eq!((editor.offset, editor.top, editor.dirty), (0, 0, false));
+        assert!(editor.undo_history.is_empty());
+        assert_eq!(editor.redo_history.len(), 1);
+        assert_eq!(editor.history_bytes, history_bytes);
+        assert!(editor.redo().unwrap());
+        assert_eq!(editor.data[0], 1);
+        assert_eq!((editor.offset, editor.top, editor.dirty), (1, 0, true));
+        assert!(editor.undo().unwrap());
+        assert!(editor.data.iter().all(|&byte| byte == 0));
+        assert_eq!((editor.offset, editor.top, editor.dirty), (0, 0, false));
     }
 }

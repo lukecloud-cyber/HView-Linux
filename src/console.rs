@@ -638,6 +638,10 @@ mod tests {
         assert_eq!(csi_key(b"18~").unwrap().code, 118);
         assert_eq!(csi_key(b"18;2~").unwrap().control, 16);
         assert_eq!(csi_key(b"18;5~").unwrap().control, 8);
+        assert_eq!(csi_key(b"13;2~").unwrap().code, 114);
+        assert_eq!(csi_key(b"13;2~").unwrap().control, 16);
+        assert_eq!(csi_key(b"1;2R").unwrap().code, 114);
+        assert_eq!(csi_key(b"1;2R").unwrap().control, 16);
         assert_eq!(csi_key(b"1;3A").unwrap().control, 2);
         assert_eq!(scan_key(0xe04b, 0, 0).unwrap().code, 37);
         assert!(csi_key(b"3~").is_none());
