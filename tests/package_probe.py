@@ -13,6 +13,7 @@ import tempfile
 
 MANIFEST = "package-manifest.json"
 NATIVE_METADATA = "native-dependencies.json"
+PACKAGE_DOCUMENTS = {"README.md", "hview-linux.ini.example"}
 
 
 def require(condition, message):
@@ -67,7 +68,7 @@ def isolated_environment():
 def expected_files(package):
     metadata = json.loads((package / NATIVE_METADATA).read_text(encoding="utf-8"))
     require(metadata.get("schema_version") == 1, "The native dependency schema is not supported.")
-    names = {"hview-linux", NATIVE_METADATA}
+    names = {"hview-linux", NATIVE_METADATA, *PACKAGE_DOCUMENTS}
     libraries = []
     for dependency in metadata.get("dependencies", []):
         require(
@@ -119,6 +120,18 @@ def check(package):
 
     binary = package / "hview-linux"
     require(os.access(binary, os.X_OK), "The packaged hview-linux file is not executable.")
+    readme = (package / "README.md").read_text(encoding="utf-8")
+    require(readme.startswith("# HView-Linux\n"), "The packaged README file has an invalid title.")
+    sample = (package / "hview-linux.ini.example").read_bytes()
+    require(
+        sample.startswith(b"[HView-Linux 1]\n") and b"\r" not in sample,
+        "The packaged configuration sample does not use the native header and LF lines.",
+    )
+    sample_text = sample.decode("utf-8")
+    require(
+        "\nDisassemblySyntax=Intel\nInvalidCode=Error\n" in sample_text,
+        "The packaged configuration sample does not show the native Code defaults.",
+    )
     check_elf_x86_64(binary)
     for name in libraries:
         check_elf_x86_64(package / name)

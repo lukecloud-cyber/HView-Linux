@@ -4,6 +4,7 @@
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -14,6 +15,7 @@ from pathlib import Path
 
 TARGET = "x86_64-unknown-linux-gnu"
 PACKAGE_FILES = "package-manifest.json"
+PACKAGE_DOCUMENTS = ("README.md", "hview-linux.ini.example")
 
 
 def sha256(path):
@@ -96,6 +98,11 @@ def package(output_argument=None):
         shutil.copy2(binary, output / binary.name)
         for name in names:
             shutil.copy2(root / "lib" / name, output / name)
+        for name in PACKAGE_DOCUMENTS:
+            source = root / name
+            if not source.is_file() or source.is_symlink():
+                raise FileNotFoundError(f"The package document is not a regular file: {source}")
+            shutil.copy2(source, output / name)
 
     files = []
     for path in sorted(output.iterdir(), key=lambda item: item.name):
@@ -111,6 +118,17 @@ def package(output_argument=None):
         cwd=root,
         check=True,
     )
+    environment = {name: value for name, value in os.environ.items() if not name.startswith("LD_")}
+    environment["HVIEW_PORTABLE"] = "1"
+    for probe in sorted((root / "tests").glob("*_probe.py")):
+        if probe.name == "package_probe.py":
+            continue
+        subprocess.run(
+            [sys.executable, str(probe), str(output / "hview-linux")],
+            cwd=root,
+            env=environment,
+            check=True,
+        )
     print(f"Package ready: {output}")
     return output
 
