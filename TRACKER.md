@@ -8,12 +8,12 @@ Read [PLAN.md](PLAN.md) for the complete requirements and source references.
 
 - Completed: project analysis, repository rename, branch creation, plan, and tracker.
 - Application implementation: Phases 1 through 4 passed Astra review.
-- Active work: Phase 5 macros and Linux behavior.
+- Active work: the stable Phase 5 candidate and its Astra review.
 - Core owner: `sol_linux_baseline` owns source adapters, fixtures, core tests, and terminal checks.
 - Native owner: `native_package` owns `lib`, package scripts, native probes, and native metadata.
 - Save owner: `save_backend` owns `src/save.rs` and its inline tests.
-- Next task: implement and verify the Phase 5 Linux behavior.
-- Next acceptance check: compare Real16 decoding against the pinned Zydis oracle.
+- Next task: create the stable Phase 5 review commit.
+- Next acceptance check: have Astra review the exact Phase 5 commit.
 - Application blockers: none confirmed.
 - Current branch: `rust-rewrite`.
 - Project folder: `/home/sweet_cicero/Projects/HView-Linux`.
@@ -87,16 +87,16 @@ Use the Evidence column for implementation locations, checks, and review results
 | P4-05 | PE tools | Connect sections, directories, imports, exports, and overlay browsing | Complete | Generated PE32 and PE32+ structure fixtures passed; Astra accepted |
 | P4-06 | PE tools | Connect checked offset/RVA/VA conversion; preserve separate legacy address behavior | Complete | PE32 and PE32+ file, RVA, and VA conversions passed; Astra accepted |
 | P4-07 | Analysis | Verify all tools against unsaved buffers, malformed inputs, and range boundaries | Complete | Unsaved-buffer, invalid-pattern, cancellation, and boundary workflows passed; Astra accepted |
-| P5-01 | Macros | Port macro events, startup playback, repeats, modifiers, and stop-on-notice behavior | Pending | None |
-| P5-02 | Macros | Verify long-delay cancellation and preservation of queued input | Pending | None |
-| P5-03 | Linux behavior | Add reachable key alternatives and Linux shortcuts without prompt/edit conflicts | Active | Ctrl+S, Ctrl+Q, M, Enter, O, and H/J/K/L work; focused review remains |
+| P5-01 | Macros | Port macro events, startup playback, repeats, modifiers, and stop-on-notice behavior | Implemented | `tests/macro_probe.py` passed both signatures, repeats, modifiers, notices, and Ctrl-key handling |
+| P5-02 | Macros | Verify long-delay cancellation and preservation of queued input | Implemented | The macro probe passed maximum-delay cancellation and preserved queued prompt input |
+| P5-03 | Linux behavior | Add reachable key alternatives and Linux shortcuts without prompt/edit conflicts | Implemented | The macro probe passed Ctrl+S, Ctrl+Q, M, Enter, O, H/J/K/L, prompt, and edit conflicts |
 | P5-04 | Syntax | Add Intel/AT&T configuration; verify Intel defaults, explicit AT&T, and invalid-setting errors | Implemented | `DisassemblySyntax` tests pass; assembly input and prompt seeds remain Intel |
-| P5-05 | Linux behavior | Retain verified real-mode decoding and optional invalid-byte display | Pending | None |
-| P5-06 | Linux behavior | Permit raw ELF Code viewing without claiming ELF structure or address support | Pending | None |
+| P5-05 | Linux behavior | Retain verified real-mode decoding and optional invalid-byte display | Implemented | Pinned Zydis corpus and Linux behavior probe passed Real16, strict errors, and `InvalidCode=Byte` |
+| P5-06 | Linux behavior | Permit raw ELF Code viewing without claiming ELF structure or address support | Implemented | Linux behavior probe passed raw ELF Code decoding; PE-only address operations still reject ELF |
 | P6-01 | Release | Add Linux packaging, native provenance, hashes, notices, and native self-test | Implemented | Isolated package build, file hashes, ELF checks, and missing-library checks passed |
 | P6-02 | Release | Add Linux CI, user documentation, and installation instructions | Pending | None |
-| P6-03 | Verification | Pass formatting, Rust tests, strict Clippy, and a fresh release build | Implemented | Format passed; 54 tests passed; strict Clippy passed; release build passed |
-| P6-04 | Verification | Pass terminal, recovery, session, macro, and native-library integration checks | Active | Phase 1 PTY and package probes passed; later-phase checks remain |
+| P6-03 | Verification | Pass formatting, Rust tests, strict Clippy, and a fresh release build | Implemented | Format passed; 64 tests passed; strict Clippy passed; release build passed |
+| P6-04 | Verification | Pass terminal, recovery, session, macro, and native-library integration checks | Implemented | Six application probes passed together; final package and review checks remain |
 | P6-05 | Verification | Verify package isolation, missing libraries, and decoder preparation measurements | Implemented | Package isolation passed; release benchmark measured raw and PE redraw preparation |
 | P6-06 | Final review | Have Astra check every function-matrix row and all documented Linux differences | Pending | None |
 
@@ -143,6 +143,14 @@ These results do not establish Linux feature parity.
 | `python3 -m py_compile tests/analysis_probe.py` | Passed for the Phase 4 candidate |
 | `python3 tests/analysis_probe.py target/release/hview-linux` | Passed all Phase 4 analysis workflows in 13.4 seconds |
 | `cargo test --locked --release d01_redraw_preparation_benchmark -- --ignored --nocapture --test-threads=1` | Passed; raw median 23833 ns and PE median 29062 ns |
+| Temporary pinned Zydis C17 oracle | Built commit `1ba75ae` with Zycore `1401fb8`; the finite Real16 corpus passed |
+| Generated Zydis protected-mode extraction | Returned the exact required set of 41 mnemonics |
+| `cargo test --locked -- --test-threads=1` | 64 passed; one manual benchmark ignored for the Phase 5 candidate |
+| `cargo clippy --locked --all-targets -- -D warnings` | Passed for the Phase 5 candidate |
+| `cargo build --locked --release` | Passed for the Phase 5 candidate |
+| `python3 tests/macro_probe.py target/release/hview-linux` | Passed macro, delay, modifier, notice, alias, prompt, and edit workflows |
+| `python3 tests/linux_behavior_probe.py target/release/hview-linux` | Passed Code cycling, Real16, fallback, sessions, syntax, and raw ELF workflows |
+| Six application probes against one release build | Terminal, file, reliability, analysis, macro, and Linux behavior probes passed |
 
 These checks ran on Linux x86-64 with Rust 1.98.0.
 The Astra Phase 1 review passed at commit `77d4236bc355cdca517c094a45d3a12c766eaef1`.
@@ -153,6 +161,19 @@ The advisory-lock, final-rename race, and power-loss limits remain explicit in `
 The Phase 4 probe SHA-256 was `bbd48e8a94d359c47618a8f053fbed91870f4bef4381593a856c9379841de90c`.
 The redraw benchmark used 28 rows, five warmups, ten batches, and five preparations per batch.
 The raw p95 was 27626 ns, and the PE p95 was 30486 ns.
+
+The temporary oracle used the official Zydis source at the pinned commit.
+The oracle compared Real16 and LONG_COMPAT_16 with Intel and AT&T syntax.
+Relative fixtures used addresses zero, `0xFFFF`, and `0x10000`.
+Capstone matched ordinary lengths, registers, operand widths, address widths, and validity.
+Real16 now filters the complete protected-mode set and vector encodings.
+Real16 preserves LES, LDS, BOUND, POP, MOV control-register instructions, and far pointers.
+The session keeps the legacy 16-bit width and stores a versioned 24-file Real16 bitmap.
+The session refuses Real16 persistence when unknown data occupies the extension area.
+
+Astra found that Ctrl-modified macro letters could insert printable text.
+The input adapter now gives Ctrl-modified macro letters control characters and keeps their action codes.
+Focused edit and prompt workflows pass with the corrected input adapter.
 
 The Phase 2 candidate adds GNU options and keeps explicit legacy forms.
 The native configuration format uses `[HView-Linux 1]`, UTF-8, and LF line endings.

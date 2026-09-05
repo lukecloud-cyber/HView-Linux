@@ -6,6 +6,7 @@ LineFeed=Auto
 AutoCodeSize=On
 DefaultCodeSize=16
 DisassemblySyntax=Intel
+InvalidCode=Error
 OpcodeShowBytes=15
 HexDelimiterChar=0x2D
 ShowOffset=Local

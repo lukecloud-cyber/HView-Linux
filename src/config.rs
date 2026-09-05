@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 
 const SAVE_HEADER: &[u8; 16] = b"HViewSav\0\x04\0\0\0\0\x08\x20";
 const NATIVE_INI_HEADER: &str = "[HView-Linux 1]";
+const REAL16_EXTENSION: usize = 67544;
+const REAL16_SIGNATURE: &[u8; 4] = b"R16\x01";
 // These signatures permit imports from the frozen legacy INI and SAV formats.
 const LEGACY_INI_HEADER: &[u8] = &[
     0x5b, 0x48, 0x69, 0x65, 0x77, 0x49, 0x6e, 0x69, 0x20, 0x35, 0x2e, 0x30, 0x33, 0x5d,
@@ -45,6 +47,7 @@ pub struct Config {
     pub auto_code_size: bool,
     pub default_code_size: u32,
     pub disassembly_syntax: crate::decoder::Syntax,
+    pub invalid_code_bytes: bool,
     pub opcode_show_bytes: usize,
     pub hex_delimiter: u8,
     pub show_offset_local: bool,
@@ -64,6 +67,7 @@ impl Default for Config {
             auto_code_size: true,
             default_code_size: 16,
             disassembly_syntax: crate::decoder::Syntax::Intel,
+            invalid_code_bytes: false,
             opcode_show_bytes: 15,
             hex_delimiter: b'-',
             show_offset_local: true,
@@ -106,6 +110,7 @@ impl Config {
         view.expand_tabs = text.tab;
         view.is_text = text.is_text;
         view.syntax = self.disassembly_syntax;
+        view.invalid_code_bytes = self.invalid_code_bytes;
         view.delimiter = match text.line_feed {
             LineFeed::Cr => b"\r",
             LineFeed::Lf => b"\n",
@@ -297,7 +302,9 @@ pub fn parse(data: &[u8]) -> Result<Config, String> {
             .unwrap_or(line.len());
         let key = line[..key_end].to_ascii_uppercase();
         const KEYS: &[u32] = include!("../assets/config_keys.rs");
-        if !KEYS.contains(&crate::checksum::checksum(key.as_bytes())) {
+        if !KEYS.contains(&crate::checksum::checksum(key.as_bytes()))
+            && !(native && key == "INVALIDCODE")
+        {
             return Err(error("Invalid keyword"));
         }
         let rest = line[key_end..].trim_start_matches(|c: char| c.is_ascii_whitespace());
@@ -363,6 +370,13 @@ pub fn parse(data: &[u8]) -> Result<Config, String> {
                 config.disassembly_syntax = match word()?.as_str() {
                     "INTEL" => crate::decoder::Syntax::Intel,
                     "ATT" => crate::decoder::Syntax::Att,
+                    _ => return Err(error("Illegal value")),
+                }
+            }
+            "INVALIDCODE" if native => {
+                config.invalid_code_bytes = match word()?.as_str() {
+                    "ERROR" => false,
+                    "BYTE" => true,
                     _ => return Err(error("Illegal value")),
                 }
             }
@@ -539,6 +553,7 @@ pub struct SavedFile {
     pub offset: u64,
     pub top: u64,
     pub code_bits: u32,
+    pub real_mode: bool,
     pub wrap: bool,
     pub tab: bool,
     pub line_feed: LineFeed,
@@ -604,6 +619,7 @@ impl SavedState {
             return Err("The saved file record is truncated.".into());
         }
         let record = Self::new_single(path, view, config)?;
+        set_real16(&mut self.payload, index, view.real_mode)?;
         self.payload[base..base + 2814].copy_from_slice(&record.payload[8..8 + 2814]);
         self.files.extend(record.files);
         put32(&mut self.payload, 4, self.files.len() as u32);
@@ -663,6 +679,7 @@ impl SavedState {
             b"\n" => LineFeed::Lf,
             _ => return Err("The saved line-feed mode is not reconstructed.".into()),
         };
+        set_real16(&mut self.payload, index, view.real_mode)?;
         file.mode = match view.mode {
             crate::editor::Mode::Text => 1,
             crate::editor::Mode::Hex => 2,
@@ -671,6 +688,7 @@ impl SavedState {
         file.offset = view.offset;
         file.top = view.top;
         file.code_bits = view.code_bits;
+        file.real_mode = view.real_mode;
         file.wrap = view.wrap;
         file.tab = view.expand_tabs;
         file.line_feed = line_feed;
@@ -768,6 +786,45 @@ fn put32(payload: &mut [u8], offset: usize, value: u32) {
     payload[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+fn real16_bitmap(payload: &[u8]) -> Result<u32, String> {
+    let extension = payload
+        .get(REAL16_EXTENSION..REAL16_EXTENSION + 8)
+        .ok_or("The save payload is too short for the Real16 extension.")?;
+    if &extension[..4] != REAL16_SIGNATURE {
+        return Ok(0);
+    }
+    let bitmap = u32::from_le_bytes(extension[4..8].try_into().unwrap());
+    if bitmap >> 24 != 0 {
+        return Err("The save payload has an invalid Real16 file bitmap.".into());
+    }
+    Ok(bitmap)
+}
+
+fn set_real16(payload: &mut [u8], index: usize, enabled: bool) -> Result<(), String> {
+    let extension = payload
+        .get_mut(REAL16_EXTENSION..REAL16_EXTENSION + 8)
+        .ok_or("The save payload is too short for the Real16 extension.")?;
+    if &extension[..4] != REAL16_SIGNATURE {
+        if !enabled {
+            return Ok(());
+        }
+        if extension.iter().any(|byte| *byte != 0) {
+            return Err(
+                "The save payload extension area is in use. Real16 cannot be saved.".into(),
+            );
+        }
+        extension[..4].copy_from_slice(REAL16_SIGNATURE);
+    }
+    let mut bitmap = u32::from_le_bytes(extension[4..8].try_into().unwrap());
+    if enabled {
+        bitmap |= 1 << index;
+    } else {
+        bitmap &= !(1 << index);
+    }
+    extension[4..8].copy_from_slice(&bitmap.to_le_bytes());
+    Ok(())
+}
+
 pub fn parse_saved(data: &[u8]) -> Result<SavedState, String> {
     let payload = decode_saved(data)?;
     if payload.len() < 69708 {
@@ -780,6 +837,7 @@ pub fn parse_saved(data: &[u8]) -> Result<SavedState, String> {
     if count == 0 || count > 24 || active_index >= count {
         return Err("The save file has an invalid file index or count.".into());
     }
+    let real16 = real16_bitmap(&payload)?;
     let mut files = Vec::with_capacity(count);
     for index in 0..count {
         let base = 8 + index * 2814;
@@ -795,6 +853,10 @@ pub fn parse_saved(data: &[u8]) -> Result<SavedState, String> {
         let code_bits = read32(base + 2784);
         if !(1..=3).contains(&mode) || ![16, 32, 64].contains(&code_bits) {
             return Err("The saved file has an unsupported mode or code width.".into());
+        }
+        let real_mode = real16 & (1 << index) != 0;
+        if real_mode && code_bits != 16 {
+            return Err("The saved Real16 view has an invalid code width.".into());
         }
         let line_feed = match read32(base + 2776) {
             0 => LineFeed::CrLf,
@@ -814,6 +876,7 @@ pub fn parse_saved(data: &[u8]) -> Result<SavedState, String> {
             offset: read64(base + 376),
             top: read64(base + 352),
             code_bits,
+            real_mode,
             wrap: payload[base + 2808] == b'Y',
             tab: payload[base + 2809] == b'Y',
             line_feed,
@@ -967,19 +1030,23 @@ mod tests {
         let config = parse(b"[HViewIni 5.03]\r\nDisassemblySyntax=ATT").unwrap();
         assert_eq!(config.disassembly_syntax, crate::decoder::Syntax::Att);
         assert!(parse(b"[HViewIni 5.03]\r\nDisassemblySyntax=MASM").is_err());
+        assert!(!Config::default().invalid_code_bytes);
+        assert!(parse(b"[HViewIni 5.03]\r\nInvalidCode=Byte").is_err());
     }
 
     #[test]
     fn native_configuration_uses_utf8_and_lf() {
         let config = parse(
-            "[HView-Linux 1]\nStartMode=Code\nDisassemblySyntax=ATT\nSaveFile=\"résumé.sav\"\n"
+            "[HView-Linux 1]\nStartMode=Code\nDisassemblySyntax=ATT\nInvalidCode=Byte\nSaveFile=\"résumé.sav\"\n"
                 .as_bytes(),
         )
         .unwrap();
         assert_eq!(config.start_mode, "Code");
         assert_eq!(config.disassembly_syntax, crate::decoder::Syntax::Att);
+        assert!(config.invalid_code_bytes);
         assert_eq!(config.savefile, "résumé.sav");
         assert!(parse(b"[HView-Linux 1]\nDisassemblySyntax=MASM\n").is_err());
+        assert!(parse(b"[HView-Linux 1]\nInvalidCode=Skip\n").is_err());
         let mut invalid = b"[HView-Linux 1]\n;".to_vec();
         invalid.push(0xff);
         assert!(parse(&invalid).unwrap_err().contains("valid UTF-8"));
@@ -1033,6 +1100,11 @@ mod tests {
         let second = decode_saved(include_bytes!("../tests/fixtures/offset-20.sav")).unwrap();
         assert_eq!(first.len(), 105916);
         assert_eq!(second.len(), first.len());
+        assert!(
+            first[REAL16_EXTENSION..REAL16_EXTENSION + 8]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
         assert_eq!(u64::from_le_bytes(first[384..392].try_into().unwrap()), 16);
         assert_eq!(u64::from_le_bytes(second[384..392].try_into().unwrap()), 32);
         assert!(decode_saved(b"HViewSav").is_err());
@@ -1145,6 +1217,39 @@ mod tests {
         assert_eq!(parsed.files[1].offset, 64);
         assert_eq!(parsed.files[1].mode, 2);
         assert!(SavedState::new_files(&[], 0, &view, &Config::default(), Mode::Hex, None).is_err());
+    }
+
+    #[test]
+    fn real16_session_extension_preserves_legacy_widths_and_unknown_data() {
+        use crate::editor::{Editor, Mode};
+        let mut view = Editor::new(vec![0x90], Mode::Code, 0);
+        view.real_mode = true;
+        let mut state =
+            SavedState::new_single("/tmp/real16.bin", &view, &Config::default()).unwrap();
+        assert_eq!(state.files[0].code_bits, 16);
+        assert!(state.files[0].real_mode);
+        assert_eq!(
+            &state.payload[REAL16_EXTENSION..REAL16_EXTENSION + 4],
+            REAL16_SIGNATURE
+        );
+        let parsed = parse_saved(&encode_saved(&state.payload).unwrap()).unwrap();
+        assert!(parsed.files[0].real_mode);
+
+        view.real_mode = false;
+        state.update_view(0, &view).unwrap();
+        assert!(!state.files[0].real_mode);
+        let parsed = parse_saved(&encode_saved(&state.payload).unwrap()).unwrap();
+        assert!(!parsed.files[0].real_mode);
+
+        let mut ordinary =
+            SavedState::new_single("/tmp/ordinary.bin", &view, &Config::default()).unwrap();
+        ordinary.payload[REAL16_EXTENSION] = 0x7a;
+        let before = ordinary.payload.clone();
+        ordinary.update_view(0, &view).unwrap();
+        assert_eq!(ordinary.payload[REAL16_EXTENSION], 0x7a);
+        view.real_mode = true;
+        assert!(ordinary.update_view(0, &view).is_err());
+        assert_eq!(ordinary.payload, before);
     }
 
     #[test]

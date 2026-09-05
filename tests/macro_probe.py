@@ -229,6 +229,41 @@ def main() -> None:
         if edit_file.read_bytes() != b"\xA0":
             raise AssertionError("Normal-mode aliases changed the hexadecimal edit workflow.")
 
+        ctrl_edit = root / "ctrl-edit.mac"
+        ctrl_edit.write_bytes(
+            macro_file(
+                [(0, 0xFF3D), (2, ord("A")), (0, 0xFF43), (2, ord("Q"))]
+            )
+        )
+        ctrl_edit_file = root / "ctrl-edit.bin"
+        ctrl_edit_file.write_bytes(b"\0")
+        run_session(
+            binary,
+            ["--mode=hex", "--macro", str(ctrl_edit), str(ctrl_edit_file)],
+            [],
+        )
+        if ctrl_edit_file.read_bytes() != b"\0":
+            raise AssertionError("A Ctrl macro key changed a hexadecimal edit byte.")
+
+        ctrl_prompt = root / "ctrl-prompt.mac"
+        ctrl_prompt.write_bytes(
+            macro_file(
+                [
+                    (0, ord("m")),
+                    (2, ord("A")),
+                    (0, ord("h")),
+                    (0, 13),
+                    (2, ord("Q")),
+                ]
+            )
+        )
+        output = run_session(
+            binary,
+            ["--mode=text", "--macro", str(ctrl_prompt), str(data_file)],
+            [],
+        )
+        require(output, b"00000000:", "A Ctrl macro key inserted text into the mode prompt.")
+
     print("Macro probe passed.")
 
 

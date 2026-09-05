@@ -43,6 +43,9 @@ pub struct Metadata {
 
 impl Metadata {
     pub fn parse(data: &[u8]) -> Result<Self, String> {
+        if data.starts_with(b"\x7fELF") {
+            return Ok(Self { pe: None });
+        }
         let pe = pe_header(data)?
             .map(|header| Pe::read(data, header))
             .transpose()?;
@@ -1312,6 +1315,7 @@ mod tests {
         assert_eq!(entry_point(b"raw bytes"), Ok(0));
         assert_eq!(virtual_to_file(b"raw bytes", 16), Ok(16));
         assert_eq!(code_address(b"raw bytes", 16), Ok((16, 16)));
+        assert_eq!(code_address(b"\x7fELF raw x86", 4), Ok((4, 16)));
         assert!(entry_point(b"\x7fELF").is_err());
         assert!(entry_point(b"MZ").is_err());
         let mut dos = vec![0; 64];

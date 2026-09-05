@@ -78,8 +78,13 @@ fn frame(
         let mut code_header: Vec<char> = lines[0].chars().collect();
         put(
             &mut code_header,
-            width.saturating_sub(35),
-            &format!("a{}", view.code_bits),
+            width.saturating_sub(40),
+            if view.real_mode {
+                "Real16".to_owned()
+            } else {
+                format!("a{}", view.code_bits)
+            }
+            .as_str(),
         );
         if address != view.offset {
             put(&mut code_header, width.saturating_sub(31), "PE");
@@ -163,12 +168,12 @@ fn decoder_for(
     decoder: &mut Option<decoder::Decoder>,
     bits: u32,
     syntax: decoder::Syntax,
+    real_mode: bool,
 ) -> Result<&decoder::Decoder, String> {
-    if decoder
-        .as_ref()
-        .is_none_or(|decoder| decoder.bits() != bits || decoder.syntax() != syntax)
-    {
-        *decoder = Some(decoder::Decoder::with_syntax(bits, syntax)?);
+    if decoder.as_ref().is_none_or(|decoder| {
+        decoder.bits() != bits || decoder.syntax() != syntax || decoder.real_mode() != real_mode
+    }) {
+        *decoder = Some(decoder::Decoder::with_mode(bits, syntax, real_mode)?);
     }
     Ok(decoder.as_ref().unwrap())
 }
@@ -180,8 +185,23 @@ fn decode_at(
     decoder: &mut Option<decoder::Decoder>,
 ) -> Result<(u64, decoder::Instruction), String> {
     let (address, _) = code_address(metadata, offset)?;
-    let mut instruction =
-        decoder_for(decoder, view.code_bits, view.syntax)?.decode(&view.data, offset, address)?;
+    let decoded = decoder_for(decoder, view.code_bits, view.syntax, view.real_mode)?
+        .decode(&view.data, offset, address);
+    let mut instruction = match decoded {
+        Ok(instruction) => instruction,
+        Err(_) if view.invalid_code_bytes => {
+            let byte = *view
+                .data
+                .get(offset as usize)
+                .ok_or("The decoder reached the end of the file.")?;
+            decoder::Instruction {
+                size: 1,
+                hex: format!("{byte:02X}"),
+                text: format!("db {byte:02X}"),
+            }
+        }
+        Err(error) => return Err(error),
+    };
     if instruction.size == 1
         && let Some(&byte) = view.data.get(offset as usize)
         && ((byte == 0x90 && view.pack_nops) || (byte == 0xCC && view.pack_int3))
@@ -455,6 +475,7 @@ fn open_editor(
         view.offset = state.offset.min(view.data.len() as u64);
         view.top = state.top.min(view.data.len() as u64);
         view.code_bits = state.code_bits;
+        view.real_mode = state.real_mode;
         view.wrap = state.wrap;
         view.expand_tabs = state.tab;
         view.text_column = state.text_column;
@@ -717,11 +738,19 @@ fn open_editor(
                 && view.mode == Mode::Code
                 && key.character.eq_ignore_ascii_case(&'o') =>
             {
-                view.code_bits = match view.code_bits {
-                    16 => 32,
-                    32 => 64,
-                    _ => 16,
-                };
+                if view.real_mode {
+                    view.real_mode = false;
+                    view.code_bits = 16;
+                } else {
+                    match view.code_bits {
+                        16 => view.code_bits = 32,
+                        32 => view.code_bits = 64,
+                        _ => {
+                            view.code_bits = 16;
+                            view.real_mode = true;
+                        }
+                    }
+                }
                 decoder = None;
                 history.clear();
             }
@@ -1084,30 +1113,35 @@ mod tests {
     fn decoder_for_reuses_and_replaces_decoder() {
         let mut decoder = None;
         assert_eq!(
-            decoder_for(&mut decoder, 32, decoder::Syntax::Intel)
+            decoder_for(&mut decoder, 32, decoder::Syntax::Intel, false)
                 .unwrap()
                 .bits(),
             32
         );
         assert_eq!(
-            decoder_for(&mut decoder, 32, decoder::Syntax::Att)
+            decoder_for(&mut decoder, 32, decoder::Syntax::Att, false)
                 .unwrap()
                 .syntax(),
             decoder::Syntax::Att
         );
         assert_eq!(
-            decoder_for(&mut decoder, 16, decoder::Syntax::Intel)
+            decoder_for(&mut decoder, 16, decoder::Syntax::Intel, false)
                 .unwrap()
                 .bits(),
             16
         );
         assert_eq!(
-            decoder_for(&mut decoder, 64, decoder::Syntax::Intel)
+            decoder_for(&mut decoder, 64, decoder::Syntax::Intel, false)
                 .unwrap()
                 .bits(),
             64
         );
-        assert!(decoder_for(&mut decoder, 8, decoder::Syntax::Intel).is_err());
+        assert!(decoder_for(&mut decoder, 8, decoder::Syntax::Intel, false).is_err());
+        assert!(
+            decoder_for(&mut decoder, 16, decoder::Syntax::Intel, true)
+                .unwrap()
+                .real_mode()
+        );
     }
 
     #[test]
@@ -1125,6 +1159,17 @@ mod tests {
         let seed = assembly_seed(&view, &format::Metadata::parse(&view.data)).unwrap();
         assert!(seed.contains("eax, ebx"));
         assert!(!seed.contains('%'));
+    }
+
+    #[test]
+    fn invalid_byte_fallback_is_explicit() {
+        let metadata = format::Metadata::parse(&[0x0f]);
+        let mut decoder = None;
+        let mut view = Editor::new(vec![0x0f], Mode::Code, 0);
+        assert!(decode_at(&view, 0, &metadata, &mut decoder).is_err());
+        view.invalid_code_bytes = true;
+        let (_, instruction) = decode_at(&view, 0, &metadata, &mut decoder).unwrap();
+        assert_eq!((instruction.size, instruction.text.as_str()), (1, "db 0F"));
     }
 
     #[test]

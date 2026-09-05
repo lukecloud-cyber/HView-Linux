@@ -238,19 +238,34 @@ fn scan_key(scan: u16, keycode: u32, control: u32) -> Option<Key> {
         _ => {
             let code = u16::try_from(keycode).ok()?;
             if code <= 0x7f {
-                key_code(code as u8)
+                match code as u8 {
+                    8 => 8,
+                    9 => 9,
+                    10 | 13 => 13,
+                    27 => 27,
+                    byte => key_code(byte),
+                }
             } else {
                 code
             }
         }
     };
+    let character = if keycode <= 255 {
+        let byte = keycode as u8;
+        let upper = byte.to_ascii_uppercase();
+        if control & 8 != 0 && (b'@'..=b'_').contains(&upper) {
+            char::from(upper - b'@')
+        } else if byte.is_ascii_control() {
+            char::from(byte)
+        } else {
+            crate::editor::cp437(byte)
+        }
+    } else {
+        '\0'
+    };
     Some(Key {
         code,
-        character: if keycode <= 255 {
-            crate::editor::cp437(keycode as u8)
-        } else {
-            '\0'
-        },
+        character,
         control,
     })
 }
@@ -633,6 +648,16 @@ mod tests {
         assert_eq!(
             scan_key(0, u32::from(b'q'), 0).unwrap().code,
             u16::from(b'Q')
+        );
+        let macro_ctrl_a = scan_key(0, u32::from(b'A'), 8).unwrap();
+        assert_eq!((macro_ctrl_a.code, macro_ctrl_a.character), (65, '\u{1}'));
+        assert_eq!(scan_key(0, u32::from(b'A'), 0).unwrap().character, 'A');
+        assert_eq!(
+            (
+                scan_key(0, 13, 0).unwrap().code,
+                scan_key(0, 13, 0).unwrap().character
+            ),
+            (13, '\r')
         );
         for (byte, code) in [(1, b'A'), (3, b'C'), (6, b'F'), (19, b'S')] {
             let key = control_key(byte);
