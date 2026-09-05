@@ -6,7 +6,9 @@ Use `TRACKER.md` for task status and Astra review results.
 Astra accepted all matrix rows and Linux differences at source commit `5febcd48d5d71642fd4d6eca7bd67ff273e149a4`.
 The final package is `target/packages/hview-linux-x86_64-5febcd4`.
 The packaged executable SHA-256 is `e0ebf155b1392a955aa1b2d941120889ef4e2511ebf6824a65e116ea696e12c7`.
-Local CI-equivalent checks passed. The hosted CI workflow has not run.
+Local CI-equivalent checks passed.
+Hosted CI started after publication of `a2e6ddd` and was in progress when the publication record was written.
+See `TRACKER.md` for the hosted run link.
 
 ## Commands
 

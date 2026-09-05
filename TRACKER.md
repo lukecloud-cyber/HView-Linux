@@ -23,6 +23,10 @@ Read [VERIFICATION.md](VERIFICATION.md) for the final function and Linux-differe
 The Phase 1 candidate contains the imported source and the Linux adapters.
 The branch started with the empty root commit `4ded82f485022075d061588a090cb8ddbfa03406`.
 The initial branch commit was pushed and verified.
+The user authorized publication of the Rust implementation on September 5, 2026.
+The push published commit `a2e6ddd98a559c0585e1eb5b8db7c9a0f81ab329` to `origin/rust-rewrite`.
+The remote branch hash matched that commit after publication.
+The default branch remains `main`.
 Use Git status and history to determine the current documentation commit and remote state.
 
 ## Fixed decisions
@@ -157,7 +161,9 @@ These results do not establish Linux feature parity.
 | Final release benchmark | Raw median/p95 24180/26064 ns; PE median/p95 29850/31273 ns |
 
 These checks ran on Linux x86-64 with Rust 1.98.0.
-The local CI-equivalent checks passed. The configured remote CI workflow has not run.
+The local CI-equivalent checks passed.
+Hosted CI started after publication in [run 33984434765](https://github.com/lukecloud-cyber/HView-Linux/actions/runs/33984434765).
+The run was in progress when this publication record was written.
 The Astra Phase 1 review passed at commit `77d4236bc355cdca517c094a45d3a12c766eaef1`.
 The Astra Phase 2 review passed at commit `cd476bd2354dd30a545197b6d1ba2b674ff975e6`.
 The Astra Phase 3 review passed at commit `1764904fde9a4d0fc8567f7b240c0087511972e2`.
