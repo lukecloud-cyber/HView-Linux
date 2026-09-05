@@ -12,8 +12,8 @@ Read [PLAN.md](PLAN.md) for the complete requirements and source references.
 - Core owner: `sol_linux_baseline` owns source adapters, fixtures, core tests, and terminal checks.
 - Native owner: `native_package` owns `lib`, package scripts, native probes, and native metadata.
 - Save owner: `save_backend` owns `src/save.rs` and its inline tests.
-- Next task: complete Astra review of the stable Phase 2 candidate.
-- Next acceptance check: rerun required checks after Astra review.
+- Next task: complete Astra review of the corrected Phase 2 candidate.
+- Next acceptance check: verify the six Phase 2 review corrections.
 - Application blockers: none confirmed.
 - Current branch: `rust-rewrite`.
 - Project folder: `/home/sweet_cicero/Projects/HView-Linux`.
@@ -150,6 +150,14 @@ Portable mode stops lookup after the executable sibling.
 The candidate keeps legacy CRLF parsing and legacy numeric behavior.
 The saved format still permits 1 to 24 ASCII paths with fewer than 260 bytes.
 Windows saved paths now fail with a Linux path error.
+
+Astra found six Phase 2 defects in the first candidate.
+New sessions now store absolute paths before SAV validation.
+Linux absolute paths can contain literal backslashes.
+Relative and empty XDG paths now fall back to HOME.
+File switching now reads the current session view record.
+Explicit startup modes now initialize inactive session records.
+The `--` boundary now disables every legacy option check.
 
 Astra found incomplete CP437 output and idle resize handling.
 The candidate now preserves all CP437 cells and redraws after idle resize.

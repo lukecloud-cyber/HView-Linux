@@ -107,7 +107,7 @@ def main() -> None:
         copied.parent.mkdir()
         shutil.copy2(binary, copied)
         xdg = root / "xdg"
-        xdg_config = xdg / "hview-linux" / "config.ini"
+        xdg_config = xdg / "hview-linux" / "hview-linux.ini"
         xdg_config.parent.mkdir(parents=True)
         xdg_config.write_bytes(native_config("Hex"))
         environment = os.environ.copy()
@@ -185,6 +185,16 @@ def main() -> None:
         output = run_session(binary, ["--session", str(session)], [CTRL_Q])
         require(output, b"a-first.bin", "The active file did not survive restart.")
 
+        view_config = root / "view.ini"
+        view_config.write_bytes(native_config("Hex"))
+        view_session = root / "view.sav"
+        output = run_session(
+            binary,
+            ["--config", str(view_config), "--session", str(view_session), str(first)],
+            [b"\x1b[C", F9, DOWN, DOWN, b"\r", CTRL_F11, CTRL_Q],
+        )
+        require(output, b"00000001", "File switching did not restore the current view offset.")
+
         saved = bytearray(session.read_bytes())
         if saved[24:28] != b"\0\0\0\0":
             raise AssertionError("The native saved fixture is unexpectedly compressed.")
@@ -216,6 +226,57 @@ def main() -> None:
         require(output, b"260 ASCII bytes", "A Unicode session path did not fail clearly.")
         if excluded_session.exists():
             raise AssertionError("An invalid session was published.")
+
+        backslash_file = root / "name\\part.bin"
+        backslash_file.write_bytes(b"Backslash path")
+        backslash_session = root / "backslash.sav"
+        run_session(
+            binary,
+            ["--session", str(backslash_session), str(backslash_file)],
+            [CTRL_Q],
+        )
+        output = run_session(binary, ["--session", str(backslash_session)], [CTRL_Q])
+        require(output, b"name\\part.bin", "A Linux backslash path did not survive restart.")
+
+        first_directory = root / "first-directory"
+        second_directory = root / "second-directory"
+        first_directory.mkdir()
+        second_directory.mkdir()
+        (first_directory / "same.bin").write_bytes(b"FIRST DIRECTORY")
+        (second_directory / "same.bin").write_bytes(b"SECOND DIRECTORY")
+        relative_session = root / "relative.sav"
+        old_directory = Path.cwd()
+        try:
+            os.chdir(first_directory)
+            run_session(
+                binary,
+                ["--session", str(relative_session), "same.bin"],
+                [CTRL_Q],
+            )
+            os.chdir(second_directory)
+            output = run_session(binary, ["--session", str(relative_session)], [CTRL_Q])
+        finally:
+            os.chdir(old_directory)
+        require(output, b"FIRST DIRECTORY", "A relative session path opened a different file.")
+        if b"SECOND DIRECTORY" in output:
+            raise AssertionError("A session used the restart working directory.")
+
+        utf16_file = root / "utf16.bin"
+        utf16_file.write_bytes("\N{ZERO WIDTH NO-BREAK SPACE}Text".encode("utf-16-le"))
+        utf16_session = root / "utf16.sav"
+        run_session(
+            binary,
+            [
+                "--mode=hex",
+                "--session",
+                str(utf16_session),
+                str(data_file),
+                str(utf16_file),
+            ],
+            [CTRL_Q],
+        )
+        if not utf16_session.is_file():
+            raise AssertionError("Explicit Hex mode did not initialize the UTF-16 session file.")
 
     print("File workflow probe passed.")
 

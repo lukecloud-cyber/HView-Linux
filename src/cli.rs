@@ -137,7 +137,7 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
-        if legacy_option(arg) && arg.len() >= 260 {
+        if !files_only && legacy_option(arg) && arg.len() >= 260 {
             return Err(CliError::ArgumentTooLong);
         }
         let bytes = arg.as_bytes();
@@ -408,6 +408,11 @@ mod tests {
         assert_eq!(paths.file_masks[2].pattern, "/other/file.bin");
         assert_eq!(paths.file_masks[3].pattern, "/s");
         assert!(parse(&["x".repeat(260)]).is_ok());
+        let literal = format!("/SAV={}", "x".repeat(260));
+        assert_eq!(
+            parse(&["--".into(), literal.clone()]).unwrap().file_masks[0].pattern,
+            literal
+        );
         assert_eq!(
             parse(&[format!("/SAV={}", "x".repeat(260))]),
             Err(CliError::ArgumentTooLong)

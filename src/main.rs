@@ -343,6 +343,10 @@ fn new_view(
 }
 
 fn restored_path(text: &str) -> Result<PathBuf, String> {
+    let path = Path::new(text);
+    if path.is_absolute() {
+        return Ok(path.into());
+    }
     let bytes = text.as_bytes();
     let drive = bytes.get(1) == Some(&b':') && bytes.first().is_some_and(u8::is_ascii_alphabetic);
     if drive || text.contains('\\') {
@@ -350,7 +354,9 @@ fn restored_path(text: &str) -> Result<PathBuf, String> {
             "The saved path uses Windows syntax and cannot open on Linux: {text}"
         ));
     }
-    Ok(PathBuf::from(text))
+    Err(format!(
+        "The saved path is relative and cannot restore safely: {text}"
+    ))
 }
 
 enum EditorAction {
@@ -476,8 +482,7 @@ fn open_editor(
                 let destination = PathBuf::from(name.trim().trim_matches('"'));
                 let result = std::path::absolute(&destination).and_then(|destination| {
                     if save_state_enabled {
-                        config::SavedState::validate_path(destination.to_str().unwrap_or("\0"))
-                            .map_err(io::Error::other)?;
+                        config::SavedState::saved_path(&destination).map_err(io::Error::other)?;
                     }
                     save::save_as(&destination, &view.data)?;
                     Ok(destination)
@@ -903,7 +908,6 @@ fn run() -> io::Result<()> {
         console.modal(&lines, "Couldn't open file")?;
         return Ok(());
     }
-    let restore_saved = saved_state.is_some();
     let mut index = saved_state.as_ref().map_or(0, |state| state.active_index);
     if let Some(playback) = playback.take() {
         console.start_macro(playback);
@@ -914,25 +918,23 @@ fn run() -> io::Result<()> {
             paths[index].clone(),
             &options,
             &config,
-            if restore_saved {
-                saved_state
-                    .as_ref()
-                    .and_then(|state| state.files.get(index))
-            } else {
-                None
-            },
+            saved_state
+                .as_ref()
+                .and_then(|state| state.files.get(index)),
             session_enabled,
         )?;
         if let Some((path, view)) = view {
             paths[index] = path;
             if let Some(state) = &mut saved_state {
+                let saved_path =
+                    config::SavedState::saved_path(&paths[index]).map_err(io::Error::other)?;
                 if index == state.files.len() {
                     state
-                        .add_file(paths[index].to_str().unwrap_or("\0"), &view, &config)
+                        .add_file(&saved_path, &view, &config)
                         .map_err(io::Error::other)?;
-                } else if state.files[index].path != paths[index].to_string_lossy() {
+                } else if state.files[index].path != saved_path {
                     state
-                        .update_path(index, paths[index].to_str().unwrap_or("\0"))
+                        .update_path(index, &saved_path)
                         .map_err(io::Error::other)?;
                 }
                 state.update_view(index, &view).map_err(io::Error::other)?;
@@ -959,10 +961,7 @@ fn run() -> io::Result<()> {
                 } else if session_enabled && paths.len() >= 24 {
                     console.modal(&[], "A save state supports no more than 24 files.")?;
                 } else {
-                    if session_enabled
-                        && let Err(error) =
-                            config::SavedState::validate_path(path.to_str().unwrap_or("\0"))
-                    {
+                    if session_enabled && let Err(error) = config::SavedState::saved_path(&path) {
                         console.modal(&[], &error)?;
                         continue;
                     }
@@ -1113,7 +1112,39 @@ mod tests {
             restored_path("/tmp/file.bin").unwrap(),
             Path::new("/tmp/file.bin")
         );
+        assert_eq!(
+            restored_path("/tmp/name\\part.bin").unwrap(),
+            Path::new("/tmp/name\\part.bin")
+        );
         assert!(restored_path("C:\\file.bin").is_err());
+        assert!(restored_path("\\\\server\\file.bin").is_err());
         assert!(restored_path("folder\\file.bin").is_err());
+        assert!(restored_path("relative.bin").is_err());
+    }
+
+    #[test]
+    fn native_backslash_path_roundtrips_through_a_session() {
+        let folder = std::env::temp_dir().join(format!(
+            "hview-backslash-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&folder).unwrap();
+        let path = folder.join("name\\part.bin");
+        std::fs::write(&path, b"data").unwrap();
+        let view = Editor::new(b"data".to_vec(), Mode::Hex, 0);
+        let state = config::SavedState::new_files(
+            std::slice::from_ref(&path),
+            0,
+            &view,
+            &config::Config::default(),
+        )
+        .unwrap();
+        let parsed = config::parse_saved(&config::encode_saved(&state.payload).unwrap()).unwrap();
+        assert_eq!(restored_path(&parsed.files[0].path).unwrap(), path);
+        std::fs::remove_dir_all(folder).unwrap();
     }
 }

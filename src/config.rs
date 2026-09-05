@@ -217,10 +217,10 @@ pub fn configuration_paths(
     if portable {
         return paths;
     }
-    if let Some(root) = xdg_config_home.filter(|root| !root.is_empty()) {
-        paths.push(PathBuf::from(root).join("hview-linux/config.ini"));
+    if let Some(root) = xdg_config_home.filter(|root| Path::new(root).is_absolute()) {
+        paths.push(PathBuf::from(root).join("hview-linux/hview-linux.ini"));
     } else if let Some(root) = home.filter(|root| !root.is_empty()) {
-        paths.push(PathBuf::from(root).join(".config/hview-linux/config.ini"));
+        paths.push(PathBuf::from(root).join(".config/hview-linux/hview-linux.ini"));
     }
     paths
 }
@@ -560,32 +560,21 @@ impl SavedState {
         view: &crate::editor::Editor,
         config: &Config,
     ) -> Result<Self, String> {
-        use crate::editor::Mode;
         if paths.is_empty() || paths.len() > 24 || active_index >= paths.len() {
             return Err("A save state supports 1 to 24 files and a valid active index.".into());
         }
-        let mut state = Self::new_single(
-            paths[active_index]
-                .to_str()
-                .ok_or("The saved path is not ASCII.")?,
-            view,
-            config,
-        )?;
+        let active_path = Self::saved_path(&paths[active_index])?;
+        let mut state = Self::new_single(&active_path, view, config)?;
         state.files.clear();
         for (index, path) in paths.iter().enumerate() {
-            let text_path = path.to_str().ok_or("The saved path is not ASCII.")?;
+            let text_path = Self::saved_path(path)?;
             if index == active_index {
-                state.add_file(text_path, view, config)?;
+                state.add_file(&text_path, view, config)?;
             } else {
                 let data = std::fs::read(path)
                     .map_err(|error| format!("Cannot read {}: {error}", path.display()))?;
-                let mode = match config.start_mode.as_str() {
-                    "Hex" => Mode::Hex,
-                    "Code" => Mode::Code,
-                    _ => Mode::Text,
-                };
-                let initial = config.new_view(data, mode, 0)?;
-                state.add_file(text_path, &initial, config)?;
+                let initial = config.new_view(data, view.mode, 0)?;
+                state.add_file(&text_path, &initial, config)?;
             }
         }
         state.update_view(active_index, view)?;
@@ -618,6 +607,16 @@ impl SavedState {
             return Err("The saved path must contain fewer than 260 ASCII bytes.".into());
         }
         Ok(())
+    }
+
+    pub fn saved_path(path: &Path) -> Result<String, String> {
+        let absolute = std::path::absolute(path)
+            .map_err(|error| format!("Cannot make the saved path absolute: {error}"))?;
+        let text = absolute
+            .to_str()
+            .ok_or("The saved path is not valid UTF-8.")?;
+        Self::validate_path(text)?;
+        Ok(text.into())
     }
 
     pub fn update_path(&mut self, index: usize, path: &str) -> Result<(), String> {
@@ -975,14 +974,14 @@ mod tests {
             ),
             [
                 PathBuf::from("/opt/hview-linux/bin/hview-linux.ini"),
-                PathBuf::from("/xdg/hview-linux/config.ini"),
+                PathBuf::from("/xdg/hview-linux/hview-linux.ini"),
             ]
         );
         assert_eq!(
             configuration_paths(executable, false, None, Some(OsStr::new("/home/user"))),
             [
                 PathBuf::from("/opt/hview-linux/bin/hview-linux.ini"),
-                PathBuf::from("/home/user/.config/hview-linux/config.ini"),
+                PathBuf::from("/home/user/.config/hview-linux/hview-linux.ini"),
             ]
         );
         assert_eq!(
@@ -994,6 +993,15 @@ mod tests {
             ),
             [PathBuf::from("/opt/hview-linux/bin/hview-linux.ini")]
         );
+        for xdg in [OsStr::new("relative"), OsStr::new("")] {
+            assert_eq!(
+                configuration_paths(executable, false, Some(xdg), Some(OsStr::new("/home/user")),),
+                [
+                    PathBuf::from("/opt/hview-linux/bin/hview-linux.ini"),
+                    PathBuf::from("/home/user/.config/hview-linux/hview-linux.ini"),
+                ]
+            );
+        }
     }
 
     #[test]
@@ -1116,31 +1124,6 @@ mod tests {
     }
 
     #[test]
-    fn saved_state_accepts_one_to_twenty_four_files() {
-        use crate::editor::{Editor, Mode};
-        let config = Config::default();
-        let view = Editor::new(vec![0], Mode::Hex, 0);
-        let mut state = SavedState::new_single("file-00.bin", &view, &config).unwrap();
-        for index in 1..24 {
-            state
-                .add_file(&format!("file-{index:02}.bin"), &view, &config)
-                .unwrap();
-        }
-        for count in 1..=24 {
-            put32(&mut state.payload, 4, count);
-            assert_eq!(
-                parse_saved(&encode_saved(&state.payload).unwrap())
-                    .unwrap()
-                    .files
-                    .len(),
-                count as usize
-            );
-        }
-        put32(&mut state.payload, 4, 24);
-        assert!(state.add_file("file-24.bin", &view, &config).is_err());
-    }
-
-    #[test]
     fn inactive_utf16_files_use_the_same_view_options() {
         use crate::editor::Mode;
         let data: Vec<u8> = "\u{feff}Alpha beta gamma delta epsilon zeta eta theta\r\n"
@@ -1171,6 +1154,11 @@ mod tests {
                 SavedState::new_files(&paths, 0, &view, &config)
             })
             .collect();
+        let explicit_hex = Config::default();
+        let hex_view = explicit_hex.new_view(vec![0], Mode::Hex, 0).unwrap();
+        let explicit_hex_state =
+            SavedState::new_files(&paths, 0, &hex_view, &explicit_hex).unwrap();
+        assert!(explicit_hex_state.files.iter().all(|file| file.mode == 2));
         std::fs::remove_file(path).unwrap();
         for (result, expected_mode) in results.into_iter().zip([2, 3]) {
             let state = result.unwrap();
@@ -1232,12 +1220,16 @@ mod tests {
         assert_eq!(state.files.len(), 24);
         assert_eq!(state.active_index, 1);
         assert_eq!(state.payload, before);
-        assert_eq!(
-            parse_saved(&encode_saved(&state.payload).unwrap())
-                .unwrap()
-                .files
-                .len(),
-            24
-        );
+        put32(&mut state.payload, 0, 0);
+        for count in 1..=24 {
+            put32(&mut state.payload, 4, count);
+            assert_eq!(
+                parse_saved(&encode_saved(&state.payload).unwrap())
+                    .unwrap()
+                    .files
+                    .len(),
+                count as usize
+            );
+        }
     }
 }
