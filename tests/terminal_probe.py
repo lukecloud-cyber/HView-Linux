@@ -13,6 +13,7 @@ import sys
 import tempfile
 import termios
 import time
+from collections.abc import Callable
 
 
 def set_size(fd: int, columns: int, rows: int) -> None:
@@ -36,7 +37,13 @@ def drain(fd: int, output: bytearray, wait: float = 0.08) -> None:
 def run_session(
     binary: Path,
     arguments: list[str],
-    actions: list[bytes | tuple[int, int] | tuple[int, int, bytes] | list[bytes]],
+    actions: list[
+        bytes
+        | tuple[int, int]
+        | tuple[int, int, bytes]
+        | list[bytes]
+        | Callable[[], None]
+    ],
     environment: dict[str, str] | None = None,
     expected_code: int = 0,
 ) -> bytes:
@@ -56,7 +63,9 @@ def run_session(
     try:
         drain(master, output, 0.15)
         for action in actions:
-            if isinstance(action, tuple):
+            if callable(action):
+                action()
+            elif isinstance(action, tuple):
                 start = len(output)
                 set_size(slave, action[0], action[1])
                 if len(action) == 3:

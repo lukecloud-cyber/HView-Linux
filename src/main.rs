@@ -504,7 +504,12 @@ fn open_editor(
                         updated = true;
                     }
                     Err(error) => {
-                        console.modal(&lines, &error.to_string())?;
+                        let message = if error.kind() == io::ErrorKind::AlreadyExists {
+                            format!("The destination already exists. Use a new file name. {error}")
+                        } else {
+                            error.to_string()
+                        };
+                        console.modal(&lines, &message)?;
                     }
                 }
             }
