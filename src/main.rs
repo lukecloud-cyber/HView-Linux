@@ -482,9 +482,12 @@ fn confirm_assembly(console: &Console, preview: &AssemblyPreview) -> io::Result<
             lines[height - 1] = "Enter Apply  Esc Cancel".into();
         }
         console.draw(&lines)?;
-        match console.key()?.code {
-            13 if ready => return Ok(true),
+        let key = console.key()?;
+        let resized = console.dimensions() != (width, height);
+        match key.code {
             27 => return Ok(false),
+            _ if resized => {}
+            13 if ready => return Ok(true),
             _ => {}
         }
     }

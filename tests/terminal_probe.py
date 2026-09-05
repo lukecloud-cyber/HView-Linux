@@ -41,6 +41,7 @@ def run_session(
         bytes
         | tuple[int, int]
         | tuple[int, int, bytes]
+        | tuple[int, int, bytes, bytes]
         | list[bytes]
         | Callable[[], None]
     ],
@@ -68,6 +69,12 @@ def run_session(
             elif isinstance(action, tuple):
                 start = len(output)
                 set_size(slave, action[0], action[1])
+                if len(action) == 4:
+                    os.write(master, action[2])
+                    drain(master, output, 0.25)
+                    if action[3] not in output[start:]:
+                        raise AssertionError("A simultaneous resize and key did not redraw.")
+                    continue
                 if len(action) == 3:
                     drain(master, output, 0.25)
                     if action[2] not in output[start:]:

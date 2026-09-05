@@ -37,7 +37,7 @@ def raw_model(value: str) -> list[bytes]:
 
 
 def check_overlap_and_resize(binary: Path, root: Path, config: Path) -> None:
-    """Check longer overlap, cancellation, and live resize."""
+    """Check longer overlap, live resize, and guarded application."""
     path = root / "overlap.bin"
     original = bytes.fromhex("90 BB 02 00 00 00 C3")
     path.write_bytes(original)
@@ -49,9 +49,14 @@ def check_overlap_and_resize(binary: Path, root: Path, config: Path) -> None:
             F3,
             F2,
             b"mov eax,1\r",
-            (30, 5),
-            ENTER,
+            (30, 5, ENTER, b"Resize to at least 60 columns"),
             (60, 24, b"Assembly patch preview"),
+            ENTER,
+            lambda: require_bytes(
+                path,
+                original,
+                "An applied preview changed the file before F9.",
+            ),
             ESCAPE,
             F9,
             CTRL_Q,
@@ -77,7 +82,11 @@ def check_overlap_and_resize(binary: Path, root: Path, config: Path) -> None:
         b"F:0 mov eax",
         b"Enter Apply  Esc Cancel",
     )
-    require_bytes(path, original, "A canceled longer preview changed the file.")
+    require_bytes(
+        path,
+        bytes.fromhex("B8 01 00 00 00 00 C3"),
+        "The confirmed longer preview did not save the exact bytes.",
+    )
 
 
 def check_shorter_apply(binary: Path, root: Path, config: Path) -> None:
