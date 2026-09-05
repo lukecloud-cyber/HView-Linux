@@ -151,7 +151,8 @@ def check_decode_and_assembly(binary: Path, root: Path) -> None:
         b"%ebx",
         b"%eax",
         b"eax, ebx",
-        b".00001000: E803000000",
+        b"Runtime address: 0000000000001000",
+        b"Replacement bytes (5): E8 03 00 00 00",
         raw_header(0x1000),
     )
     if path.read_bytes() != original:

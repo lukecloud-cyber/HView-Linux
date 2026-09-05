@@ -10,12 +10,12 @@ Read [UPSTREAM_REVIEW.md](UPSTREAM_REVIEW.md) for the subsequent Windows D04 thr
 
 - Completed: project analysis, repository rename, branch creation, plan, and tracker.
 - Application implementation: the original D03 release passed all six phases and Astra review.
-- Active work: prepare the D05 raw address model for Astra review.
+- Active work: prepare the verified D06 assembly preview for Astra review.
 - Core owner: `sol_linux_baseline` owns source adapters, fixtures, core tests, and terminal checks.
 - Native owner: `native_package` owns `lib`, package scripts, native probes, and native metadata.
 - Save owner: `save_backend` owns `src/save.rs` and its inline tests.
-- Next task: have Astra review the exact D05 candidate commit.
-- Next acceptance check: close all D05 review findings before D06 starts.
+- Next task: commit the exact D06 candidate and request Astra review.
+- Next acceptance check: have Astra review the exact D06 candidate commit.
 - Upstream review: Windows `a3b7240` supplies the approved D04 through D07 source baseline.
 - Application blockers: none confirmed.
 - Current branch: `rust-rewrite`.
@@ -117,8 +117,8 @@ Finish each stage before dependent source changes.
 | ID | Task | Status | Evidence |
 |---|---|---|---|
 | D04 | Direct branch navigation, checked targets, return history, and F5 history correction | Complete | Astra accepted `1793755`; unit and PTY checks pass group targets, mappings, machines, syntax, Real16, histories, and F5 clearing |
-| D05 | Transient raw runtime base, x86 width, integer byte order, and checked growth | Implemented | Raw/AUTO, checked mappings, widths, byte order, growth, transient state, and Real16 separation pass 76 unit tests and the PTY probe; Astra review remains |
-| D06 | Nonmutating assembly preview with exact-byte confirmation | Pending | Depends on the D05 address model |
+| D05 | Transient raw runtime base, x86 width, integer byte order, and checked growth | Complete | Astra accepted `04e5610`; raw/AUTO, mapping, widths, byte order, growth, transient state, sessions, and Real16 separation pass |
+| D06 | Nonmutating assembly preview with exact-byte confirmation | Implemented | Exact bytes, strict decoding, Real16, raw bounds, 60-column wrapping, resize gates, and cancellation pass unit and PTY checks; Astra review remains |
 | D07 | Grouped operation undo/redo with record and byte limits | Pending | Includes confirmed D06 patches, hexadecimal edits, fill, and XOR |
 | EXT-VERIFY | Final regression suite, isolated package, documentation, and Astra acceptance | Pending | Run against the complete D07 extension |
 
@@ -175,6 +175,8 @@ These results do not establish Linux feature parity.
 | `python3 tests/linux_behavior_probe.py target/release/hview-linux` | Passed Code cycling, Real16, fallback, sessions, syntax, and raw ELF workflows |
 | `python3 tests/navigation_probe.py target/release/hview-linux` | Passed direct branch, return, refusal, mapping, syntax, Real16, mode, and edited-byte workflows in 18.2 seconds |
 | `python3 tests/raw_model_probe.py target/release/hview-linux` | Passed raw grammar, bounds, mapping, widths, byte order, history, transient state, AUTO, session, syntax, assembly, and growth workflows in 19.0 seconds |
+| D06 strict local checks | Format, strict Clippy, release build, 79 tests, and nine application probes passed; one manual benchmark remained ignored |
+| `python3 tests/patch_probe.py target/release/hview-linux` | Passed six exact-byte preview sessions with cancellation, Apply, resize, syntax, Real16, fallback, raw bounds, overlap, and EOF growth |
 | Six application probes against one release build | Terminal, file, reliability, analysis, macro, and Linux behavior probes passed |
 | Final isolated package | `/home/sweet_cicero/Projects/HView-Linux/target/packages/hview-linux-x86_64-5febcd4`; executable SHA-256 `e0ebf155b1392a955aa1b2d941120889ef4e2511ebf6824a65e116ea696e12c7` |
 | Final release benchmark | Raw median/p95 24180/26064 ns; PE median/p95 29850/31273 ns |

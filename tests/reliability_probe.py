@@ -75,7 +75,7 @@ def main() -> None:
         output = run_session(
             binary,
             ["--config", str(att_config), "--mode=code", str(assembly)],
-            [F3, F2, b"nop\r", b"\x1b", F9, CTRL_Q],
+            [F3, F2, b"nop\r", b"\r", b"\x1b", F9, CTRL_Q],
         )
         require(output, b"%ebx", "AT&T display syntax did not appear.")
         require(output, b"eax, ebx", "The assembly seed did not keep Intel syntax.")
@@ -87,7 +87,7 @@ def main() -> None:
         run_session(
             binary,
             ["--mode=code", str(extension)],
-            [RIGHT, F3, F2, b"nop\r", b"\x1b", F9, CTRL_Q],
+            [RIGHT, F3, F2, b"nop\r", b"\r", b"\x1b", F9, CTRL_Q],
         )
         if extension.read_bytes() != b"\xc3\x90":
             raise AssertionError("Assembly did not extend the buffer at EOF.")

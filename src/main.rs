@@ -25,6 +25,7 @@ const NORMAL_KEYS: &str = " 1Help   2PutBlk 3Edit   4Mode   5Goto   6DatRef 7Sea
 const TEXT_KEYS: &str = " 1Help   2Unwrap 3       4Mode   5Goto   6LnFeed 7Search 8Table  9Files 10Quit  11Hem   12      ";
 const EDIT_KEYS: &str = " 1Help   2       3Undo   4Byte   5Word   6Dword  7Crypt  8Xor    9Update10Trunc 11      12      ";
 const RETURN_HISTORY_LIMIT: usize = 256;
+const X86_MAX_INSTRUCTION_BYTES: usize = 15;
 
 fn put(line: &mut [char], column: usize, text: &str) {
     for (slot, ch) in line.iter_mut().skip(column).zip(text.chars()) {
@@ -185,6 +186,308 @@ fn decoder_for(
         *decoder = Some(decoder::Decoder::with_mode(bits, syntax, real_mode)?);
     }
     Ok(decoder.as_ref().unwrap())
+}
+
+struct PreviewRows {
+    rows: Vec<String>,
+    end: usize,
+    first_size: Option<usize>,
+}
+
+#[derive(Debug)]
+struct AssemblyPreview {
+    summary: Vec<String>,
+    original: Vec<String>,
+    proposed: Vec<String>,
+}
+
+fn spaced_hex(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "<end of file>".into();
+    }
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn preview_rows(
+    data: &[u8],
+    file_start: usize,
+    stop: usize,
+    metadata: &format::Metadata,
+    decoder: &decoder::Decoder,
+    byte_fallback: bool,
+) -> PreviewRows {
+    let mut rows = Vec::new();
+    let mut relative = 0usize;
+    let mut first_size = None;
+    while file_start.saturating_add(relative) < stop {
+        let file_offset = file_start.saturating_add(relative);
+        let address = match metadata.code_address(file_offset as u64) {
+            Ok((address, _)) => address,
+            Err(error) => {
+                rows.push(format!("F:{file_offset:X} <address error: {error}>"));
+                break;
+            }
+        };
+        let instruction = match decoder.decode(data, relative as u64, address) {
+            Ok(instruction) => instruction,
+            Err(_) if byte_fallback => {
+                let Some(&byte) = data.get(relative) else {
+                    rows.push(format!("F:{file_offset:X} <end of file> A:{address:X}"));
+                    break;
+                };
+                decoder::Instruction {
+                    size: 1,
+                    hex: format!("{byte:02X}"),
+                    text: format!("db {byte:02X}"),
+                }
+            }
+            Err(error) => {
+                rows.push(format!(
+                    "F:{file_offset:X} <decode error: {error}> A:{address:X}"
+                ));
+                break;
+            }
+        };
+        first_size.get_or_insert(instruction.size);
+        let text = instruction
+            .text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        rows.push(format!("F:{file_offset:X} {text} A:{address:X}"));
+        relative = relative.saturating_add(instruction.size);
+    }
+    PreviewRows {
+        rows,
+        end: file_start.saturating_add(relative),
+        first_size,
+    }
+}
+
+fn assembly_preview(
+    view: &Editor,
+    metadata: &format::Metadata,
+    decoder: &mut Option<decoder::Decoder>,
+    replacement: &[u8],
+) -> Result<AssemblyPreview, String> {
+    if replacement.is_empty() {
+        return Err("The assembler produced no replacement bytes.".into());
+    }
+    let start =
+        usize::try_from(view.offset).map_err(|_| "The offset exceeds the address range.")?;
+    if start > view.data.len() {
+        return Err("The offset exceeds the file size.".into());
+    }
+    let end = start
+        .checked_add(replacement.len())
+        .ok_or("The instruction exceeds the address range.")?;
+    let new_len = view.data.len().max(end);
+    view.validate_raw_len(new_len)?;
+    let address = metadata.code_address(view.offset)?.0;
+    let decoder = decoder_for(
+        decoder,
+        view.decode_bits(),
+        view.syntax,
+        view.decode_real_mode(),
+    )?;
+
+    let original_stop = end.min(view.data.len());
+    let mut original = preview_rows(
+        &view.data[start..],
+        start,
+        original_stop,
+        metadata,
+        decoder,
+        view.invalid_code_bytes,
+    );
+    if start == view.data.len() {
+        original
+            .rows
+            .push(format!("F:{start:X} <end of file> A:{address:X}"));
+    }
+    let original_end = original.end.max(original_stop);
+    let proposed_stop = end.max(original_end);
+    let tail_end = proposed_stop
+        .saturating_add(X86_MAX_INSTRUCTION_BYTES - 1)
+        .min(view.data.len());
+    let mut proposed_data = view.data[start..tail_end].to_vec();
+    proposed_data.resize(proposed_data.len().max(replacement.len()), 0);
+    proposed_data[..replacement.len()].copy_from_slice(replacement);
+
+    let verified = decoder
+        .decode(&proposed_data, 0, address)
+        .map_err(|error| format!("Cannot verify the replacement instruction: {error}"))?;
+    if verified.size != replacement.len() {
+        return Err(
+            "The assembler and decoder disagree on the replacement instruction length.".into(),
+        );
+    }
+    let proposed = preview_rows(
+        &proposed_data,
+        start,
+        proposed_stop,
+        metadata,
+        decoder,
+        view.invalid_code_bytes,
+    );
+
+    let original_size = original.first_size;
+    let overwritten = original_stop.saturating_sub(start);
+    let shown_original_size = original_size.unwrap_or(0).max(overwritten);
+    let original_bytes = &view.data[start..start + shown_original_size];
+    let delta = original_size
+        .map(|size| format!("{:+} bytes", replacement.len() as i128 - size as i128))
+        .unwrap_or_else(|| "n/a".into());
+    let growth = new_len - view.data.len();
+    let mut summary = vec![
+        "Assembly patch preview".into(),
+        format!("File offset: {start:08X} | Runtime address: {address:016X}"),
+        format!(
+            "Original bytes ({}): {}",
+            original_bytes.len(),
+            spaced_hex(original_bytes)
+        ),
+        format!(
+            "Replacement bytes ({}): {}",
+            replacement.len(),
+            spaced_hex(replacement)
+        ),
+        format!("Replacement length delta: {delta} | File growth: +{growth} bytes"),
+    ];
+    let overlap = original.end.saturating_sub(end);
+    if overlap != 0 {
+        summary.push(format!(
+            "Partial overlap: the final original instruction retains {overlap} byte(s)."
+        ));
+    }
+    if original_size.is_some_and(|size| replacement.len() < size) {
+        summary.push(format!(
+            "Shorter replacement: {overlap} retained tail byte(s) will be re-decoded."
+        ));
+    }
+    if growth != 0 {
+        summary.push(format!("EOF growth: {growth} byte(s) will be appended."));
+    }
+
+    Ok(AssemblyPreview {
+        summary,
+        original: original.rows,
+        proposed: proposed.rows,
+    })
+}
+
+fn clipped(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.into();
+    }
+    if width <= 3 {
+        return ".".repeat(width);
+    }
+    format!("{}...", text.chars().take(width - 3).collect::<String>())
+}
+
+fn preview_columns(width: usize, left: &str, right: &str) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let middle = width / 2;
+    let mut line = vec![' '; width];
+    put(&mut line[..middle], 0, &clipped(left, middle));
+    line[middle] = '│';
+    put(
+        &mut line[middle + 1..],
+        0,
+        &clipped(right, width - middle - 1),
+    );
+    line.into_iter().collect()
+}
+
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.chars().count() + word.chars().count() + 1 > width {
+            rows.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() || rows.is_empty() {
+        rows.push(line);
+    }
+    rows
+}
+
+fn confirm_assembly(console: &Console, preview: &AssemblyPreview) -> io::Result<bool> {
+    loop {
+        let (width, height) = console.dimensions();
+        let layout_width = width.max(60);
+        let summary: Vec<_> = preview
+            .summary
+            .iter()
+            .flat_map(|text| wrap_text(text, layout_width))
+            .collect();
+        let required_height = summary.len().saturating_add(4);
+        let ready = width >= 60 && height >= required_height;
+        let mut lines = vec![String::new(); height];
+        if !ready {
+            if let Some(line) = lines.first_mut() {
+                *line = "Assembly patch preview".into();
+            }
+            if let Some(line) = lines.get_mut(2) {
+                *line = format!(
+                    "Resize to at least 60 columns and {required_height} rows. Esc cancels."
+                );
+            }
+            if let Some(line) = lines.last_mut() {
+                *line = "Esc Cancel  Resize to apply".into();
+            }
+        } else {
+            let mut row = 0usize;
+            for text in summary {
+                lines[row] = text;
+                row += 1;
+            }
+            lines[row] = preview_columns(
+                width,
+                "Original affected instructions",
+                "Proposed instructions",
+            );
+            row += 1;
+            let available = height.saturating_sub(row + 1);
+            let count = preview.original.len().max(preview.proposed.len());
+            let truncated = count > available;
+            let data_rows = if truncated {
+                available.saturating_sub(1)
+            } else {
+                count
+            };
+            for index in 0..data_rows {
+                lines[row + index] = preview_columns(
+                    width,
+                    preview.original.get(index).map_or("", String::as_str),
+                    preview.proposed.get(index).map_or("", String::as_str),
+                );
+            }
+            if truncated {
+                lines[row + available - 1] = "Preview rows truncated to fit the console.".into();
+            }
+            lines[height - 1] = "Enter Apply  Esc Cancel".into();
+        }
+        console.draw(&lines)?;
+        match console.key()?.code {
+            13 if ready => return Ok(true),
+            27 => return Ok(false),
+            _ => {}
+        }
+    }
 }
 
 fn decode_at(
@@ -794,20 +1097,28 @@ fn open_editor(
                 let Some(text) = console.prompt_seed(&lines, "Assembler", &seed)? else {
                     break;
                 };
-                let assembled = code_address(&metadata, view.offset)
-                    .and_then(|(address, _)| {
-                        assembler::assemble(&text, view.decode_bits(), address)
-                    })
-                    .and_then(|bytes| {
-                        let start = view.offset as usize;
-                        let end = start
-                            .checked_add(bytes.len())
-                            .ok_or("The instruction exceeds the address range.")?;
-                        view.validate_raw_len(view.data.len().max(end))?;
-                        Ok((bytes, start, end))
-                    });
-                match assembled {
-                    Ok((bytes, start, end)) => {
+                let proposed = (|| {
+                    let metadata = metadata.as_ref().map_err(Clone::clone)?;
+                    let address = metadata.code_address(view.offset)?.0;
+                    let bytes = assembler::assemble(&text, view.decode_bits(), address)?;
+                    let start = usize::try_from(view.offset)
+                        .map_err(|_| "The offset exceeds the address range.")?;
+                    let end = start
+                        .checked_add(bytes.len())
+                        .ok_or("The instruction exceeds the address range.")?;
+                    view.validate_raw_len(view.data.len().max(end))?;
+                    let preview = assembly_preview(&view, metadata, &mut decoder, &bytes)?;
+                    Ok::<_, String>((bytes, start, end, preview))
+                })();
+                match proposed {
+                    Ok((bytes, start, end, preview)) => {
+                        if !confirm_assembly(console, &preview)? {
+                            break;
+                        }
+                        if let Err(error) = view.validate_raw_len(view.data.len().max(end)) {
+                            console.modal(&lines, &error)?;
+                            continue;
+                        }
                         if end > view.data.len() {
                             view.data.resize(end, 0);
                         }
@@ -1280,6 +1591,146 @@ mod tests {
                 .unwrap()
                 .real_mode()
         );
+    }
+
+    #[test]
+    fn assembly_preview_covers_exact_overwritten_bytes_and_growth() {
+        fn preview(view: &Editor, replacement: &[u8]) -> AssemblyPreview {
+            let metadata = view.metadata().unwrap();
+            assembly_preview(view, &metadata, &mut None, replacement).unwrap()
+        }
+
+        let mut shorter = Editor::new(vec![0xb8, 1, 0, 0, 0, 0xc3], Mode::Code, 0);
+        shorter.code_bits = 32;
+        shorter
+            .set_raw_model(Some(editor::RawModel {
+                base: 0x1000,
+                bits: 32,
+                byte_order: editor::ByteOrder::Little,
+            }))
+            .unwrap();
+        let before = shorter.data.clone();
+        let result = preview(&shorter, &[0x90]);
+        assert_eq!(shorter.data, before);
+        assert_eq!(result.summary[0], "Assembly patch preview");
+        assert!(result.summary[1].contains("Runtime address: 0000000000001000"));
+        assert_eq!(result.summary[2], "Original bytes (5): B8 01 00 00 00");
+        assert_eq!(result.summary[3], "Replacement bytes (1): 90");
+        assert!(result.summary[4].contains("Replacement length delta: -4 bytes"));
+        assert!(
+            result
+                .summary
+                .iter()
+                .any(|line| line.starts_with("Shorter replacement:"))
+        );
+
+        let mut longer = Editor::new(vec![0x90; 6], Mode::Code, 0);
+        longer.code_bits = 32;
+        let replacement = assembler::assemble("mov eax,1", 32, 0).unwrap();
+        let result = preview(&longer, &replacement);
+        assert_eq!(result.summary[2], "Original bytes (5): 90 90 90 90 90");
+        assert_eq!(result.original.len(), 5);
+        assert_eq!(result.proposed.len(), 1);
+        assert!(result.summary[4].contains("Replacement length delta: +4 bytes"));
+
+        let mut partial = Editor::new(vec![0x90, 0xbb, 1, 0, 0, 0, 0xc3], Mode::Code, 0);
+        partial.code_bits = 32;
+        let result = preview(&partial, &replacement);
+        assert_eq!(result.summary[2], "Original bytes (5): 90 BB 01 00 00");
+        assert!(result.summary.iter().any(
+            |line| line == "Partial overlap: the final original instruction retains 1 byte(s)."
+        ));
+
+        let mut eof = Editor::new(vec![0x90], Mode::Code, 1);
+        eof.code_bits = 32;
+        eof.set_raw_model(Some(editor::RawModel {
+            base: 0x2000,
+            bits: 32,
+            byte_order: editor::ByteOrder::Little,
+        }))
+        .unwrap();
+        let result = preview(&eof, &[0xc3]);
+        assert_eq!(result.summary[2], "Original bytes (0): <end of file>");
+        assert!(result.summary[4].contains("File growth: +1 bytes"));
+        assert!(result.original[0].contains("<end of file>"));
+        assert!(result.proposed[0].contains("ret"));
+        assert_eq!(
+            (eof.data.as_slice(), eof.offset, eof.dirty),
+            (&[0x90][..], 1, false)
+        );
+    }
+
+    #[test]
+    fn assembly_preview_uses_strict_effective_decoding_and_syntax() {
+        for syntax in [decoder::Syntax::Intel, decoder::Syntax::Att] {
+            let mut view = Editor::new(vec![0x90; 8], Mode::Code, 0);
+            view.code_bits = 16;
+            view.real_mode = true;
+            view.syntax = syntax;
+            let metadata = view.metadata().unwrap();
+            assert!(assembly_preview(&view, &metadata, &mut None, &[0x0f, 0x34]).is_err());
+
+            view.set_raw_model(Some(editor::RawModel {
+                base: 0x1000,
+                bits: 16,
+                byte_order: editor::ByteOrder::Little,
+            }))
+            .unwrap();
+            let metadata = view.metadata().unwrap();
+            assert!(assembly_preview(&view, &metadata, &mut None, &[0x0f, 0x34]).is_ok());
+
+            view.set_raw_model(Some(editor::RawModel {
+                base: 0x1000,
+                bits: 32,
+                byte_order: editor::ByteOrder::Little,
+            }))
+            .unwrap();
+            let preview =
+                assembly_preview(&view, &view.metadata().unwrap(), &mut None, &[0x89, 0xd8])
+                    .unwrap();
+            assert_eq!(
+                preview.proposed[0].contains('%'),
+                syntax == decoder::Syntax::Att
+            );
+        }
+
+        let mut fallback = Editor::new(vec![0x90], Mode::Code, 0);
+        fallback.code_bits = 32;
+        fallback.invalid_code_bytes = true;
+        let before = fallback.data.clone();
+        assert!(
+            assembly_preview(&fallback, &fallback.metadata().unwrap(), &mut None, &[0x0f]).is_err()
+        );
+        assert_eq!(fallback.data, before);
+
+        fallback.offset = 1;
+        fallback
+            .set_raw_model(Some(editor::RawModel {
+                base: u64::from(u32::MAX),
+                bits: 32,
+                byte_order: editor::ByteOrder::Little,
+            }))
+            .unwrap();
+        assert!(
+            assembly_preview(&fallback, &fallback.metadata().unwrap(), &mut None, &[0xc3]).is_err()
+        );
+        assert_eq!(
+            (fallback.data.as_slice(), fallback.offset),
+            (&[0x90][..], 1)
+        );
+    }
+
+    #[test]
+    fn assembly_preview_wraps_summary_and_marks_truncated_columns() {
+        let text = format!("Replacement bytes (15): {}", spaced_hex(&[0x90; 15]));
+        let rows = wrap_text(&text, 60);
+        assert!(rows.len() > 1);
+        assert!(rows.iter().all(|row| row.chars().count() <= 60));
+        assert_eq!(rows.join(" "), text);
+
+        let columns = preview_columns(60, &"x".repeat(50), &"y".repeat(50));
+        assert_eq!(columns.chars().count(), 60);
+        assert_eq!(columns.matches("...").count(), 2);
     }
 
     #[test]
