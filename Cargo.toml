@@ -1,0 +1,8 @@
+[package]
+name = "hview-linux"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+description = "A Linux terminal hex editor with x86 decoding and binary analysis tools."
+
+[dependencies]

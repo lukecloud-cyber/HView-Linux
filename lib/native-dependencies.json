@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "dependencies": [
+    {
+      "package": "capstone",
+      "version": "5.0.9",
+      "api_version": "5.0",
+      "architecture": "linux-x86_64",
+      "release_url": "https://github.com/capstone-engine/capstone/releases/tag/5.0.9",
+      "source_commit": "022575848782a4801fd150fdbc927effcbca0864",
+      "wheel": {
+        "filename": "capstone-5.0.9-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "url": "https://files.pythonhosted.org/packages/d1/39/17747862222bb062e86b501f1f148d5ff589b77908b080d30f7f085cbfb7/capstone-5.0.9-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "sha256": "273fd8d747d2e35c88f91450be51a603ecfaafb00d96d9f315dcb8689c86193e",
+        "member": "capstone/lib/libcapstone.so",
+        "member_sha256": "a0897f809e062bdb2a84a6aca71707648e1b9420949b549fe8946f612c22dc84"
+      },
+      "shared_library": {
+        "file": "libcapstone.so",
+        "sha256": "a0897f809e062bdb2a84a6aca71707648e1b9420949b549fe8946f612c22dc84",
+        "elf_class": "ELF64",
+        "elf_machine": "Advanced Micro Devices X86-64",
+        "soname": "libcapstone.so.5",
+        "rpath": [],
+        "runpath": [],
+        "needed": [
+          "libc.so.6"
+        ]
+      },
+      "licenses": [
+        {
+          "file": "CAPSTONE-LICENSE.TXT",
+          "url": "https://raw.githubusercontent.com/capstone-engine/capstone/022575848782a4801fd150fdbc927effcbca0864/LICENSE.TXT",
+          "sha256": "65e9ed46a59976eda8f5bd1ea79a680dea38dd299c760bc9a8d87a764ef5029b"
+        },
+        {
+          "file": "CAPSTONE-LLVM-LICENSE.TXT",
+          "url": "https://raw.githubusercontent.com/capstone-engine/capstone/022575848782a4801fd150fdbc927effcbca0864/LICENSE_LLVM.TXT",
+          "sha256": "dfdca2d7fdbabfd937f9dc41b7f61647b0e6cb1f9ee767ecb4520f979ebe91da"
+        }
+      ]
+    },
+    {
+      "package": "keystone-engine",
+      "version": "0.9.2",
+      "api_version": "0.9",
+      "architecture": "linux-x86_64",
+      "release_url": "https://github.com/keystone-engine/keystone/releases/tag/0.9.2",
+      "source_commit": "dc7932ef2b2c4a793836caec6ecab485005139d6",
+      "wheel": {
+        "filename": "keystone_engine-0.9.2-py2.py3-none-manylinux1_x86_64.whl",
+        "url": "https://files.pythonhosted.org/packages/01/5c/40ffbec589262f49ff7c463d96ff0bfab0fbd98d9d869c370a70853a13fb/keystone_engine-0.9.2-py2.py3-none-manylinux1_x86_64.whl",
+        "sha256": "5a5316a34323620b1bba31dcfe9e4b4ca6f0c030e82fc7a151da7c8fbe81a379",
+        "member": "keystone/libkeystone.so",
+        "member_sha256": "aea587fa04e9c9296c1ab237db429b903a5861e302603eccdabe323f7dda99c9"
+      },
+      "shared_library": {
+        "file": "libkeystone.so",
+        "sha256": "c4ac208b02c4be88a62eb4b01b4fbda3f26cf5f8579d348373d7df21feccfca3",
+        "elf_class": "ELF64",
+        "elf_machine": "Advanced Micro Devices X86-64",
+        "soname": "libkeystone.so.0",
+        "rpath": [],
+        "runpath": [],
+        "needed": [
+          "libstdc++.so.6",
+          "libm.so.6",
+          "libgcc_s.so.1",
+          "libc.so.6"
+        ]
+      },
+      "transformation": {
+        "tool": "patchelf",
+        "version": "0.19.1",
+        "release_url": "https://github.com/NixOS/patchelf/releases/tag/0.19.1",
+        "source_commit": "7688b17c18d16f67fa8d5a82a2404c2e3a18648d",
+        "archive": {
+          "filename": "patchelf-0.19.1-x86_64.tar.gz",
+          "url": "https://github.com/NixOS/patchelf/releases/download/0.19.1/patchelf-0.19.1-x86_64.tar.gz",
+          "sha256": "a6818fef80128fb354423234ecacdcca3e993913d774e5d8346bc63f70fed4cf"
+        },
+        "tool_sha256": "6526398feccd54ab150e49ef643376c6ae37445fdc28b3320baf4aea59f9d536",
+        "arguments": [
+          "--remove-rpath",
+          "libkeystone.so"
+        ],
+        "input_sha256": "aea587fa04e9c9296c1ab237db429b903a5861e302603eccdabe323f7dda99c9",
+        "output_sha256": "c4ac208b02c4be88a62eb4b01b4fbda3f26cf5f8579d348373d7df21feccfca3"
+      },
+      "licenses": [
+        {
+          "file": "KEYSTONE-COPYING.TXT",
+          "url": "https://raw.githubusercontent.com/keystone-engine/keystone/dc7932ef2b2c4a793836caec6ecab485005139d6/COPYING",
+          "sha256": "ab15fd526bd8dd18a9e77ebc139656bf4d33e97fc7238cd11bf60e2b9b8666c6"
+        },
+        {
+          "file": "KEYSTONE-EXCEPTIONS-CLIENT.TXT",
+          "url": "https://raw.githubusercontent.com/keystone-engine/keystone/dc7932ef2b2c4a793836caec6ecab485005139d6/EXCEPTIONS-CLIENT",
+          "sha256": "2e3ba49ed5363ecbdf4bc8b6d2b886c772cdc0b321fb1e6e137098fc2dd5968e"
+        },
+        {
+          "file": "KEYSTONE-LICENSE-COM.TXT",
+          "url": "https://raw.githubusercontent.com/keystone-engine/keystone/dc7932ef2b2c4a793836caec6ecab485005139d6/LICENSE-COM.TXT",
+          "sha256": "51330f413cbe607a1f1dc9e73c78c040f9423230d2b7ef98c84c1bd4c54af055"
+        },
+        {
+          "file": "KEYSTONE-LLVM-LICENSE.TXT",
+          "url": "https://raw.githubusercontent.com/keystone-engine/keystone/dc7932ef2b2c4a793836caec6ecab485005139d6/llvm/LICENSE.TXT",
+          "sha256": "721cb11de618fcf9bbb7d25a389207bf2227357e6694bc326ab32a6699f9b951"
+        },
+        {
+          "file": "KEYSTONE-LLVM-SUPPORT-LICENSE.TXT",
+          "url": "https://raw.githubusercontent.com/keystone-engine/keystone/dc7932ef2b2c4a793836caec6ecab485005139d6/llvm/include/llvm/Support/LICENSE.TXT",
+          "sha256": "a012d664e4e01df52a65b2eeafdfb8aeb856fec0e6c372265d01b0109c3f5e2a"
+        },
+        {
+          "file": "KEYSTONE-LLVM-ENGINE-LICENSE.TXT",
+          "url": "https://raw.githubusercontent.com/keystone-engine/keystone/dc7932ef2b2c4a793836caec6ecab485005139d6/llvm/keystone/LICENSE",
+          "sha256": "258ec4a974b62937005323ee22fb641f5f3dfe7ed99911c99d4178025b98be06"
+        },
+        {
+          "file": "KEYSTONE-ARM-LICENSE.TXT",
+          "url": "https://raw.githubusercontent.com/keystone-engine/keystone/dc7932ef2b2c4a793836caec6ecab485005139d6/llvm/lib/Target/ARM/LICENSE.TXT",
+          "sha256": "28cbd5f6dac844fc3d94e879dba83c3ca87328ece8e0d388284f8cec6a042a97"
+        },
+        {
+          "file": "KEYSTONE-LICENSE.TXT",
+          "url": "https://raw.githubusercontent.com/keystone-engine/keystone/dc7932ef2b2c4a793836caec6ecab485005139d6/bindings/python/LICENSE.TXT",
+          "sha256": "1cb7d9695461374058b850ef33377c70d8f9c20642b95a96f057ff519e283a1d"
+        }
+      ]
+    }
+  ]
+}

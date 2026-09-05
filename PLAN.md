@@ -51,7 +51,7 @@ The default branch remains `main` at the previous Linux baseline.
 The local and remote `rust-rewrite` branches contain the empty root commit `4ded82f485022075d061588a090cb8ddbfa03406`.
 The branch started without tracked files.
 The branch now contains the plan, tracker, and project instructions.
-Application implementation has not started.
+Application implementation had not started when this plan was approved.
 Use the tracker for current branch and implementation status.
 
 ### Checks executed on this Linux computer
