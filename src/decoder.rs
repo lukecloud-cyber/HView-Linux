@@ -84,6 +84,8 @@ type Disasm =
 type Free = unsafe extern "C" fn(*mut CsInstruction, usize);
 type Close = unsafe extern "C" fn(*mut usize) -> i32;
 type InstructionName = unsafe extern "C" fn(usize, u32) -> *const c_char;
+type SetOption = unsafe extern "C" fn(usize, i32, usize) -> i32;
+type InGroup = unsafe extern "C" fn(usize, *const CsInstruction, u32) -> bool;
 
 pub struct Decoder {
     _library: Library,
@@ -92,6 +94,8 @@ pub struct Decoder {
     free: Free,
     close: Close,
     instruction_name: InstructionName,
+    set_option: SetOption,
+    in_group: InGroup,
     bits: u32,
     syntax: Syntax,
     real_mode: bool,
@@ -139,7 +143,8 @@ impl Decoder {
         let free = symbol!("cs_free", Free);
         let close = symbol!("cs_close", Close);
         let instruction_name = symbol!("cs_insn_name", InstructionName);
-        let option = symbol!("cs_option", unsafe extern "C" fn(usize, i32, usize) -> i32);
+        let set_option = symbol!("cs_option", SetOption);
+        let in_group = symbol!("cs_insn_group", InGroup);
         let mut major = 0;
         let mut minor = 0;
         unsafe {
@@ -161,7 +166,7 @@ impl Decoder {
             Syntax::Intel => 1,
             Syntax::Att => 2,
         };
-        let status = unsafe { option(handle, 1, syntax_value) };
+        let status = unsafe { set_option(handle, 1, syntax_value) };
         if status != 0 {
             unsafe {
                 close(&mut handle);
@@ -177,6 +182,8 @@ impl Decoder {
             free,
             close,
             instruction_name,
+            set_option,
+            in_group,
             bits,
             syntax,
             real_mode,
@@ -252,6 +259,94 @@ impl Decoder {
                         format!("{mnemonic:<13}{operands}")
                     };
                     Ok(Instruction { size, hex, text })
+                }
+            }
+        };
+        unsafe {
+            if !instruction.is_null() {
+                (self.free)(instruction, count);
+            }
+        }
+        result
+    }
+
+    pub fn direct_target(&self, data: &[u8], address: u64) -> Result<Option<u64>, String> {
+        let status = unsafe { (self.set_option)(self.handle, 2, 3) };
+        if status != 0 {
+            unsafe {
+                (self.set_option)(self.handle, 2, 0);
+            }
+            return Err(format!(
+                "Cannot enable Capstone detail: Capstone error {status}."
+            ));
+        }
+
+        let result = self.direct_target_with_detail(data, address);
+        let status = unsafe { (self.set_option)(self.handle, 2, 0) };
+        if status != 0 {
+            return Err(format!(
+                "Cannot disable Capstone detail: Capstone error {status}."
+            ));
+        }
+        result
+    }
+
+    fn direct_target_with_detail(&self, data: &[u8], address: u64) -> Result<Option<u64>, String> {
+        if data.is_empty() {
+            return Err("The decoder reached the end of the file.".into());
+        }
+        let mut instruction = std::ptr::null_mut();
+        let count = unsafe {
+            (self.disasm)(
+                self.handle,
+                data.as_ptr(),
+                data.len().min(15),
+                address,
+                1,
+                &mut instruction,
+            )
+        };
+        let result = if count != 1 || instruction.is_null() {
+            Err(format!(
+                "Invalid or incomplete x86 instruction at address {address:X}."
+            ))
+        } else {
+            let instruction_ref = unsafe { &*instruction };
+            let size = instruction_ref.size as usize;
+            if size == 0 || size > data.len().min(15) {
+                Err("The decoder returned an invalid instruction size.".into())
+            } else {
+                let mnemonic = text(&instruction_ref.mnemonic);
+                let name = unsafe { (self.instruction_name)(self.handle, instruction_ref.id) };
+                let canonical = if name.is_null() {
+                    mnemonic.as_str()
+                } else {
+                    unsafe { CStr::from_ptr(name) }
+                        .to_str()
+                        .unwrap_or(&mnemonic)
+                };
+                if self.real_mode
+                    && (real16_protected(data, size, canonical)
+                        || real16_vector(data, size, canonical))
+                {
+                    Err(format!(
+                        "Invalid or incomplete x86 instruction at address {address:X}."
+                    ))
+                } else if !unsafe { (self.in_group)(self.handle, instruction_ref, 7) } {
+                    Ok(None)
+                } else {
+                    let operands = text(&instruction_ref.operands);
+                    number(&operands)
+                        .map(|target| {
+                            Some(if self.real_mode {
+                                target & 0xffff
+                            } else {
+                                target
+                            })
+                        })
+                        .ok_or_else(|| {
+                            format!("Capstone returned an invalid direct target: {operands}.")
+                        })
                 }
             }
         };
@@ -489,6 +584,76 @@ mod tests {
                         .ends_with(target)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn direct_relative_targets_use_branch_groups_and_selected_syntax() {
+        for syntax in [Syntax::Intel, Syntax::Att] {
+            let decoder16 = Decoder::with_syntax(16, syntax).unwrap();
+            let decoder32 = Decoder::with_syntax(32, syntax).unwrap();
+            let decoder64 = Decoder::with_syntax(64, syntax).unwrap();
+            assert_eq!(
+                decoder32.direct_target(&[0xe8, 0, 0, 0, 0], 0x1000),
+                Ok(Some(0x1005))
+            );
+            assert_eq!(
+                decoder32.direct_target(&[0xeb, 2], 0x1000),
+                Ok(Some(0x1004))
+            );
+            assert_eq!(
+                decoder32.direct_target(&[0x75, 0xfc], 0x1000),
+                Ok(Some(0x0ffe))
+            );
+            assert_eq!(
+                decoder32.direct_target(&[0xe2, 0xfe], 0x1000),
+                Ok(Some(0x1000))
+            );
+            assert_eq!(
+                decoder16.direct_target(&[0x67, 0xe3, 0], 0x1000),
+                Ok(Some(0x1003))
+            );
+            assert_eq!(decoder32.direct_target(&[0xeb, 0], 0), Ok(Some(2)));
+            assert_eq!(
+                decoder16.direct_target(&[0xeb, 0], 0xfffe),
+                Ok(Some(0x10000))
+            );
+            assert_eq!(
+                decoder32.direct_target(&[0xeb, 0], u32::MAX as u64 - 1),
+                Ok(Some(0))
+            );
+            assert_eq!(
+                decoder64.direct_target(&[0xeb, 0], u64::MAX - 1),
+                Ok(Some(0))
+            );
+            assert_eq!(decoder32.syntax(), syntax);
+        }
+    }
+
+    #[test]
+    fn direct_target_applies_real16_policy_and_restores_detail() {
+        for syntax in [Syntax::Intel, Syntax::Att] {
+            let linear = Decoder::with_syntax(16, syntax).unwrap();
+            let real = Decoder::with_mode(16, syntax, true).unwrap();
+            assert_eq!(linear.direct_target(&[0xeb, 0], 0xfffe), Ok(Some(0x10000)));
+            assert_eq!(real.direct_target(&[0xeb, 0], 0xfffe), Ok(Some(0)));
+            assert_eq!(
+                linear.direct_target(&[0xeb, 0xfe], 0x10000),
+                Ok(Some(0x10000))
+            );
+            assert_eq!(real.direct_target(&[0xeb, 0xfe], 0x10000), Ok(Some(0)));
+            assert!(real.direct_target(&[0x0f, 0x34], 0).is_err());
+            assert_eq!(real.direct_target(&[0xff, 0xd0], 0), Ok(None));
+            assert_eq!(real.direct_target(&[0xff, 0xe0], 0), Ok(None));
+            assert_eq!(
+                real.direct_target(&[0x9a, 0x78, 0x56, 0x34, 0x12], 0),
+                Ok(None)
+            );
+            assert_eq!(real.direct_target(&[0x90], 0), Ok(None));
+            assert!(real.direct_target(&[0x0f], 0).is_err());
+            assert!(real.direct_target(&[], 0).is_err());
+            assert_eq!(real.decode(&[0x90], 0, 0).unwrap().text, "nop");
+            assert_eq!(real.syntax(), syntax);
         }
     }
 }

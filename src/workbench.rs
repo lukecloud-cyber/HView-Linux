@@ -66,6 +66,7 @@ pub fn help(console: &Console) -> io::Result<()> {
         " F4 Mode  F5 Goto  F7 Search  F9 Files  F10 Quit",
         " Hex search accepts wildcards: 48 8B ?? A? ?F",
         " Shift+F7 Next match  Ctrl+F7 Previous match",
+        " Code: Enter Follow direct relative branch/call  Backspace Return",
         " Ctrl+T Analysis tools:",
         "   A  Convert a PE file offset, RVA, or preferred ImageBase VA",
         "   S  Browse ASCII and UTF-16 ASCII strings",
@@ -78,7 +79,6 @@ pub fn help(console: &Console) -> io::Result<()> {
         " Tools use the current editor buffer, including unsaved edits.",
         " Address conversion uses the PE preferred ImageBase.",
         " Range offsets and lengths use hexadecimal numbers.",
-        " Analysis tools are additions to the reconstruction.",
         " Press Esc or Enter to return.",
     ];
     loop {

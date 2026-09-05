@@ -65,6 +65,34 @@ impl Metadata {
             None => Ok((file_offset, 16)),
         }
     }
+
+    pub fn navigation_address(&self, data: &[u8], file_offset: u64) -> Result<u64, String> {
+        if self.pe.is_some() || data.starts_with(b"MZ") || data.starts_with(b"ZM") {
+            return convert_address(data, AddressKind::File, file_offset)?
+                .va
+                .ok_or_else(|| "The branch source has no virtual address.".into());
+        }
+        let offset = usize::try_from(file_offset)
+            .map_err(|_| "The branch source exceeds the address range.")?;
+        data.get(offset)
+            .map(|_| file_offset)
+            .ok_or_else(|| "The branch source is outside the current buffer.".into())
+    }
+
+    pub fn navigation_offset(&self, data: &[u8], address: u64) -> Result<u64, String> {
+        if self.pe.is_some() || data.starts_with(b"MZ") || data.starts_with(b"ZM") {
+            let offset = convert_address(data, AddressKind::Va, address)?
+                .file_offset
+                .ok_or("The branch target has no file byte.")?;
+            return u64::try_from(offset)
+                .map_err(|_| "The branch target exceeds the address range.".into());
+        }
+        let offset =
+            usize::try_from(address).map_err(|_| "The branch target exceeds the address range.")?;
+        data.get(offset)
+            .map(|_| address)
+            .ok_or_else(|| "The branch target is outside the current buffer.".into())
+    }
 }
 
 impl Pe {
@@ -1378,6 +1406,56 @@ mod tests {
             assert!(convert_address(&data, AddressKind::File, 0x400).is_err());
             assert!(convert_address(&data, AddressKind::Rva, 0x1200).is_err());
         }
+    }
+
+    #[test]
+    fn code_navigation_uses_checked_pe_raw_and_elf_mappings() {
+        for plus in [false, true] {
+            let data = fixture(plus);
+            let base = if plus { 0x1_4000_0000 } else { 0x40_0000 };
+            let metadata = Metadata::parse(&data).unwrap();
+            assert_eq!(metadata.navigation_address(&data, 0x210), Ok(base + 0x1010));
+            assert_eq!(metadata.navigation_offset(&data, base + 0x1010), Ok(0x210));
+            assert!(
+                metadata
+                    .navigation_address(&data, data.len() as u64)
+                    .is_err()
+            );
+            assert!(metadata.navigation_offset(&data, base + 0x1200).is_err());
+        }
+
+        for data in [&b"raw code"[..], &b"\x7fELF raw code"[..]] {
+            let metadata = Metadata::parse(data).unwrap();
+            assert_eq!(metadata.navigation_address(data, 4), Ok(4));
+            assert_eq!(metadata.navigation_offset(data, 4), Ok(4));
+            assert!(
+                metadata
+                    .navigation_address(data, data.len() as u64)
+                    .is_err()
+            );
+            assert!(metadata.navigation_offset(data, data.len() as u64).is_err());
+        }
+
+        let overlay = browser_fixture(false);
+        let metadata = Metadata::parse(&overlay).unwrap();
+        assert!(metadata.navigation_address(&overlay, 0x800).is_err());
+
+        let mut gap = fixture(false);
+        gap.resize(0x500, 0);
+        put(&mut gap, 376 + 20, 0x300);
+        let metadata = Metadata::parse(&gap).unwrap();
+        assert!(metadata.navigation_address(&gap, 0x250).is_err());
+
+        let mut zero_fill = browser_fixture(false);
+        add_zero_raw_section(&mut zero_fill, false);
+        let metadata = Metadata::parse(&zero_fill).unwrap();
+        assert!(metadata.navigation_offset(&zero_fill, 0x40_2010).is_err());
+
+        let mut malformed = vec![0; 64];
+        malformed[..2].copy_from_slice(b"MZ");
+        let metadata = Metadata::parse(&malformed).unwrap();
+        assert!(metadata.navigation_address(&malformed, 0).is_err());
+        assert!(metadata.navigation_offset(&malformed, 0).is_err());
     }
 
     #[test]

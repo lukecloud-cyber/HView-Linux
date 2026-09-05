@@ -16,6 +16,7 @@ mod workbench;
 
 use console::Console;
 use editor::{Editor, Key, Mode};
+use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -23,6 +24,7 @@ use std::path::{Path, PathBuf};
 const NORMAL_KEYS: &str = " 1Help   2PutBlk 3Edit   4Mode   5Goto   6DatRef 7Search 8Header 9Files 10Quit  11Hem   12Names ";
 const TEXT_KEYS: &str = " 1Help   2Unwrap 3       4Mode   5Goto   6LnFeed 7Search 8Table  9Files 10Quit  11Hem   12      ";
 const EDIT_KEYS: &str = " 1Help   2       3Undo   4Byte   5Word   6Dword  7Crypt  8Xor    9Update10Trunc 11      12      ";
+const RETURN_HISTORY_LIMIT: usize = 256;
 
 fn put(line: &mut [char], column: usize, text: &str) {
     for (slot, ch) in line.iter_mut().skip(column).zip(text.chars()) {
@@ -215,6 +217,48 @@ fn decode_at(
         instruction.hex = format!("{byte:02X}").repeat(count);
     }
     Ok((address, instruction))
+}
+
+fn direct_target_offset(
+    view: &Editor,
+    metadata: &Result<format::Metadata, String>,
+    decoder: &mut Option<decoder::Decoder>,
+) -> Result<u64, String> {
+    let metadata = metadata.as_ref().map_err(Clone::clone)?;
+    let address = metadata.navigation_address(&view.data, view.offset)?;
+    let start =
+        usize::try_from(view.offset).map_err(|_| "The branch source exceeds the address range.")?;
+    let bytes = view
+        .data
+        .get(start..)
+        .filter(|bytes| !bytes.is_empty())
+        .ok_or("The branch source is outside the current buffer.")?;
+    let target = decoder_for(decoder, view.code_bits, view.syntax, view.real_mode)?
+        .direct_target(bytes, address)?
+        .ok_or("The instruction has no direct relative branch or call target.")?;
+    metadata.navigation_offset(&view.data, target)
+}
+
+fn remember_return(history: &mut VecDeque<(u64, u64)>, position: (u64, u64)) {
+    if history.len() >= RETURN_HISTORY_LIMIT {
+        history.pop_front();
+    }
+    history.push_back(position);
+}
+
+fn take_return(
+    history: &mut VecDeque<(u64, u64)>,
+    data: &[u8],
+) -> Result<Option<(u64, u64)>, String> {
+    let Some(&(offset, top)) = history.back() else {
+        return Ok(None);
+    };
+    let offset = usize::try_from(offset)
+        .map_err(|_| "The branch return position exceeds the address range.")?;
+    if data.get(offset).is_none() || top > data.len() as u64 {
+        return Err("The branch return position is outside the current buffer.".into());
+    }
+    Ok(history.pop_back())
 }
 
 fn assembly_seed(
@@ -485,7 +529,8 @@ fn open_editor(
             _ => b"\r\n",
         };
     }
-    let mut history = Vec::new();
+    let mut step_history = Vec::new();
+    let mut return_history = VecDeque::new();
     let mut search: Option<operations::Pattern> = None;
     let mut updated = false;
     let mut writable = false;
@@ -538,7 +583,7 @@ fn open_editor(
         }
         if ctrl && key.code == 84 {
             workbench::tools(console, &mut view, &lines)?;
-            history.clear();
+            step_history.clear();
             continue;
         }
         if key.code == 112 {
@@ -556,7 +601,7 @@ fn open_editor(
                     match start.and_then(|start| pattern.find(&view.data, start, ctrl)) {
                         Some(offset) => {
                             workbench::jump(&mut view, offset, console.height().saturating_sub(2));
-                            history.clear();
+                            step_history.clear();
                         }
                         None => {
                             console.modal(&lines, "Not found")?;
@@ -607,7 +652,7 @@ fn open_editor(
                         for _ in 0..count {
                             match decode_at(&view, view.offset, &metadata, &mut decoder) {
                                 Ok((_address, instruction)) => {
-                                    history.push(view.offset);
+                                    step_history.push(view.offset);
                                     view.offset = (view.offset + instruction.size as u64)
                                         .min(view.data.len() as u64);
                                     view.top = view.offset;
@@ -621,7 +666,7 @@ fn open_editor(
                     }
                     Key::Up | Key::Left | Key::PageUp => {
                         for _ in 0..count {
-                            if let Some(offset) = history.pop() {
+                            if let Some(offset) = step_history.pop() {
                                 view.offset = offset;
                                 view.top = offset;
                             }
@@ -630,7 +675,7 @@ fn open_editor(
                     Key::Home | Key::FileStart => {
                         view.offset = 0;
                         view.top = 0;
-                        history.clear();
+                        step_history.clear();
                     }
                     _ => {
                         console.modal(
@@ -655,6 +700,36 @@ fn open_editor(
             continue;
         }
         match key.code {
+            13 if !view.editing && view.mode == Mode::Code => {
+                match direct_target_offset(&view, &metadata, &mut decoder) {
+                    Ok(target) => {
+                        if target != view.offset {
+                            remember_return(&mut return_history, (view.offset, view.top));
+                            view.offset = target;
+                            view.top = target;
+                            step_history.clear();
+                        }
+                    }
+                    Err(error) => {
+                        console.modal(&lines, &error)?;
+                    }
+                }
+            }
+            8 if !view.editing && view.mode == Mode::Code => {
+                match take_return(&mut return_history, &view.data) {
+                    Ok(Some((offset, top))) => {
+                        view.offset = offset;
+                        view.top = top;
+                        step_history.clear();
+                    }
+                    Ok(None) => {
+                        console.modal(&lines, "The branch return history is empty.")?;
+                    }
+                    Err(error) => {
+                        console.modal(&lines, &error)?;
+                    }
+                }
+            }
             13 | 113 if view.editing && view.mode == Mode::Code => loop {
                 let metadata = format::Metadata::parse(&view.data);
                 let lines = frame(
@@ -728,7 +803,7 @@ fn open_editor(
                         "C" | "3" => {
                             view.mode = Mode::Code;
                             view.top = view.offset;
-                            history.clear();
+                            step_history.clear();
                         }
                         _ => {}
                     }
@@ -752,7 +827,8 @@ fn open_editor(
                     }
                 }
                 decoder = None;
-                history.clear();
+                step_history.clear();
+                return_history.clear();
             }
             116 if !view.editing => {
                 if let Some(value) = console.prompt(&lines, "Goto")? {
@@ -761,6 +837,7 @@ fn open_editor(
                             view.goto(offset, console.height().saturating_sub(2));
                             if view.mode == Mode::Code {
                                 view.top = offset;
+                                step_history.clear();
                             }
                         }
                         _ => {
@@ -794,7 +871,7 @@ fn open_editor(
                                         offset,
                                         console.height().saturating_sub(2),
                                     );
-                                    history.clear();
+                                    step_history.clear();
                                 }
                                 None => {
                                     console.macro_notice();
@@ -1142,6 +1219,71 @@ mod tests {
                 .unwrap()
                 .real_mode()
         );
+    }
+
+    #[test]
+    fn direct_navigation_uses_current_raw_and_elf_bytes() {
+        for syntax in [decoder::Syntax::Intel, decoder::Syntax::Att] {
+            for prefix in [&[][..], &b"\x7fELF"[..]] {
+                let start = prefix.len();
+                let mut data = prefix.to_vec();
+                data.extend_from_slice(&[0xe8, 5, 0, 0x90, 0x90, 0x90, 0x90, 0x90, 0xeb, 0xf6]);
+                let mut view = Editor::new(data, Mode::Code, start as u64);
+                view.code_bits = 16;
+                view.syntax = syntax;
+                let mut decoder = None;
+                let metadata = format::Metadata::parse(&view.data);
+                assert_eq!(
+                    direct_target_offset(&view, &metadata, &mut decoder),
+                    Ok((start + 8) as u64)
+                );
+
+                view.data[start + 1] = 2;
+                let metadata = format::Metadata::parse(&view.data);
+                assert_eq!(
+                    direct_target_offset(&view, &metadata, &mut decoder),
+                    Ok((start + 5) as u64)
+                );
+            }
+        }
+
+        let mut view = Editor::new(vec![0xff, 0xd0], Mode::Code, 0);
+        let mut decoder = None;
+        let metadata = format::Metadata::parse(&view.data);
+        assert!(direct_target_offset(&view, &metadata, &mut decoder).is_err());
+
+        view.data = vec![0xe8, 0xff, 0x7f];
+        let metadata = format::Metadata::parse(&view.data);
+        assert!(direct_target_offset(&view, &metadata, &mut decoder).is_err());
+
+        view.data = vec![0x0f];
+        view.invalid_code_bytes = true;
+        let metadata = format::Metadata::parse(&view.data);
+        assert!(direct_target_offset(&view, &metadata, &mut decoder).is_err());
+    }
+
+    #[test]
+    fn return_history_is_bounded_and_preserves_positions() {
+        let mut history = VecDeque::new();
+        for offset in 0..=RETURN_HISTORY_LIMIT as u64 {
+            remember_return(&mut history, (offset, offset.saturating_sub(10)));
+        }
+        assert_eq!(history.len(), RETURN_HISTORY_LIMIT);
+        assert_eq!(history.front(), Some(&(1, 0)));
+        assert_eq!(history.back(), Some(&(RETURN_HISTORY_LIMIT as u64, 246)));
+
+        let data = vec![0; RETURN_HISTORY_LIMIT + 1];
+        assert_eq!(take_return(&mut history, &data), Ok(Some((256, 246))));
+        remember_return(&mut history, (4, 2));
+        remember_return(&mut history, (8, 6));
+        assert_eq!(take_return(&mut history, &data), Ok(Some((8, 6))));
+        assert_eq!(take_return(&mut history, &data), Ok(Some((4, 2))));
+
+        history.clear();
+        remember_return(&mut history, (20, 0));
+        let before = history.clone();
+        assert!(take_return(&mut history, b"short").is_err());
+        assert_eq!(history, before);
     }
 
     #[test]

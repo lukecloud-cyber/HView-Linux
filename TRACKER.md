@@ -10,12 +10,12 @@ Read [UPSTREAM_REVIEW.md](UPSTREAM_REVIEW.md) for the subsequent Windows D04 thr
 
 - Completed: project analysis, repository rename, branch creation, plan, and tracker.
 - Application implementation: the original D03 release passed all six phases and Astra review.
-- Active work: implement the approved Windows D04 through D07 extension.
+- Active work: prepare the reviewed D04 direct-navigation candidate.
 - Core owner: `sol_linux_baseline` owns source adapters, fixtures, core tests, and terminal checks.
 - Native owner: `native_package` owns `lib`, package scripts, native probes, and native metadata.
 - Save owner: `save_backend` owns `src/save.rs` and its inline tests.
-- Next task: port D04 direct branch navigation and return history.
-- Next acceptance check: verify checked targets, return history, Linux input, and both syntax settings with Astra.
+- Next task: have Astra review the exact D04 candidate commit.
+- Next acceptance check: have Astra review the exact D04 candidate commit.
 - Upstream review: Windows `a3b7240` supplies the approved D04 through D07 source baseline.
 - Application blockers: none confirmed.
 - Current branch: `rust-rewrite`.
@@ -116,7 +116,7 @@ Finish each stage before dependent source changes.
 
 | ID | Task | Status | Evidence |
 |---|---|---|---|
-| D04 | Direct branch navigation, checked targets, return history, and F5 history correction | Active | Requirements and Linux integration checks in UPSTREAM_REVIEW.md |
+| D04 | Direct branch navigation, checked targets, return history, and F5 history correction | Implemented | Capstone group targets, Intel/AT&T, Real16, PE/raw/ELF mappings, 256 returns, and F5 clearing pass unit and PTY checks; Astra review remains |
 | D05 | Transient raw runtime base, x86 width, integer byte order, and checked growth | Pending | Depends on D04 address handling |
 | D06 | Nonmutating assembly preview with exact-byte confirmation | Pending | Depends on the D05 address model |
 | D07 | Grouped operation undo/redo with record and byte limits | Pending | Includes confirmed D06 patches, hexadecimal edits, fill, and XOR |
@@ -173,20 +173,22 @@ These results do not establish Linux feature parity.
 | `cargo build --locked --release` | Passed for the Phase 5 candidate |
 | `python3 tests/macro_probe.py target/release/hview-linux` | Passed macro, delay, modifier, notice, alias, prompt, and edit workflows |
 | `python3 tests/linux_behavior_probe.py target/release/hview-linux` | Passed Code cycling, Real16, fallback, sessions, syntax, and raw ELF workflows |
+| `python3 tests/navigation_probe.py target/release/hview-linux` | Passed direct branch, return, refusal, mapping, syntax, Real16, mode, and edited-byte workflows in 18.2 seconds |
 | Six application probes against one release build | Terminal, file, reliability, analysis, macro, and Linux behavior probes passed |
 | Final isolated package | `/home/sweet_cicero/Projects/HView-Linux/target/packages/hview-linux-x86_64-5febcd4`; executable SHA-256 `e0ebf155b1392a955aa1b2d941120889ef4e2511ebf6824a65e116ea696e12c7` |
 | Final release benchmark | Raw median/p95 24180/26064 ns; PE median/p95 29850/31273 ns |
 
 These checks ran on Linux x86-64 with Rust 1.98.0.
 The local CI-equivalent checks passed.
-Hosted CI started after publication in [run 33984434765](https://github.com/lukecloud-cyber/HView-Linux/actions/runs/33984434765).
-The run was in progress when this publication record was written.
+Hosted CI passed for [a2e6ddd](https://github.com/lukecloud-cyber/HView-Linux/actions/runs/33984434765).
+Hosted CI also passed for [aa5bd96](https://github.com/lukecloud-cyber/HView-Linux/actions/runs/33984463090).
 The Astra Phase 1 review passed at commit `77d4236bc355cdca517c094a45d3a12c766eaef1`.
 The Astra Phase 2 review passed at commit `cd476bd2354dd30a545197b6d1ba2b674ff975e6`.
 The Astra Phase 3 review passed at commit `1764904fde9a4d0fc8567f7b240c0087511972e2`.
 The Astra Phase 4 review passed at commit `3dbc02179d96a782f7061aef07d7c5522189c135`.
 The Astra Phase 5 review passed at commit `5febcd48d5d71642fd4d6eca7bd67ff273e149a4`.
 The Astra Phase 6 and final parity review passed at the same accepted source commit.
+The D04 unit candidate has 70 passing tests and one ignored manual benchmark.
 The advisory-lock, final-rename race, and power-loss limits remain explicit in `src/save.rs`.
 The Phase 4 probe SHA-256 was `bbd48e8a94d359c47618a8f053fbed91870f4bef4381593a856c9379841de90c`.
 The redraw benchmark used 28 rows, five warmups, ten batches, and five preparations per batch.
