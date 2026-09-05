@@ -559,6 +559,8 @@ impl SavedState {
         active_index: usize,
         view: &crate::editor::Editor,
         config: &Config,
+        startup_mode: crate::editor::Mode,
+        startup_offset: Option<&crate::cli::Offset>,
     ) -> Result<Self, String> {
         if paths.is_empty() || paths.len() > 24 || active_index >= paths.len() {
             return Err("A save state supports 1 to 24 files and a valid active index.".into());
@@ -573,7 +575,8 @@ impl SavedState {
             } else {
                 let data = std::fs::read(path)
                     .map_err(|error| format!("Cannot read {}: {error}", path.display()))?;
-                let initial = config.new_view(data, view.mode, 0)?;
+                let initial_offset = session_offset(&data, startup_offset);
+                let initial = config.new_view(data, startup_mode, initial_offset)?;
                 state.add_file(&text_path, &initial, config)?;
             }
         }
@@ -739,6 +742,21 @@ impl SavedState {
         state.update_view(0, view)?;
         Ok(state)
     }
+}
+
+fn session_offset(data: &[u8], offset: Option<&crate::cli::Offset>) -> u64 {
+    let requested = offset.and_then(|offset| {
+        match offset.target {
+            crate::cli::OffsetTarget::File(value) => Ok(value),
+            crate::cli::OffsetTarget::Virtual(value) => crate::format::virtual_to_file(data, value),
+            crate::cli::OffsetTarget::EntryPoint => crate::format::entry_point(data),
+            crate::cli::OffsetTarget::End => Ok((data.len() as u64).wrapping_sub(1)),
+        }
+        .ok()
+    });
+    requested
+        .filter(|value| *value < data.len() as u64)
+        .unwrap_or(0)
 }
 
 fn put32(payload: &mut [u8], offset: usize, value: u32) {
@@ -1113,14 +1131,15 @@ mod tests {
             directory.join("offset-10.sav"),
             directory.join("offset-20.sav"),
         ];
-        let state = SavedState::new_files(&paths, 1, &view, &Config::default()).unwrap();
+        let state =
+            SavedState::new_files(&paths, 1, &view, &Config::default(), Mode::Hex, None).unwrap();
         let parsed = parse_saved(&encode_saved(&state.payload).unwrap()).unwrap();
         assert_eq!(parsed.active_index, 1);
         assert_eq!(parsed.files.len(), 2);
         assert_eq!(parsed.files[0].offset, 0);
         assert_eq!(parsed.files[1].offset, 64);
         assert_eq!(parsed.files[1].mode, 2);
-        assert!(SavedState::new_files(&[], 0, &view, &Config::default()).is_err());
+        assert!(SavedState::new_files(&[], 0, &view, &Config::default(), Mode::Hex, None).is_err());
     }
 
     #[test]
@@ -1151,14 +1170,26 @@ mod tests {
                     ..Config::default()
                 };
                 let view = config.new_view(data.to_vec(), mode, 0).unwrap();
-                SavedState::new_files(&paths, 0, &view, &config)
+                SavedState::new_files(&paths, 0, &view, &config, mode, None)
             })
             .collect();
         let explicit_hex = Config::default();
         let hex_view = explicit_hex.new_view(vec![0], Mode::Hex, 0).unwrap();
-        let explicit_hex_state =
-            SavedState::new_files(&paths, 0, &hex_view, &explicit_hex).unwrap();
+        let explicit_offset = crate::cli::Offset {
+            mode: 2,
+            target: crate::cli::OffsetTarget::File(1),
+        };
+        let explicit_hex_state = SavedState::new_files(
+            &paths,
+            0,
+            &hex_view,
+            &explicit_hex,
+            Mode::Hex,
+            Some(&explicit_offset),
+        )
+        .unwrap();
         assert!(explicit_hex_state.files.iter().all(|file| file.mode == 2));
+        assert_eq!(explicit_hex_state.files[1].offset, 1);
         std::fs::remove_file(path).unwrap();
         for (result, expected_mode) in results.into_iter().zip([2, 3]) {
             let state = result.unwrap();

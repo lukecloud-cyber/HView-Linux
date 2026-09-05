@@ -342,6 +342,22 @@ fn new_view(
     config.new_view(data, mode, offset)
 }
 
+fn startup_mode(options: &cli::Options, config: &config::Config) -> Mode {
+    let selected = options
+        .mode
+        .unwrap_or_else(|| options.offset.as_ref().map_or(0, |offset| offset.mode));
+    match selected {
+        1 => Mode::Text,
+        2 => Mode::Hex,
+        3 => Mode::Code,
+        _ => match config.start_mode.as_str() {
+            "Hex" => Mode::Hex,
+            "Code" => Mode::Code,
+            _ => Mode::Text,
+        },
+    }
+}
+
 fn restored_path(text: &str) -> Result<PathBuf, String> {
     let path = Path::new(text);
     if path.is_absolute() {
@@ -389,20 +405,13 @@ fn open_editor(
         }
         Err(error) => return Err(error),
     };
-    let selected_mode = saved_view
-        .map(|state| state.mode as u8)
-        .or(options.mode)
-        .unwrap_or_else(|| options.offset.as_ref().map_or(0, |offset| offset.mode));
-    let mode = match selected_mode {
-        1 => Mode::Text,
-        2 => Mode::Hex,
-        3 => Mode::Code,
-        _ => match config.start_mode.as_str() {
-            "Hex" => Mode::Hex,
-            "Code" => Mode::Code,
+    let mode = saved_view
+        .map(|state| match state.mode {
+            2 => Mode::Hex,
+            3 => Mode::Code,
             _ => Mode::Text,
-        },
-    };
+        })
+        .unwrap_or_else(|| startup_mode(options, config));
     let requested = options
         .offset
         .as_ref()
@@ -940,8 +949,15 @@ fn run() -> io::Result<()> {
                 state.update_view(index, &view).map_err(io::Error::other)?;
             } else if session_enabled {
                 saved_state = Some(
-                    config::SavedState::new_files(&paths, index, &view, &config)
-                        .map_err(io::Error::other)?,
+                    config::SavedState::new_files(
+                        &paths,
+                        index,
+                        &view,
+                        &config,
+                        startup_mode(&options, &config),
+                        options.offset.as_ref(),
+                    )
+                    .map_err(io::Error::other)?,
                 );
             }
         }
@@ -1141,6 +1157,8 @@ mod tests {
             0,
             &view,
             &config::Config::default(),
+            Mode::Hex,
+            None,
         )
         .unwrap();
         let parsed = config::parse_saved(&config::encode_saved(&state.payload).unwrap()).unwrap();

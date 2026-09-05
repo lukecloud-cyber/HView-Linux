@@ -230,7 +230,7 @@ def main() -> None:
         backslash_file = root / "name\\part.bin"
         backslash_file.write_bytes(b"Backslash path")
         backslash_session = root / "backslash.sav"
-        run_session(
+        output = run_session(
             binary,
             ["--session", str(backslash_session), str(backslash_file)],
             [CTRL_Q],
@@ -264,17 +264,19 @@ def main() -> None:
         utf16_file = root / "utf16.bin"
         utf16_file.write_bytes("\N{ZERO WIDTH NO-BREAK SPACE}Text".encode("utf-16-le"))
         utf16_session = root / "utf16.sav"
-        run_session(
+        output = run_session(
             binary,
             [
                 "--mode=hex",
+                "--offset=1",
                 "--session",
                 str(utf16_session),
                 str(data_file),
                 str(utf16_file),
             ],
-            [CTRL_Q],
+            [b"m", b"t\r", CTRL_F12, CTRL_Q],
         )
+        require(output, b"00000001", "The inactive session record lost the startup offset.")
         if not utf16_session.is_file():
             raise AssertionError("Explicit Hex mode did not initialize the UTF-16 session file.")
 

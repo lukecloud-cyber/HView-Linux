@@ -156,7 +156,7 @@ New sessions now store absolute paths before SAV validation.
 Linux absolute paths can contain literal backslashes.
 Relative and empty XDG paths now fall back to HOME.
 File switching now reads the current session view record.
-Explicit startup modes now initialize inactive session records.
+Explicit startup modes and offsets now initialize inactive session records.
 The `--` boundary now disables every legacy option check.
 
 Astra found incomplete CP437 output and idle resize handling.
