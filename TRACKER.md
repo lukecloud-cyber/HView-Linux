@@ -9,13 +9,13 @@ Read [UPSTREAM_REVIEW.md](UPSTREAM_REVIEW.md) for the subsequent Windows D04 thr
 ## Current state
 
 - Completed: project analysis, repository rename, branch creation, plan, and tracker.
-- Application implementation: the original D03 release passed all six phases and Astra review.
-- Active work: obtain final Astra acceptance and publish the extension.
-- Core owner: `sol_linux_baseline` owns source adapters, fixtures, core tests, and terminal checks.
-- Native owner: `native_package` owns `lib`, package scripts, native probes, and native metadata.
-- Save owner: `save_backend` owns `src/save.rs` and its inline tests.
-- Next task: record final Astra acceptance or required corrections before publication.
-- Next acceptance check: Astra must review the final extension package and matrix.
+- Application implementation: the original D03 release and the D04 through D07 extension passed all required checks and Astra review.
+- Active work: publish the accepted extension and check hosted CI.
+- Source owner: Sol xhigh completed all implementation and test tasks.
+- Checker: Astra High accepted source `5e4ef68` and the final package.
+- Record owner: the main task maintains final verification and publication evidence.
+- Next task: push the accepted branch and record the remote hash and hosted CI result.
+- Remaining application work: none within the approved scope.
 - Upstream review: Windows `a3b7240` supplies the approved D04 through D07 source baseline.
 - Application blockers: none confirmed.
 - Current branch: `rust-rewrite`.
@@ -120,7 +120,7 @@ Finish each stage before dependent source changes.
 | D05 | Transient raw runtime base, x86 width, integer byte order, and checked growth | Complete | Astra accepted `04e5610`; raw/AUTO, mapping, widths, byte order, growth, transient state, sessions, and Real16 separation pass |
 | D06 | Nonmutating assembly preview with exact-byte confirmation | Complete | Astra accepted `d447c4d`; exact bytes, strict decoding, Real16, raw bounds, wrapping, resize gates, cancellation, and Apply passed |
 | D07 | Grouped operation undo/redo with record and byte limits | Complete | Astra accepted `5e4ef68`; grouping, all record types, both limits, atomic refusal, raw redo, shortcuts, save resets, and failures pass |
-| EXT-VERIFY | Final regression suite, isolated package, documentation, and Astra acceptance | Implemented | All local checks and the isolated package passed at `5e4ef68`; final Astra matrix review remains |
+| EXT-VERIFY | Final regression suite, isolated package, documentation, and Astra acceptance | Complete | Astra accepted source `5e4ef68`, records `56484b0`, all matrix rows, Linux differences, and the isolated package |
 
 ## Completed planning and setup
 
@@ -206,6 +206,9 @@ Native hashes, ELF tags, isolated loading, and missing-library checks also passe
 The package is `/home/sweet_cicero/Projects/HView-Linux/target/packages/hview-linux-x86_64-5e4ef68`.
 The executable SHA-256 is `b55b91b7d3f0735a0980bf57909b83ddef41bf5388041d4e51f5700c39d8c964`.
 The command was `python3 scripts/package.py target/packages/hview-linux-x86_64-5e4ef68`.
+Astra accepted the complete extension after reviewing the final records at `56484b04fe4553a813f4e6c5ab54174e5e440b57`.
+Astra independently reran the package probe and verified the executable hash and packaged README.
+All function-matrix rows and Linux differences have implementation and passing check references.
 Real editor operations verify 256-record eviction, combined 64-MiB byte eviction, and oversized-edit rejection without state changes.
 The final manual benchmark passed with 28 rows, five warmups, ten batches, and five preparations per batch.
 Raw median/p95 was 53361/90678 ns. PE median/p95 was 100642/102425 ns.
@@ -286,7 +289,8 @@ The findings and limits above remain the persistent evidence summary.
 8. Run the required checks for that task.
 9. Record results and the next action in this tracker.
 
-Current resume action: continue the active extension stage after reading UPSTREAM_REVIEW.md and the latest task evidence.
+Current resume action: check publication and hosted CI evidence before selecting any new work.
+The approved application scope is complete. D08 and later backlog items require a new user request.
 
 ## Subsequent Windows update review
 

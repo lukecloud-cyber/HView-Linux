@@ -18,7 +18,8 @@ The extension package is `target/packages/hview-linux-x86_64-5e4ef68`.
 The extension executable SHA-256 is `b55b91b7d3f0735a0980bf57909b83ddef41bf5388041d4e51f5700c39d8c964`.
 The extension passes formatting, 83 Rust tests, strict Clippy, a fresh release build, and the native self-test.
 The manual decoder preparation benchmark also passed.
-Final Astra package and matrix acceptance remains pending.
+Astra accepted the final package, complete matrix, and Linux differences after reviewing records at `56484b0`.
+Astra independently reran the package probe and verified the executable hash and packaged README.
 
 ## Commands
 
