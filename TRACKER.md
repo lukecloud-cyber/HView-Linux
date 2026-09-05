@@ -7,13 +7,13 @@ Read [PLAN.md](PLAN.md) for the complete requirements and source references.
 ## Current state
 
 - Completed: project analysis, repository rename, branch creation, plan, and tracker.
-- Application implementation: Phase 1 code and local checks are ready for Astra review.
-- Active work: Astra review of the stable Phase 1 candidate.
+- Application implementation: Phase 1 passed Astra review.
+- Active work: the independent Phase 4 analysis probe.
 - Core owner: `sol_linux_baseline` owns source adapters, fixtures, core tests, and terminal checks.
 - Native owner: `native_package` owns `lib`, package scripts, native probes, and native metadata.
 - Save owner: `save_backend` owns `src/save.rs` and its inline tests.
-- Next task: complete the Astra review against the stable Phase 1 commit.
-- Next acceptance check: Astra Phase 1 review.
+- Next task: continue the assigned next-phase implementation work.
+- Next acceptance check: run focused checks for the next implemented task.
 - Application blockers: none confirmed.
 - Current branch: `rust-rewrite`.
 - Project folder: `/home/sweet_cicero/Projects/HView-Linux`.
@@ -63,12 +63,12 @@ Use the Evidence column for implementation locations, checks, and review results
 
 | ID | Phase | Task | Status | Evidence |
 |---|---|---|---|---|
-| P1-01 | Foundation | Import Windows Rust modules, assets, and retained fixtures with source provenance | Implemented | Imported from `97a308c4fadffa434e96cf4cab33591a26413f4e`; focused verification remains |
-| P1-02 | Foundation | Add Linux terminal input, frame output, resizing, and state restoration | Implemented | PTY passed restoration, idle resize, small help, prompts, key input, CP437, and safe rendering |
-| P1-03 | Foundation | Add native library loading, version checks, and missing-library behavior | Implemented | `src/native.rs`, decoder, assembler, `lib`; self-test and isolated package probe passed; native static review passed |
-| P1-04 | Foundation | Connect Text and Hex display, navigation, wrapping, tabs, and CP437 rendering | Implemented | Imported editor logic; PTY checks passed Text and Hex without native libraries |
-| P1-05 | Foundation | Connect 16/32/64-bit Code display, movement, decoder reuse, and NOP/INT3 packing | Implemented | Native unit tests and PTY Code check passed; syntax-aware decoder reuse passes |
-| P1-06 | Foundation | Connect help and prompts; check empty files, EOF, small terminals, and error exits | Implemented | Empty-file and invalid-option PTY checks passed; saved states with zero files fail |
+| P1-01 | Foundation | Import Windows Rust modules, assets, and retained fixtures with source provenance | Complete | Imported from `97a308c4fadffa434e96cf4cab33591a26413f4e`; Astra accepted commit `77d4236` |
+| P1-02 | Foundation | Add Linux terminal input, frame output, resizing, and state restoration | Complete | PTY passed restoration, idle resize, small help, prompts, key input, CP437, and safe rendering; Astra accepted |
+| P1-03 | Foundation | Add native library loading, version checks, and missing-library behavior | Complete | Self-test and isolated package probe passed; native static review and Astra Phase 1 review passed |
+| P1-04 | Foundation | Connect Text and Hex display, navigation, wrapping, tabs, and CP437 rendering | Complete | PTY passed Text and Hex without native libraries; Astra accepted |
+| P1-05 | Foundation | Connect 16/32/64-bit Code display, movement, decoder reuse, and NOP/INT3 packing | Complete | Native unit and PTY Code checks passed; Astra accepted |
+| P1-06 | Foundation | Connect help and prompts; check empty files, EOF, small terminals, and error exits | Complete | Empty-file, invalid-option, small-terminal, and saved-state checks passed; Astra accepted |
 | P2-01 | File workflow | Add Linux arguments, absolute paths, option boundaries, and startup offset selection | Active | Absolute paths and `--` have tests; complete Unicode argument work remains |
 | P2-02 | File workflow | Add file picker, multiple files, next/previous selection, masks, and safe recursion | Active | Linux picker and wildcard traversal exist; symlink-cycle test passes; focused review remains |
 | P2-03 | Configuration | Port configuration parsing and discovery; preserve implemented legacy settings | Active | Imported parser runs; Linux default names and focused discovery checks remain |
@@ -139,7 +139,7 @@ These results do not establish Linux feature parity.
 | `python3 scripts/package.py /tmp/hview-linux-phase1-package-1788619612135433605` | Package and isolated native checks passed |
 
 These checks ran on Linux x86-64 with Rust 1.98.0.
-The full Astra Phase 1 review is not complete.
+The Astra Phase 1 review passed at commit `77d4236bc355cdca517c094a45d3a12c766eaef1`.
 
 Astra found incomplete CP437 output and idle resize handling.
 The candidate now preserves all CP437 cells and redraws after idle resize.
@@ -175,9 +175,9 @@ The findings and limits above remain the persistent evidence summary.
 8. Run the required checks for that task.
 9. Record results and the next action in this tracker.
 
-Current resume action: read the Astra Phase 1 findings and resolve each finding.
-Repeat the format, test, Clippy, release, PTY, and package checks after a source change.
-Keep Phase 1 tasks Implemented until the Astra review passes.
+Current resume action: inspect the latest commit and active next-phase task before a source change.
+Repeat the applicable focused checks after each source change.
+Keep later tasks Active or Implemented until their required checks and Astra review pass.
 
 ## Excluded work
 
