@@ -3,12 +3,16 @@
 This matrix maps each function in `PLAN.md` to Linux source and executable evidence.
 Use `TRACKER.md` for task status and Astra review results.
 
-Astra accepted all matrix rows and Linux differences at source commit `5febcd48d5d71642fd4d6eca7bd67ff273e149a4`.
-The final package is `target/packages/hview-linux-x86_64-5febcd4`.
+Astra accepted the original D03 matrix and Linux differences at source commit `5febcd48d5d71642fd4d6eca7bd67ff273e149a4`.
+The original D03 package is `target/packages/hview-linux-x86_64-5febcd4`.
 The packaged executable SHA-256 is `e0ebf155b1392a955aa1b2d941120889ef4e2511ebf6824a65e116ea696e12c7`.
 Local CI-equivalent checks passed.
 Hosted CI passed after publication of `a2e6ddd` and `aa5bd96`.
 See `TRACKER.md` for both hosted run links.
+
+The approved extension adds D04 through D07 from Windows commit `a3b7240ae0288be383f16135fe6a2f31427fc95c`.
+Astra accepted D04 at `1793755`, D05 at `04e5610`, and D06 at `d447c4d`.
+D07 and final extension verification remain active. The original package does not contain these extension functions.
 
 ## Commands
 
@@ -23,6 +27,10 @@ The matrix uses these evidence names.
 | Analysis | `python3 tests/analysis_probe.py target/release/hview-linux` |
 | Macro | `python3 tests/macro_probe.py target/release/hview-linux` |
 | Linux | `python3 tests/linux_behavior_probe.py target/release/hview-linux` |
+| Navigation | `python3 tests/navigation_probe.py target/release/hview-linux` |
+| Raw | `python3 tests/raw_model_probe.py target/release/hview-linux` |
+| Patch | `python3 tests/patch_probe.py target/release/hview-linux` |
+| History | `python3 tests/edit_history_probe.py target/release/hview-linux` |
 | Package | `python3 scripts/package.py /tmp/hview-linux-package` |
 | Benchmark | `cargo test --locked --release d01_redraw_preparation_benchmark -- --ignored --nocapture --test-threads=1` |
 
@@ -38,7 +46,7 @@ The matrix uses these evidence names.
 | NOP and INT3 packing | `src/main.rs` `decode_at` and `code_rows` | Unit `code_packing_respects_limits_and_settings` |
 | Hex editing | `src/editor.rs` `hex_digit`; `src/main.rs` edit input | Unit `recovered_editor_contract`; Reliability |
 | Edit cancellation | `src/editor.rs` `cancel_edit` | Unit `recovered_editor_contract`; Reliability; Analysis |
-| Current-byte undo | `src/editor.rs` `undo_current_byte` | Unit `recovered_editor_contract`; Reliability |
+| Operation undo and redo | `src/editor.rs` edit records; `src/main.rs` edit input; `src/workbench.rs` transforms | D07 acceptance pending; replaces original current-byte undo |
 | Assembly | `src/assembler.rs`; `src/main.rs` `assembly_seed` and edit workflow | Unit `assembler_vectors_and_errors` and `assembly_seed_stays_intel_with_att_display`; Reliability |
 | Replacement save | `src/save.rs` `replace` | Nine `src/save.rs` unit checks; Reliability |
 | Save As | `src/save.rs` `save_as`; `src/main.rs` target switch | Unit `save_as_uses_atomic_destination_refusal`; Reliability |
@@ -60,7 +68,10 @@ The matrix uses these evidence names.
 | Macro playback | `src/macros.rs` `Playback`; `src/console.rs` event translation | Unit macro checks; Macro |
 | Help and prompts | `src/workbench.rs` help, tools, and prompt helpers; `src/console.rs` modal input | Terminal; Analysis; Macro |
 | Native self-test | `src/main.rs` `--self-test`; `src/native.rs` explicit library paths | `target/release/hview-linux --self-test`; Package |
-| Packaging and CI | `scripts/package.py`, `tests/package_probe.py`, `.github/workflows/ci.yml` | Package hash, isolation, missing-library, and six packaged probe checks |
+| Packaging and CI | `scripts/package.py`, `tests/package_probe.py`, `.github/workflows/ci.yml` | Package hash, isolation, missing-library, and every packaged application probe |
+| Direct branch navigation | `src/decoder.rs` direct targets; `src/format.rs` checked mappings; `src/main.rs` follow/return | Navigation; Unit direct targets, mappings, bounds, and histories |
+| Raw address model | `src/editor.rs` raw state; `src/format.rs` mappings; `src/workbench.rs` grammar; `src/inspect.rs` byte order | Raw; Unit grammar, address limits, mapping, growth, and AUTO state |
+| Assembly preview | `src/main.rs` preview construction, instruction rows, and confirmation | Patch; Unit strict replacement decoding, exact bytes, and preview boundaries |
 
 ## Linux differences
 
@@ -77,6 +88,9 @@ The matrix uses these evidence names.
 | Real16 | The O key selects Real16 after 64-bit mode. Sessions preserve the selection. | Unit Real16 checks; Linux; tracked Zydis oracle |
 | Invalid bytes | `InvalidCode=Error` is strict. `InvalidCode=Byte` emits one-byte rows. | Unit fallback check; Linux |
 | Raw ELF | Code mode decodes raw ELF bytes without ELF structure support. | Unit raw-format checks; Linux |
+| Code Enter | Enter and Ctrl+M share a terminal byte. Both follow branches outside editing. F4 and M select modes. | Navigation; Macro |
+| Raw and Real16 | Explicit raw width overrides AUTO. Raw 16-bit mode uses linear addresses and does not use Real16. | Raw; Navigation; Linux |
+| Preview dimensions | The complete summary must fit before Apply. Resize and input checks use current terminal dimensions. | Patch, including immediate resize with Enter |
 | Save operations | Linux staging preserves supported metadata and uses atomic publication operations. | Nine save unit checks; Reliability |
 
 ## Documented limits
@@ -86,6 +100,9 @@ The matrix uses these evidence names.
 | Host | The verified release target is Linux x86-64. |
 | Source license | The Rust source has no declared license. Native components keep separate notices. |
 | Memory | Each open file uses a complete memory buffer. Edit cancellation keeps a second buffer. |
+| Edit history | History permits 256 records and 64 MiB of stored before/after bytes. Older records can expire. |
+| Raw model | Settings are transient. Raw models provide linear mappings without ELF structure interpretation. |
+| Preview | Apply requires 60 columns and enough rows for the full summary. Instruction rows can show truncation markers. |
 | Text | Text view is byte-oriented. General Unicode text rendering is outside scope. |
 | Sessions | Sessions store 1 through 24 ASCII paths. Each path uses fewer than 260 bytes. |
 | Real16 | The application matches display behavior. Execution and segmentation semantics are outside scope. |

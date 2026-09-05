@@ -79,6 +79,8 @@ Diagnostic evidence is in `/tmp/hview-baseline.vMUmt1`.
 
 ## Function matrix
 
+This table records the original D03 analysis baseline. The approved extension below replaces current-byte undo and adds the D04 through D07 functions.
+
 All Windows paths below are relative to `/home/sweet_cicero/Projects/HView-windows`.
 Previous Linux paths refer to commit `35dbd0bbdfba08c1d3062bbeb65d5c6abcd29771`.
 
@@ -138,7 +140,7 @@ The port must retain this known limit until separate large-file work starts.
 Assembly accepts one ASCII instruction with at most 350 characters.
 The adapter rejects multiline instructions, semicolon-separated instructions, and invalid output sizes.
 Assembly can extend the buffer.
-Assembly does not preview neighboring instruction changes.
+The D03 baseline did not preview neighboring instruction changes. D06 adds a preview before buffer changes.
 
 The current configuration parser deliberately preserves CRLF parsing and legacy numeric rules.
 The current saved format permits fewer than 260 ASCII bytes in each path.
@@ -148,7 +150,7 @@ The port must document these limits without silently changing the binary format.
 The checked PE tools distinguish file gaps, overlay bytes, and virtual-only bytes.
 The checked PE tools reject ambiguous mappings and arithmetic overflow.
 VA conversion uses the preferred ImageBase from the current buffer.
-Runtime base selection is outside current Windows parity.
+The D03 baseline had no runtime base selection. D05 adds an explicit raw model with a checked runtime base.
 
 ## Linux adaptations
 
@@ -282,12 +284,31 @@ Preserve required notices for any retained source or native dependency.
 Phase 0 is complete as an environment setup action.
 The setup preserved the old history and default branch.
 The initial setup verified the remote branch hash, public visibility, zero tracked files, and clean working tree.
-Phases 1 through 6 remain application implementation work for Sol xhigh.
+Phases 1 through 6 passed implementation checks and Astra review for the original D03 release.
+Use TRACKER.md for the approved extension status.
 
 Finish each phase before starting dependent work.
 Keep the source module boundaries unless a Linux requirement needs a change.
 Do not introduce a plugin framework, general backend interface, or shared cross-repository package.
 Do not maintain a second application implementation in C.
+
+### Approved D04 through D07 extension
+
+Use Windows commit `a3b7240ae0288be383f16135fe6a2f31427fc95c` as the extension source reference.
+Keep the Linux adaptations and the accepted D03 release behavior.
+
+| Stage | Required behavior | Acceptance evidence |
+|---|---|---|
+| D04 | Follow direct branches with Enter; return with Backspace; keep separate bounded histories | Checked PE/raw targets, unsupported processors, syntax, Real16, view restoration, and F5 history checks |
+| D05 | Select a transient raw base, x86 width, and integer byte order with Ctrl+T R | Grammar, mapping, width limits, growth, AUTO restoration, session separation, and current-buffer checks |
+| D06 | Preview exact assembly bytes and affected instructions before confirmation | Cancellation, overwrite, retained bytes, EOF growth, strict decoding, resize, and small-terminal checks |
+| D07 | Group hexadecimal, assembly, Fill, and XOR operations for undo and redo | Bytes, length, cursor, dirty state, save/cancel resets, redo preservation, and 256-record/64-MiB limits |
+| Final | Verify the complete extension and its Linux adaptations | Full regression checks, isolated package, updated matrix, and Astra acceptance |
+
+Raw 16-bit mode remains distinct from Real16. Raw settings do not enter the SAV format.
+Assembly input remains Intel. Preview display follows the configured disassembly syntax.
+The preview must check current terminal dimensions before applying a patch.
+Synthetic resize events must preserve a hexadecimal edit group.
 
 ## Required verification
 

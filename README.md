@@ -89,8 +89,12 @@ For ordinary raw files, `--virtual` uses the value as a file offset. Raw ELF fil
 | --- | --- |
 | `F1` | The key shows help. |
 | `F2` or `Enter` | The key opens the Intel assembler during Code editing. |
-| `F3` | The key starts editing or restores the current edited byte. |
-| `F4`, `M`, or `Enter` | The key selects Text, Hex, or Code mode outside editing. |
+| `F3` | The key starts editing. During editing, the key undoes one operation. |
+| `Ctrl+Z` | The key undoes one operation during editing. |
+| `Shift+F3` or `Ctrl+Y` | The key redoes one operation during editing. |
+| `F4` or `M` | The key selects Text, Hex, or Code mode outside editing. |
+| `Enter` | Outside editing, the key selects mode in Text/Hex or follows a direct branch in Code. |
+| `Backspace` | In Code view outside editing, the key returns from a followed branch. |
 | `F5` | The key goes to a file offset. |
 | `F7` | The key starts an ASCII or masked hexadecimal search. |
 | `Shift+F7` | The key finds the next match. |
@@ -106,6 +110,12 @@ For ordinary raw files, `--virtual` uses the value as a file offset. Raw ELF fil
 | `F10` or `Ctrl+Q` | The key exits the application. |
 
 Arrow, Home, End, Page Up, and Page Down keys also move the cursor.
+
+Linux terminals send the same byte for `Ctrl+M` and `Enter`. Both keys follow a branch in Code view outside editing.
+
+Code navigation follows direct relative calls, jumps, conditional branches, and loops. Indirect branches and invalid targets produce a notice.
+
+Backspace restores the file offset and viewport from a separate history of up to 256 return positions.
 
 Hex search accepts complete byte pairs and wildcard nibbles. For example, enter `48 8B ?? A? ?F`.
 
@@ -169,6 +179,7 @@ Press `Ctrl+T`, and then select one tool:
 | Key | Tool |
 | --- | --- |
 | `A` | The tool converts a checked PE file offset, RVA, or preferred ImageBase VA. |
+| `R` | The tool selects an explicit raw address model or restores `AUTO`. |
 | `S` | The tool finds printable ASCII and ASCII encoded as UTF-16LE or UTF-16BE. |
 | `P` | The tool browses PE sections, directories, imports, exports, security data, and overlay data. |
 | `E` | The tool shows an entropy map in bits per byte. |
@@ -185,6 +196,28 @@ PE parsing supports checked PE32 and PE32+ file-backed mappings. The PE browser 
 
 Code mode can decode raw x86 bytes in non-PE files. Raw ELF files do not receive ELF headers, symbols, or virtual-address mapping.
 
+### Raw address model
+
+Press `Ctrl+T`, and then press `R`. Enter `AUTO` or `X86 16|32|64 LE|BE HEXBASE` with one width and one byte order.
+
+For example, `X86 64 LE 140000000` maps file offset zero to hexadecimal address `140000000`.
+
+The raw model overrides PE metadata for addresses, x86 width, decoding, assembly, and branch navigation. The address tool converts file offsets and virtual addresses.
+
+The raw model rejects RVA conversion. The selected byte order controls integer inspection; x86 decoding and assembly always use little-endian bytes.
+
+Raw 16-bit mode uses a linear 32-bit address range. Raw 16-bit mode does not use the Real16 instruction policy or wrapped targets.
+
+With a raw model active, `O` cycles 16-bit, 32-bit, and 64-bit widths. The application checks the address range before changing width.
+
+`AUTO` restores the previous automatic code width and Real16 selection. Changes to the raw base or width clear branch-return history.
+
+Changes to byte order alone preserve branch-return history. Invalid, canceled, and unchanged model selections also preserve that history.
+
+Raw settings survive mode changes, Save As, and edit cancellation. File switches and application restarts clear raw settings.
+
+Sessions store the underlying automatic width and Real16 selection. Sessions do not store the raw model.
+
 String results use a four-character minimum and a 120-character display limit. String and comparison browsers limit output to 10,000 rows.
 
 The entropy tool uses blocks of at least 4,096 bytes. The tool increases the block size for large files.
@@ -195,7 +228,31 @@ Press `F3` to start editing. Hex mode replaces nibbles, and Code mode assembles 
 
 Press `Esc` to restore the pre-edit buffer. The application keeps a full memory copy for this cancellation operation.
 
+During Code editing, `F2` or `Enter` opens the Intel assembly prompt. A preview shows the proposed patch before buffer changes.
+
+The preview shows exact bytes, mapped addresses, affected instructions, retained bytes, overwritten bytes, and extension beyond EOF.
+
+Preview instruction text uses the selected disassembly syntax. Assembly input and prompt text always use Intel syntax.
+
+Press `Enter` to apply the exact proposed bytes. Press `Esc` to cancel the preview.
+
+The preview requires at least 60 columns and enough rows for the complete patch summary. A resize notice prevents application below those dimensions.
+
+The preview marks clipped instruction rows. The replacement instruction must decode completely, including when `InvalidCode=Byte` is active.
+
+Press `F3` or `Ctrl+Z` to undo one operation during editing. Press `Shift+F3` or `Ctrl+Y` to redo one operation.
+
+One completed hexadecimal byte, confirmed assembly patch, Fill range, or XOR range forms one edit record.
+
+Undo and redo restore bytes, buffer length, cursor, viewport, and nibble selection. A changed edit clears redo history.
+
+Failed, canceled, and unchanged edits preserve redo history. The history holds up to 256 records within 64 MiB of stored bytes.
+
+The application removes the oldest records when necessary. An operation larger than the history byte limit fails before buffer changes.
+
 Press `F9` to replace the current file. Press `Ctrl+S` to save the buffer under a new name.
+
+Successful saves establish a new edit baseline and clear both histories. Failed saves preserve both histories. Edit cancellation clears both histories.
 
 An in-place save checks the original bytes, file identity, metadata, and an advisory file lock before publication.
 
@@ -279,6 +336,10 @@ python3 tests/reliability_probe.py target/release/hview-linux
 python3 tests/analysis_probe.py target/release/hview-linux
 python3 tests/macro_probe.py target/release/hview-linux
 python3 tests/linux_behavior_probe.py target/release/hview-linux
+python3 tests/navigation_probe.py target/release/hview-linux
+python3 tests/raw_model_probe.py target/release/hview-linux
+python3 tests/patch_probe.py target/release/hview-linux
+python3 tests/edit_history_probe.py target/release/hview-linux
 python3 scripts/package.py /tmp/hview-linux-package
 ```
 

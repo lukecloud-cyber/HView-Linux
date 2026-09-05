@@ -12,7 +12,9 @@ The clean `master` branch advanced from `97a308c4fadffa434e96cf4cab33591a26413f4
 The update contains seven commits, including four feature commits.
 The Linux comparison baseline is `aa5bd966af8c91c3e5795c57119a9a4419708639` on `rust-rewrite`.
 
-## Missing Linux features
+## Linux gaps at the comparison baseline
+
+The table records gaps at Linux commit `aa5bd96`. Use TRACKER.md for implementation and acceptance status after this review.
 
 | Order | Windows feature and commit | User behavior | Linux gap |
 |---|---|---|---|
@@ -44,7 +46,7 @@ Linux source paths use the corresponding `src` modules in this repository.
 | D07 | `src/editor.rs`: edit records, grouped nibble edits, undo, redo, and history limits; edit callers in `src/main.rs` and `src/workbench.rs` | Hex grouping; assembly, fill, and XOR records; redo invalidation; no-op and failed operations; length and cursor restoration; save/cancel resets; history limits |
 
 D04 also fixes stale instruction-step history after a successful F5 Code jump.
-The Linux F5 handler still leaves that history intact.
+At the comparison baseline, the Linux F5 handler left that history intact.
 Include this related correction with the navigation port.
 
 The raw model overrides PE headers and affects rendering, decoding, assembly, navigation, and address conversion.
@@ -82,7 +84,7 @@ Do not replace Linux modules with complete Windows files.
 ## Review evidence
 
 The review compared the seven new commits, feature source, README, tracker, and reliability probe changes.
-Astra confirmed that D04 through D07 are missing from Linux.
+Astra confirmed that D04 through D07 were missing from the Linux comparison baseline.
 The portable Windows format module passed all 13 tests on this Linux host.
 Those tests cover raw mappings, checked navigation, address bounds, PE conversion, and malformed inputs.
 
