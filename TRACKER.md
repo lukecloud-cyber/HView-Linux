@@ -137,7 +137,7 @@ These results do not establish Linux feature parity.
 | `target/release/hview-linux --self-test` | Passed 16-bit, 32-bit, and 64-bit native checks |
 | `python3 tests/terminal_probe.py target/release/hview-linux` | Passed all Phase 1 PTY checks |
 | `python3 scripts/package.py /tmp/hview-linux-phase1-package-1788619612135433605` | Package and isolated native checks passed |
-| `cargo test --locked -- --test-threads=1` | 59 passed; one manual benchmark ignored for the Phase 2 candidate |
+| `cargo test --locked -- --test-threads=1` | 60 passed; one manual benchmark ignored for the Phase 2 candidate |
 | `python3 tests/file_workflow_probe.py target/release/hview-linux` | Passed native options, configuration, files, macros, and session workflows |
 
 These checks ran on Linux x86-64 with Rust 1.98.0.
@@ -157,6 +157,7 @@ Linux absolute paths can contain literal backslashes.
 Relative and empty XDG paths now fall back to HOME.
 File switching now reads the current session view record.
 Explicit startup modes and offsets now initialize inactive session records.
+Inactive Hex and Code records now keep their startup cursor visible.
 The `--` boundary now disables every legacy option check.
 
 Astra found incomplete CP437 output and idle resize handling.

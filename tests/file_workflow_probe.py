@@ -188,12 +188,16 @@ def main() -> None:
         view_config = root / "view.ini"
         view_config.write_bytes(native_config("Hex"))
         view_session = root / "view.sav"
-        output = run_session(
+        run_session(
             binary,
             ["--config", str(view_config), "--session", str(view_session), str(first)],
             [b"\x1b[C", F9, DOWN, DOWN, b"\r", CTRL_F11, CTRL_Q],
         )
-        require(output, b"00000001", "File switching did not restore the current view offset.")
+        view_payload = view_session.read_bytes()[32:]
+        active = int.from_bytes(view_payload[:4], "little")
+        final_offset = int.from_bytes(view_payload[384:392], "little")
+        if (active, final_offset) != (0, 1):
+            raise AssertionError("File switching did not restore the current view offset.")
 
         saved = bytearray(session.read_bytes())
         if saved[24:28] != b"\0\0\0\0":
@@ -276,9 +280,15 @@ def main() -> None:
             ],
             [b"m", b"t\r", CTRL_F12, CTRL_Q],
         )
-        require(output, b"00000001", "The inactive session record lost the startup offset.")
         if not utf16_session.is_file():
             raise AssertionError("Explicit Hex mode did not initialize the UTF-16 session file.")
+        utf16_payload = utf16_session.read_bytes()[32:]
+        second_base = 8 + 2814
+        active = int.from_bytes(utf16_payload[:4], "little")
+        mode = int.from_bytes(utf16_payload[second_base + 2772 : second_base + 2776], "little")
+        offset = int.from_bytes(utf16_payload[second_base + 376 : second_base + 384], "little")
+        if (active, mode, offset) != (1, 2, 1):
+            raise AssertionError("The inactive session record lost its startup mode or offset.")
 
     print("File workflow probe passed.")
 

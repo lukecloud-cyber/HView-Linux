@@ -576,7 +576,12 @@ impl SavedState {
                 let data = std::fs::read(path)
                     .map_err(|error| format!("Cannot read {}: {error}", path.display()))?;
                 let initial_offset = session_offset(&data, startup_offset);
-                let initial = config.new_view(data, startup_mode, initial_offset)?;
+                let mut initial = config.new_view(data, startup_mode, initial_offset)?;
+                initial.top = match startup_mode {
+                    crate::editor::Mode::Hex => initial_offset / 16 * 16,
+                    crate::editor::Mode::Code => initial_offset,
+                    crate::editor::Mode::Text => initial.top,
+                };
                 state.add_file(&text_path, &initial, config)?;
             }
         }
@@ -1207,6 +1212,37 @@ mod tests {
                 .new_view(data.to_vec(), Mode::Text, 0)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn inactive_session_offsets_keep_the_selected_bytes_visible() {
+        use crate::editor::{Editor, Mode};
+        let path = std::env::temp_dir().join(format!(
+            "hview-offset-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, vec![0; 2048]).unwrap();
+        let paths = vec![PathBuf::from("active.bin"), path.clone()];
+        let offset = crate::cli::Offset {
+            mode: 0,
+            target: crate::cli::OffsetTarget::File(0x301),
+        };
+        for mode in [Mode::Hex, Mode::Code] {
+            let view = Editor::new(vec![0; 2048], mode, 0);
+            let state =
+                SavedState::new_files(&paths, 0, &view, &Config::default(), mode, Some(&offset))
+                    .unwrap();
+            assert_eq!(state.files[1].offset, 0x301);
+            assert_eq!(
+                state.files[1].top,
+                if mode == Mode::Hex { 0x300 } else { 0x301 }
+            );
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
