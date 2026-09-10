@@ -10,14 +10,14 @@ Read [UPSTREAM_REVIEW.md](UPSTREAM_REVIEW.md) for the historical and current Win
 
 - Current scope: all implemented functions in Windows commit `469f13d0959d5bed7fbf068a7c4a5858be16d0a8`.
 - Current Windows source: clean local `master` at `469f13d0959d5bed7fbf068a7c4a5858be16d0a8`.
-- Current Linux branch: local and remote `rust-rewrite` at `1a3877a459aa7bea0f4e6f9d3249b1adb4554fdc`.
+- Current Linux branch: local and remote `rust-rewrite` at `2a275daf88dad159165b9ad982dd62fd2983be2d`.
 - Accepted Linux application baseline: D07 source at `5e4ef68`.
 - Current authorization: scoped application work on L02.1 only.
 - Planning status: L01.1, L01.2, and parent L01 are `Complete`.
-- Application implementation: L02.1 is authorized and `Pending`. All other application items remain `Pending` and unauthorized.
-- Detailed plan: two current children are `Complete`; 83 children are `Pending`.
-- Next action: Plan L02.1 with Astra xhigh. Assign its bounded implementation to Sol xhigh under the recorded authorization.
-- Review gate: L02.1 is authorized. Do not add another approval gate for L02.1.
+- Application implementation: L02.1 is `Complete`. All other application items remain `Pending` and unauthorized.
+- Detailed plan: three current children are `Complete`; 82 children are `Pending`.
+- Next action: L02.2 is the next item. Plan viewer file-lifecycle integration when the user requests the next item.
+- Request boundary: end this request after L02.1 publication. Do not start L02.2 now.
 - Accepted platform decisions: retain scoped HEM functions, closely match the Windows terminal, and support raw-device editing.
 - Device policy: use read-only defaults and explicit writable mode. Permit a user-controlled override for mounted, in-use, or nonexclusive devices.
 - Product policy: do not block a supported, valid, local operation only because the operation is risky.
@@ -32,7 +32,7 @@ Read [UPSTREAM_REVIEW.md](UPSTREAM_REVIEW.md) for the historical and current Win
 - Reviewer: Astra xhigh performs all planning and review.
 - Publication: commit and push reviewed goals only to `origin/rust-rewrite`.
 - Astra High accepted the detailed 85-goal plan after text review; all implementation goals remain pending until explicit user authorization.
-- Current modified records: `PLAN.md`, `TRACKER.md`, and `UPSTREAM_REVIEW.md`.
+- Current modified files: `src/paged.rs`, `tests/paged_reads.rs`, and `TRACKER.md`.
 - Project folder: `/home/sweet_cicero/Projects/HView-Linux`.
 - Repository: [HView-Linux](https://github.com/lukecloud-cyber/HView-Linux).
 
@@ -131,7 +131,7 @@ Linux currently reads the complete file at `L:src/main.rs:810`.
 
 | ID | Status | Deliverable | Why and context | Dependencies | Acceptance | Boundary |
 |---|---|---|---|---|---|---|
-| L02.1 | Pending | Add owned bounded file reads. | Whole-file loading prevents files larger than memory from opening. | L01.2 | Check 64 KiB windows, `u64` offsets, short reads, EOF, and files above 64 MiB and 4 GiB. | Regular files only. Preserve actual I/O errors and bounded allocation. |
+| L02.1 | Complete | Add owned bounded file reads. | Whole-file loading prevents files larger than memory from opening. | L01.2 | Check 64 KiB windows, `u64` offsets, short reads, EOF, and files above 64 MiB and 4 GiB. | Regular files only. Preserve actual I/O errors and bounded allocation. |
 | L02.2 | Pending | Connect bounded storage to the file lifecycle. | Views and reopen paths must retain the same source identity across file changes. | L02.1 | Check first and last bytes, limited-memory opening, file switches, reopening, replacement, truncation, and source changes. | Preserve native pathname identity. Keep buffered behavior where upstream uses it. Do not add paged-only analysis routes. |
 
 ### L03: logical spans and edit transactions
@@ -479,6 +479,10 @@ The current full Rust suite has an environment-limited ACL failure.
 
 | Date | Change | Result | Next action |
 |---|---|---|---|
+| 2026-09-10 | Complete L02.1 bounded file reads. | All required checks and Astra xhigh review passed. | Publish L02.1. Then stop before L02.2. |
+| 2026-09-10 | Implement L02.1 bounded file reads. | The focused tests, formatting, strict Clippy, and release build passed. | Have Astra xhigh review the diff and evidence. |
+| 2026-09-10 | Start L02.1 bounded file reads. | The new component owns a regular-file handle and returns bounded windows at `u64` offsets. The bounded FIFO test passed. | Run the complete focused target and required Rust checks. |
+| 2026-09-10 | Publish L01.2 authorization records. | Commit `2a275daf88dad159165b9ad982dd62fd2983be2d` reached `HView-Linux` `rust-rewrite`. Remote verification matched. | Execute the authorized L02.1 item. |
 | 2026-09-10 | Complete L01.2 authorization records. | The records authorize L02.1 only. Documentation checks and Astra xhigh review passed. | Plan L02.1 with Astra xhigh. Assign its bounded implementation to Sol xhigh under the recorded authorization. |
 | 2026-09-10 | Publish L01.1 implementation contracts. | Commit `1a3877a459aa7bea0f4e6f9d3249b1adb4554fdc` reached `HView-Linux` `rust-rewrite`. Remote verification matched. | Execute L01.2. |
 | 2026-09-10 | Complete L01.1 implementation contracts. | Documentation checks and Astra xhigh review passed. Application files remain unchanged. | Execute the user-authorized L01.2 planning item. |
@@ -515,6 +519,33 @@ Astra xhigh accepted L01.2 on September 10, 2026.
 The user instruction ‘k, do the next thing’ authorizes the next selected item.
 Current application authorization covers L02.1 only.
 Documentation checks passed. Application files remain unchanged.
+
+### L02.1 implementation evidence
+
+| Command | Result |
+|---|---|
+| `timeout 30s cargo test --locked --offline --test paged_reads fifo_is_rejected_without_blocking` | Passed. The FIFO refusal test completed without blocking. |
+| `cargo test --locked --offline --test paged_reads` | Passed all nine focused tests. |
+| `cargo fmt --all -- --check` | Passed. |
+| `cargo clippy --locked --offline --all-targets -- -D warnings` | Passed. |
+| `cargo build --locked --offline --release` | Passed. |
+
+`src/paged.rs` owns one read-only regular-file descriptor and captured source metadata.
+Each request returns an independent window of at most 64 KiB at a `u64` offset.
+The integration target `tests/paged_reads.rs` compiles the component without viewer changes.
+
+The tests cover native non-UTF-8 paths, EOF rules, invalid ranges, sparse large files, and actual missing-file errors.
+The tests also cover FIFO refusal, independent windows, explicit time changes, and truncation without a completed partial window.
+
+Linux validation compares the captured length, modification time, and change time with nanosecond fields.
+This validation cannot exclude every concurrent writer.
+L02.2 will connect the owned source and native path identity to the viewer file lifecycle.
+
+Astra xhigh accepted L02.1 on September 10, 2026.
+Nine focused tests, the bounded FIFO check, formatting, strict Clippy, and the release build passed.
+The component preserves owned windows, native path bytes, checked bounds, and source validation.
+The viewer remains unchanged.
+L02.2 will connect the component to the file lifecycle.
 
 ## Current stage sequence
 
@@ -846,8 +877,8 @@ The findings and limits above remain the persistent evidence summary.
 9. Assign an authorized dependency-ready item to Sol xhigh.
 10. Record results and the next action in this tracker.
 
-Current resume action: Plan L02.1 with Astra xhigh.
-Assign its bounded implementation to Sol xhigh under the recorded authorization.
+Current resume action: L02.2 is the next item.
+Plan viewer file-lifecycle integration when the user requests the next item.
 
 ## Historical D04 through D07 Windows review
 
