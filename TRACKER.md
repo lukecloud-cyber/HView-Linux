@@ -10,14 +10,14 @@ Read [UPSTREAM_REVIEW.md](UPSTREAM_REVIEW.md) for the historical and current Win
 
 - Current scope: all implemented functions in Windows commit `469f13d0959d5bed7fbf068a7c4a5858be16d0a8`.
 - Current Windows source: clean local `master` at `469f13d0959d5bed7fbf068a7c4a5858be16d0a8`.
-- Published L03.1 baseline: local and remote `rust-rewrite` at `3f71ac608940752d7a321477b15b163f95cff1a2`.
-- Current Linux branch: `rust-rewrite`. The L03.2 publication commit contains this completion record.
+- Published L03.2 baseline: local and remote `rust-rewrite` at `1cf7bb5d2f63e7a20efb3a74f4a1a9b77a9be728`.
+- Current Linux branch: `rust-rewrite`. The L03.3 publication commit contains this completion record.
 - Accepted Linux application baseline: D07 source at `5e4ef68`.
 - Current authorization: the user instruction “finish out L03” authorizes all L03 children.
 - Planning status: L01.1, L01.2, and parent L01 are `Complete`.
-- Application implementation: L03.1 and L03.2 are `Complete`. L03.3 is authorized and `Pending`.
-- Detailed plan: six current children are `Complete`; 79 children are `Pending`.
-- Next action: publish accepted L03.2 to `origin/rust-rewrite`. Then implement L03.3 under the recorded L03 authorization.
+- Application implementation: L03.1, L03.2, L03.3, and parent L03 are `Complete`.
+- Detailed plan: seven current children are `Complete`; 78 children are `Pending`.
+- Next action: publish accepted L03.3 to `origin/rust-rewrite`. Then stop. L04.1 remains `Pending` and unauthorized.
 - Request boundary: complete and publish each L03 child in sequence. Stop after parent L03 is complete.
 - Accepted platform decisions: retain scoped HEM functions, closely match the Windows terminal, and support raw-device editing.
 - Device policy: use read-only defaults and explicit writable mode. Permit a user-controlled override for mounted, in-use, or nonexclusive devices.
@@ -33,7 +33,7 @@ Read [UPSTREAM_REVIEW.md](UPSTREAM_REVIEW.md) for the historical and current Win
 - Reviewer: Astra xhigh performs all planning and review.
 - Publication: commit and push reviewed goals only to `origin/rust-rewrite`.
 - Astra High accepted the detailed 85-goal plan after text review; all implementation goals remain pending until explicit user authorization.
-- Current modified files: `PLAN.md`, `README.md`, `TRACKER.md`, `src/editor.rs`, and `src/paged.rs`.
+- Current modified files: `PLAN.md`, `README.md`, `TRACKER.md`, `src/main.rs`, `src/paged.rs`, and `tests/paged_lifecycle_probe.py`.
 - Removed temporary file: `tests/paged_reads.rs`. The normal application target now compiles `src/paged.rs`.
 - Project folder: `/home/sweet_cicero/Projects/HView-Linux`.
 - Repository: [HView-Linux](https://github.com/lukecloud-cyber/HView-Linux).
@@ -41,7 +41,8 @@ Read [UPSTREAM_REVIEW.md](UPSTREAM_REVIEW.md) for the historical and current Win
 The current source review used local checkouts only.
 The review did not run the Windows application, HEM modules, or real devices.
 The release application passed the current terminal probes.
-The final serialized host Rust suite passed all 101 active tests.
+The L03.3 serialized host Rust suite passed all 121 active tests.
+One manual benchmark stayed ignored.
 The sandbox Rust suite kept one ACL fixture failure because `setfacl` rejected UID 1.
 See [UPSTREAM_REVIEW.md](UPSTREAM_REVIEW.md) for the exact failure and source evidence.
 
@@ -71,7 +72,7 @@ Each task stays at its recorded status until its checks and Astra acceptance pas
 |---|---|---|---|---|---|
 | L01 | P01-P07, X03 | Complete records | None | Record the accepted HEM, terminal, device, path, and process-control contracts. | Record scoped application authorization and identify the first dependency-ready application item. |
 | L02 | S01, REQ01 | Complete | L01 | Add bounded regular-file access with stable ownership and `u64` positions. | Check files above 64 MiB, 4 GiB, and memory limits. Check both ends and source changes. |
-| L03 | S02, D07, REQ01/10 | Partial | L02 | Add logical spans and current edit transactions. Retain exact buffered undo state. | Check 256 records, 130 MiB history, 65 MiB changed memory, and 4,096 spans. Check atomic refusal. |
+| L03 | S02, D07, REQ01/10 | Complete | L02 | Add logical spans and current edit transactions. Retain exact buffered undo state. | Check 256 records, 130 MiB history, 65 MiB changed memory, and 4,096 spans. Check atomic refusal. |
 | L04 | S02, R03/R04 | Scale missing | L03 | Extend guarded Linux saves to logical spans and sparse files. | Check metadata, ACLs, identities, holes, races, reopening, failures, and recovery paths. |
 | L05 | S03, REQ01/13 | Missing | L02, L03 | Add shared Text indexes, resumable scans, and suffix invalidation. | Check cold and warm seeks, cancellation, 64 KiB rows, 4 KiB carry, and bounded checkpoints. |
 | L06 | S04 | Missing | L02 | Add cancellable workers, source stamps, progress, and Linux input polling. | Check Escape, queued keys, resize, errors, races, stale results, and no partial results. |
@@ -146,7 +147,7 @@ Linux stores one `Vec<u8>` at `L:src/editor.rs:81`.
 |---|---|---|---|---|---|---|
 | L03.1 | Complete | Add logical edit spans. | Large edits need current bytes without copying the complete source. | L02 | Check replacement, insertion, deletion, EOF, span splitting, merging, checked lengths, and reads across boundaries. | Preserve 65 MiB changed memory and 4,096 spans. Check limits before mutation. |
 | L03.2 | Complete | Extend operation history. | Logical spans must retain exact undo and redo state like buffered edits. | L03.1 | Check 256 records, 130 MiB history, cursor and length restoration, grouped nibbles, redo invalidation, and no-op preservation. | Reuse the existing history behavior. Refuse oversized operations atomically. |
-| L03.3 | Pending | Connect transactions to the edit lifecycle. | Save, cancel, and file switching can otherwise leave stale edit state. | L03.2 | Check all existing edit callers, baseline reset, canceled edits, source changes, and buffered or paged agreement. | Keep disk saving in L04. Add no separate transaction framework. |
+| L03.3 | Complete | Connect transactions to the edit lifecycle. | Save, cancel, and file switching can otherwise leave stale edit state. | L03.2 | Check all existing edit callers, baseline reset, canceled edits, source changes, and buffered or paged agreement. | Keep disk saving in L04. Add no separate transaction framework. |
 
 ### L04: guarded large-file saves
 
@@ -483,6 +484,9 @@ The L02.2 serialized host suite passed all active tests.
 
 | Date | Change | Result | Next action |
 |---|---|---|---|
+| 2026-09-10 | Complete L03.3 and parent L03. | Astra xhigh accepted all three children, source comments, capability text, and required evidence. | Publish L03.3. Then stop before unauthorized L04.1. |
+| 2026-09-10 | Implement L03.3 paged Hex editing. | The focused tests, terminal regressions, and required checks passed. | Have Astra xhigh review the complete candidate and evidence. |
+| 2026-09-10 | Start L03.3 paged Hex editing. | L03.2 is published. The recorded L03 authorization covers L03.3. | Connect nibble editing, history controls, retained errors, and explicit cancellation. |
 | 2026-09-10 | Complete L03.2 operation history. | Astra xhigh accepted the complete diff and required check evidence. The history limits, cursor restoration, and atomic-refusal checks passed. | Publish L03.2. Then implement L03.3 under the recorded authorization. |
 | 2026-09-10 | Implement L03.2 operation history. | Focused history tests and all required Rust checks passed. | Have Astra xhigh review the complete candidate and evidence. |
 | 2026-09-10 | Start L03.2 operation history. | L03.1 is published. The recorded L03 authorization covers L03.2. | Add retained logical layouts, cursor state, grouping, undo, redo, and cancellation. |
@@ -683,12 +687,62 @@ Cancellation restores the source layout after eviction or source validation fail
 
 The buffered editor now uses the same 130 MiB stored-history limit.
 Its existing seven history and editor tests pass without behavior changes outside the limit.
-L03.3 will connect these transactions to the paged Hex lifecycle.
+L03.3 connects these transactions to the paged Hex lifecycle.
 
 The L03.2 serialized host Rust suite passed all 120 active tests.
 One manual benchmark stayed ignored.
 Astra xhigh accepted the complete L03.2 diff and required check evidence.
 The history limits, cursor restoration, and atomic-refusal checks passed.
+
+### L03.3 implementation evidence
+
+| Command | Result |
+|---|---|
+| `cargo test --locked --offline paged -- --test-threads=1` | Passed all 36 focused paged and lifecycle tests. |
+| `cargo fmt --all -- --check` | Passed. |
+| `cargo check --locked --offline --all-targets` | Passed after the final comment changes. |
+| `cargo clippy --locked --offline --all-targets -- -D warnings` | Passed. |
+| `cargo build --locked --offline --release` | Passed. |
+| `target/release/hview-linux --self-test` | Passed. |
+| `python3 -m py_compile tests/paged_lifecycle_probe.py` | Passed. |
+| `python3 tests/paged_lifecycle_probe.py target/release/hview-linux` | Passed after one corrected fixture assertion. |
+| `python3 tests/edit_history_probe.py target/release/hview-linux` | Passed the unchanged buffered edit and save regressions. |
+| `python3 tests/terminal_probe.py target/release/hview-linux` | Passed. |
+| `python3 tests/file_workflow_probe.py target/release/hview-linux` | Passed. |
+| `python3 tests/navigation_probe.py target/release/hview-linux` | Passed. |
+| `python3 tests/reliability_probe.py target/release/hview-linux` | Passed. |
+| `cargo test --locked --offline --all-targets -- --test-threads=1` in the host environment | Passed 121 tests. One manual benchmark stayed ignored. |
+| `git diff --check` | Passed for the complete candidate. |
+
+The paged Hex view now uses logical edit transactions for direct nibble overtype.
+F3, Ctrl+Z, Shift+F3, and Ctrl+Y operate the retained paged history.
+Goto clears pending nibble state.
+Control and Alt Hex keys cannot change data.
+Shift remains available for uppercase Hex input.
+Normal-mode character aliases cannot move the edit cursor.
+
+Escape restores the captured source layout and clears history.
+
+Edit mode retains the owned source during blocked save, tool, switch, picker, and quit commands.
+Source errors retain logical spans and history until explicit cancellation.
+The error view does not publish stale or replacement bytes.
+A fresh open captures the current source identity.
+
+The first lifecycle probe used an incorrect Goto expectation.
+The expectation omitted the earlier in-memory first-byte edit.
+The corrected `A1 C2` expectation passed without an application change.
+
+L04 owns large-file disk saving.
+L05 and L16 own large-file Text support.
+L07 and L08 own large-file Code and format-address support.
+L17 owns large-file search.
+These functions remain pending parity work.
+
+Astra xhigh accepted L03.3 and parent L03 on September 10, 2026.
+The review covered all three child goals, source comments, capability text, and required check evidence.
+The final serialized host suite passed 121 tests.
+One manual benchmark stayed ignored.
+Large-file disk saving remains in L04.
 
 ## Current stage sequence
 
@@ -1020,8 +1074,9 @@ The findings and limits above remain the persistent evidence summary.
 9. Assign an authorized dependency-ready item to Sol xhigh.
 10. Record results and the next action in this tracker.
 
-Current resume action: publish accepted L03.2 to `origin/rust-rewrite`.
-Then implement L03.3 under the recorded L03 authorization.
+Current resume action: publish accepted L03.3 to `origin/rust-rewrite`.
+Then stop.
+L04.1 remains `Pending` and unauthorized.
 
 ## Historical D04 through D07 Windows review
 

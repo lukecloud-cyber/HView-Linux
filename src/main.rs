@@ -38,7 +38,10 @@ Each view selects the key bar that matches its available operations.
 const NORMAL_KEYS: &str = " 1Help   2PutBlk 3Edit   4Mode   5Goto   6DatRef 7Search 8Header 9Files 10Quit  11Hem   12Names ";
 const TEXT_KEYS: &str = " 1Help   2Unwrap 3       4Mode   5Goto   6LnFeed 7Search 8Table  9Files 10Quit  11Hem   12      ";
 const EDIT_KEYS: &str = " 1Help   2       3Undo   4Byte   5Word   6Dword  7Crypt  8Xor    9Update10Trunc 11      12      ";
-const PAGED_KEYS: &str = " F1 Help  F5 Goto  F9 Files  F10 Quit  Ctrl+F11 Prev  Ctrl+F12 Next ";
+const PAGED_KEYS: &str =
+    " F1 Help  F3 Edit  F5 Goto  F9 Files  F10 Quit  Ctrl+F11 Prev  Ctrl+F12 Next ";
+const PAGED_EDIT_KEYS: &str =
+    " Memory edits  No disk save  F3 Undo  Shift+F3 Redo  F5 Goto  Esc Cancel ";
 const RETURN_HISTORY_LIMIT: usize = 256;
 const X86_MAX_INSTRUCTION_BYTES: usize = 15;
 
@@ -1020,12 +1023,15 @@ fn restored_path(text: &str) -> Result<PathBuf, String> {
 /*
 The paged view keeps only display state while PagedFile owns source bytes.
 All positions remain u64 values for files that exceed the process address space.
-The metadata fields can enter the existing content-free session record after close.
+The runtime metadata fields can enter the existing content-free session record after close.
+The nibble fields exist only while this paged view remains active.
 */
 #[derive(Clone, Debug)]
 struct PagedView {
     offset: u64,
     top: u64,
+    low_nibble: bool,
+    hex_start: Option<paged::PagedEditCursor>,
     code_bits: u32,
     real_mode: bool,
     wrap: bool,
@@ -1033,6 +1039,52 @@ struct PagedView {
     line_feed: config::LineFeed,
     text_column: usize,
     local_offset: bool,
+}
+
+/*
+These helpers convert the visible paged position to the transaction cursor and restore it.
+The edit-only fields stay outside runtime and SAV records because active edits cannot close normally.
+*/
+impl PagedView {
+    /*
+    This conversion captures the selected logical byte, viewport, and nibble.
+    PagedFile stores this value at each undo and redo boundary.
+    */
+    fn edit_cursor(&self) -> paged::PagedEditCursor {
+        paged::PagedEditCursor {
+            offset: self.offset,
+            top: self.top,
+            low_nibble: self.low_nibble,
+        }
+    }
+
+    /*
+    This restoration applies one history cursor to the matching logical layout.
+    The selected byte can equal EOF after a completed final byte.
+    Viewport correction uses the final real byte and preserves a valid recorded top.
+    */
+    fn restore_edit_cursor(&mut self, cursor: paged::PagedEditCursor, len: u64, rows: usize) {
+        self.offset = cursor.offset.min(len);
+        self.top = cursor.top.min(len.saturating_sub(1));
+        self.low_nibble = cursor.low_nibble;
+        self.hex_start = None;
+        if len == 0 {
+            self.offset = 0;
+            self.top = 0;
+            self.low_nibble = false;
+            return;
+        }
+        let visible = self.offset.min(len - 1);
+        let page = (rows.max(1) as u64).saturating_mul(16);
+        if visible < self.top {
+            self.top = visible / 16 * 16;
+        }
+        if visible >= self.top.saturating_add(page) {
+            self.top = (visible / 16 + 1)
+                .saturating_sub(rows.max(1) as u64)
+                .saturating_mul(16);
+        }
+    }
 }
 
 /*
@@ -1257,7 +1309,7 @@ fn paged_frame(
     delimiter: char,
 ) -> io::Result<Vec<String>> {
     /*
-    The header shows escaped native filename text, read-only state, mode, and full selected offset.
+    The header shows escaped native filename text, source state, mode, and full selected offset.
     Fixed-width writes clip fields to the current terminal width.
     */
     let (width, height) = console.dimensions();
@@ -1270,7 +1322,16 @@ fn paged_frame(
         5,
         &display_path(file.file_name().unwrap_or_default()),
     );
-    put(&mut header, width.saturating_sub(58), "↓FRO PAGED HEX");
+    let source_state = if source.editing() {
+        if source.has_changes() {
+            "↓MEM EDITMODE"
+        } else {
+            "↓FRO EDITMODE"
+        }
+    } else {
+        "↓FRO PAGED HEX"
+    };
+    put(&mut header, width.saturating_sub(58), source_state);
     let status = format!(
         "{:08X}│HView-Linux {}",
         view.offset,
@@ -1310,9 +1371,14 @@ fn paged_frame(
     The complete frame returns only after every section is available.
     */
     if let Some(footer) = lines.last_mut() {
+        let keys = if source.editing() {
+            PAGED_EDIT_KEYS
+        } else {
+            PAGED_KEYS
+        };
         *footer = format!(
-            "{PAGED_KEYS}{}",
-            "▒".repeat(width.saturating_sub(PAGED_KEYS.chars().count()))
+            "{keys}{}",
+            "▒".repeat(width.saturating_sub(keys.chars().count()))
         );
     }
     Ok(lines)
@@ -1321,9 +1387,12 @@ fn paged_frame(
 /*
 This positioning helper centers a requested byte and clamps the final visible page.
 Empty files keep both positions at zero.
+Goto also selects the high nibble and closes pending nibble cursor state.
 */
 fn paged_goto(view: &mut PagedView, requested: u64, len: u64, rows: usize) {
     view.offset = if len == 0 { 0 } else { requested.min(len - 1) };
+    view.low_nibble = false;
+    view.hex_start = None;
     let rows = rows.max(1) as u64;
     view.top = view.offset.saturating_sub(rows.saturating_mul(8)) / 16 * 16;
     let file_rows = len.div_ceil(16);
@@ -1416,6 +1485,139 @@ fn paged_navigate(view: &mut PagedView, key: Key, len: u64, rows: usize) {
 }
 
 /*
+This helper applies paged navigation while edit mode selects one hexadecimal nibble.
+Left and Right move through nibbles, while other keys keep the accepted byte movement.
+The caller closes a pending byte group before this helper changes the cursor.
+*/
+fn paged_edit_navigate(view: &mut PagedView, key: Key, len: u64, rows: usize) {
+    match key {
+        Key::Left => {
+            if !view.low_nibble {
+                view.offset = view.offset.saturating_sub(1);
+            }
+            view.low_nibble = !view.low_nibble;
+        }
+        Key::Right => {
+            if view.low_nibble {
+                view.offset = view.offset.saturating_add(1).min(len);
+            }
+            view.low_nibble = !view.low_nibble;
+        }
+        key => {
+            paged_navigate(view, key, len, rows);
+            if matches!(key, Key::Home | Key::End | Key::FileStart | Key::FileEnd) {
+                view.low_nibble = false;
+            }
+        }
+    }
+
+    /*
+    Nibble movement can select EOF after the final low nibble.
+    The viewport follows the final real byte without changing the EOF selection.
+    */
+    if len != 0 {
+        let visible = view.offset.min(len - 1);
+        let page = (rows.max(1) as u64).saturating_mul(16);
+        if visible < view.top {
+            view.top = visible / 16 * 16;
+        }
+        if visible >= view.top.saturating_add(page) {
+            view.top = (visible / 16 + 1)
+                .saturating_sub(rows.max(1) as u64)
+                .saturating_mul(16);
+        }
+    }
+}
+
+/*
+This helper replaces one selected paged Hex nibble through the shared transaction path.
+It reads one logical byte, calculates the new byte, and commits cursor state only after success.
+The operation refuses EOF to match Windows paged Hex overtype behavior.
+*/
+fn paged_hex_digit(
+    source: &mut paged::PagedFile,
+    view: &mut PagedView,
+    character: char,
+) -> io::Result<()> {
+    let digit = character
+        .to_digit(16)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Enter a hexadecimal digit."))?
+        as u8;
+    if view.offset >= source.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Paged Hex editing cannot extend the file at EOF.",
+        ));
+    }
+    let current = source
+        .read_window(view.offset, 1)?
+        .bytes
+        .first()
+        .copied()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Cannot read the selected byte.",
+            )
+        })?;
+    let low_nibble = view.low_nibble;
+    let before_cursor = view.hex_start.unwrap_or_else(|| view.edit_cursor());
+    let after_cursor = paged::PagedEditCursor {
+        offset: view.offset + u64::from(low_nibble),
+        top: view.top,
+        low_nibble: !low_nibble,
+    };
+    let replacement = editor::replace_nibble(current, digit, low_nibble);
+    source.replace_bytes(
+        view.offset,
+        &[replacement],
+        before_cursor,
+        after_cursor,
+        !low_nibble,
+    )?;
+    view.offset = after_cursor.offset;
+    view.top = after_cursor.top;
+    view.low_nibble = after_cursor.low_nibble;
+    view.hex_start = (!low_nibble).then_some(before_cursor);
+    Ok(())
+}
+
+/*
+This helper cancels every in-memory paged edit and returns to read-only navigation.
+The source restores its captured layout while the view clamps any prior EOF cursor.
+*/
+fn cancel_paged_edit(source: &mut paged::PagedFile, view: &mut PagedView, rows: usize) {
+    source.cancel_edit();
+    view.low_nibble = false;
+    view.hex_start = None;
+    restore_paged_position(view, source.len(), rows);
+}
+
+/*
+This handler displays an edit error without redrawing stale or replacement source bytes.
+The blank error screen keeps the active owner and makes explicit cancellation available.
+*/
+fn paged_edit_error(
+    console: &Console,
+    source: &mut paged::PagedFile,
+    view: &mut PagedView,
+    error: &io::Error,
+) -> io::Result<()> {
+    let mut base = vec![String::new(); console.height()];
+    if let Some(header) = base.first_mut() {
+        *header = "Edits remain in memory. Large-file saving is unavailable.".into();
+    }
+    if let Some(footer) = base.last_mut() {
+        *footer = "Press Escape to cancel all in-memory edits.".into();
+    }
+    let key = console.modal(&base, &error.to_string())?;
+    if key.code == 27 {
+        cancel_paged_edit(source, view, console.height().saturating_sub(2));
+    }
+    Ok(())
+}
+
+/*
 This view retains the owned source during all frames and key actions.
 Unsupported modes and address conversions produce notices before Hex display starts.
 Each loop validates the source before it publishes the next frame.
@@ -1423,7 +1625,7 @@ Each loop validates the source before it publishes the next frame.
 fn open_paged_editor(
     console: &Console,
     path: PathBuf,
-    source: paged::PagedFile,
+    mut source: paged::PagedFile,
     options: &cli::Options,
     config: &config::Config,
     saved: Option<&RuntimeView>,
@@ -1478,6 +1680,8 @@ fn open_paged_editor(
     let mut view = PagedView {
         offset: initial,
         top: 0,
+        low_nibble: false,
+        hex_start: None,
         code_bits: config.default_code_size,
         real_mode: false,
         wrap: config.wrap.resolve(true),
@@ -1519,21 +1723,71 @@ fn open_paged_editor(
         Each frame validates descriptor and pathname identity before reading visible windows.
         The console publishes only complete rows from the validated source.
         */
-        source.validate()?;
-        let lines = paged_frame(
-            &view,
-            &path,
-            &source,
-            console,
-            editor::cp437(config.hex_delimiter),
-        )?;
+        let lines = match source.validate().and_then(|()| {
+            paged_frame(
+                &view,
+                &path,
+                &source,
+                console,
+                editor::cp437(config.hex_delimiter),
+            )
+        }) {
+            Ok(lines) => lines,
+            Err(error) if source.editing() => {
+                paged_edit_error(console, &mut source, &mut view, &error)?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         console.draw(&lines)?;
         let key = console.key()?;
+
+        /*
+        The classifier accepts unmodified Hex characters and leaves Shift available for uppercase digits.
+        A real non-Hex key closes the pending group before command dispatch.
+        Resize events have code zero, so a resize cannot split a two-nibble group.
+        */
+        let hex_digit =
+            source.editing() && key.control & 15 == 0 && key.character.is_ascii_hexdigit();
+        if source.editing() && !hex_digit && key.code != 0 {
+            source.end_hex_group();
+            view.hex_start = None;
+        }
         let ctrl = key.control & 12 != 0;
 
         /*
-        Quit and file-switch commands return the native path and current display state.
-        The outer lifecycle stores that bounded state before opening another source.
+        Active edits keep source ownership during quit, switch, picker, save, and tool commands.
+        Escape is the only command in this group that discards all in-memory changes.
+        */
+        if source.editing() && key.code == 27 {
+            cancel_paged_edit(&mut source, &mut view, console.height().saturating_sub(2));
+            continue;
+        }
+        if source.editing() && key.code == 120 {
+            console.modal(
+                &lines,
+                "No large-file save. Memory edits remain. Press Escape in the editor to cancel.",
+            )?;
+            continue;
+        }
+        if source.editing() && ((ctrl && matches!(key.code, 81 | 122 | 123)) || key.code == 121) {
+            console.modal(
+                &lines,
+                "Memory edits remain. Press Escape in the editor before you leave this file.",
+            )?;
+            continue;
+        }
+        if source.editing() && ctrl && matches!(key.code, 83 | 84) {
+            console.modal(
+                &lines,
+                "No large-file save or tools. Memory edits remain. Press Escape in the editor.",
+            )?;
+            continue;
+        }
+
+        /*
+        Normal-mode quit and switch commands return the native path and display state.
+        The outer lifecycle stores that bounded state before it opens another source.
         */
         if (ctrl && key.code == 81) || matches!(key.code, 27 | 121) {
             return Ok((EditorAction::Quit, PagedClosed { path, view }));
@@ -1565,7 +1819,7 @@ fn open_paged_editor(
             35 => Some(if ctrl { Key::FileEnd } else { Key::End }),
             33 => Some(Key::PageUp),
             34 => Some(Key::PageDown),
-            _ if !ctrl => match key.character.to_ascii_lowercase() {
+            _ if !ctrl && !source.editing() => match key.character.to_ascii_lowercase() {
                 'h' => Some(Key::Left),
                 'l' => Some(Key::Right),
                 'k' => Some(Key::Up),
@@ -1575,26 +1829,103 @@ fn open_paged_editor(
             _ => None,
         };
         if let Some(key) = navigation {
-            paged_navigate(
-                &mut view,
-                key,
-                source.len(),
-                console.height().saturating_sub(2),
-            );
+            let rows = console.height().saturating_sub(2);
+            if source.editing() {
+                paged_edit_navigate(&mut view, key, source.len(), rows);
+            } else {
+                paged_navigate(&mut view, key, source.len(), rows);
+            }
             continue;
         }
 
         /*
-        Remaining function keys show help, request Goto, open the picker, or report a limit.
-        An unsupported operation leaves the paged source and display state unchanged.
+        A hexadecimal character changes one selected nibble through the paged transaction path.
+        Errors keep the source owner, logical spans, history, and last accepted cursor.
+        */
+        if hex_digit {
+            if let Err(error) = paged_hex_digit(&mut source, &mut view, key.character) {
+                paged_edit_error(console, &mut source, &mut view, &error)?;
+            }
+            continue;
+        }
+
+        /*
+        Remaining function keys manage help, edit history, edit entry, Goto, and the picker.
+        Unsupported operations leave the paged source and display state unchanged.
         */
         match key.code {
+            /*
+            Help reports controls for the current mode and explains the in-memory edit limit.
+            The modal does not change the source, history, or selected position.
+            */
             112 => {
                 console.modal(
                     &lines,
-                    "Paged files support Hex navigation, Goto, file selection, switching, and quit.",
+                    if source.editing() {
+                        "Memory edits have no disk save. F3 undoes. Shift+F3 redoes. Escape cancels."
+                    } else {
+                        "Paged files support Hex navigation, F3 editing, Goto, file selection, switching, and quit."
+                    },
                 )?;
             }
+            /*
+            Redo and undo request one alternate logical layout from PagedFile.
+            A successful result restores the matching u64 cursor, viewport, and nibble state.
+            An error keeps every accepted edit state and makes explicit cancellation available.
+            */
+            code if source.editing()
+                && ((code == 114 && key.control & 16 != 0)
+                    || (code == 89 && key.control & 8 != 0)) =>
+            {
+                match source.redo() {
+                    Ok(Some(cursor)) => view.restore_edit_cursor(
+                        cursor,
+                        source.len(),
+                        console.height().saturating_sub(2),
+                    ),
+                    Ok(None) => {
+                        console.modal(&lines, "The redo history is empty.")?;
+                    }
+                    Err(error) => {
+                        paged_edit_error(console, &mut source, &mut view, &error)?;
+                    }
+                }
+            }
+            code if source.editing()
+                && ((code == 114 && key.control & 16 == 0)
+                    || (code == 90 && key.control & 8 != 0)) =>
+            {
+                match source.undo() {
+                    Ok(Some(cursor)) => view.restore_edit_cursor(
+                        cursor,
+                        source.len(),
+                        console.height().saturating_sub(2),
+                    ),
+                    Ok(None) => {
+                        console.modal(&lines, "The undo history is empty.")?;
+                    }
+                    Err(error) => {
+                        paged_edit_error(console, &mut source, &mut view, &error)?;
+                    }
+                }
+            }
+            /*
+            F3 enters edit mode directly when no edit session exists.
+            Source validation must pass before the new session accepts Hex input.
+            */
+            114 => match source.begin_edit() {
+                Ok(()) => {
+                    view.low_nibble = false;
+                    view.hex_start = None;
+                }
+                Err(error) => {
+                    console.modal(&lines, &error.to_string())?;
+                }
+            },
+            /*
+            Goto parses one full u64 file offset and keeps the target inside logical bytes.
+            The helper clears an interrupted nibble group before the next Hex input.
+            */
             116 => {
                 if let Some(value) = console.prompt(&lines, "Goto file offset")? {
                     match cli::parse_number(value.as_bytes()) {
@@ -1612,6 +1943,10 @@ fn open_paged_editor(
                     }
                 }
             }
+            /*
+            Normal mode can select another native path through the existing picker.
+            Other function keys report the bounded-view limit without changing state.
+            */
             120 => {
                 if let Some(next) =
                     select_file(console, path.parent().unwrap_or(Path::new(".")).to_owned())?
@@ -1622,7 +1957,11 @@ fn open_paged_editor(
             113..=119 => {
                 console.modal(
                     &lines,
-                    "This operation is unavailable for the bounded Hex view.",
+                    if source.editing() {
+                        "Command unavailable. Memory edits remain. Press Escape in the editor to cancel."
+                    } else {
+                        "This operation is unavailable for the bounded Hex view."
+                    },
                 )?;
             }
             _ => {}
@@ -2585,6 +2924,8 @@ mod tests {
         let mut view = PagedView {
             offset: 0,
             top: 0,
+            low_nibble: false,
+            hex_start: None,
             code_bits: 64,
             real_mode: false,
             wrap: false,
@@ -2615,6 +2956,112 @@ mod tests {
         let rows = 20;
         restore_paged_position(&mut view, len, rows);
         assert_eq!(view.top, saved_top);
+    }
+
+    /*
+    This test drives the paged Hex helper through one grouped byte, undo, redo, and cancellation.
+    It also verifies nibble movement and refuses a replacement at logical EOF.
+    */
+    #[test]
+    fn paged_hex_edit_route_preserves_groups_cursors_and_eof() {
+        use std::os::unix::fs::FileExt;
+
+        /*
+        A small regular source is sufficient because PagedFile itself does not require large-file classification.
+        The fixture stays unchanged because all transaction bytes remain in memory.
+        */
+        let path = std::env::temp_dir().join(format!(
+            "hview-paged-edit-route-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.write_all_at(&[0x12, 0x34], 0).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        /*
+        Two digits share one record and advance from the first high nibble to the next byte.
+        The returned cursors restore the initial and final visible states with their matching bytes.
+        */
+        let mut source = paged::PagedFile::open(&path).unwrap();
+        source.begin_edit().unwrap();
+        let mut view = PagedView {
+            offset: 0,
+            top: 0,
+            low_nibble: false,
+            hex_start: None,
+            code_bits: 64,
+            real_mode: false,
+            wrap: false,
+            tab: false,
+            line_feed: config::LineFeed::Lf,
+            text_column: 0,
+            local_offset: true,
+        };
+        paged_hex_digit(&mut source, &mut view, 'A').unwrap();
+        assert_eq!((view.offset, view.low_nibble), (0, true));
+        assert_eq!(&*source.read_window(0, 1).unwrap().bytes, &[0xa2]);
+        paged_hex_digit(&mut source, &mut view, 'B').unwrap();
+        assert_eq!((view.offset, view.low_nibble), (1, false));
+        assert_eq!(&*source.read_window(0, 2).unwrap().bytes, &[0xab, 0x34]);
+
+        let undo = source.undo().unwrap().unwrap();
+        view.restore_edit_cursor(undo, source.len(), 20);
+        assert_eq!((view.offset, view.top, view.low_nibble), (0, 0, false));
+        assert_eq!(&*source.read_window(0, 2).unwrap().bytes, &[0x12, 0x34]);
+        let redo = source.redo().unwrap().unwrap();
+        view.restore_edit_cursor(redo, source.len(), 20);
+        assert_eq!((view.offset, view.top, view.low_nibble), (1, 0, false));
+        assert_eq!(&*source.read_window(0, 2).unwrap().bytes, &[0xab, 0x34]);
+
+        /*
+        Goto after a high nibble must clear the old group and select the destination high nibble.
+        Undo then restores the destination cursor and the bytes before that separate operation.
+        */
+        view.offset = 0;
+        view.low_nibble = false;
+        paged_hex_digit(&mut source, &mut view, 'A').unwrap();
+        source.end_hex_group();
+        paged_goto(&mut view, 1, source.len(), 20);
+        assert_eq!(
+            (view.offset, view.low_nibble, view.hex_start),
+            (1, false, None)
+        );
+        paged_hex_digit(&mut source, &mut view, 'C').unwrap();
+        assert_eq!(&*source.read_window(0, 2).unwrap().bytes, &[0xab, 0xc4]);
+        let undo = source.undo().unwrap().unwrap();
+        view.restore_edit_cursor(undo, source.len(), 20);
+        assert_eq!(&*source.read_window(0, 2).unwrap().bytes, &[0xab, 0x34]);
+
+        /*
+        Nibble movement follows the buffered editor at the first byte and can select logical EOF.
+        EOF input fails before bytes, history, or cursor state change.
+        */
+        paged_edit_navigate(&mut view, Key::Left, source.len(), 20);
+        assert_eq!((view.offset, view.low_nibble), (0, true));
+        paged_edit_navigate(&mut view, Key::Right, source.len(), 20);
+        paged_edit_navigate(&mut view, Key::Right, source.len(), 20);
+        paged_edit_navigate(&mut view, Key::Right, source.len(), 20);
+        assert_eq!((view.offset, view.low_nibble), (2, false));
+        let before = source.read_window(0, 2).unwrap().bytes;
+        assert!(paged_hex_digit(&mut source, &mut view, 'F').is_err());
+        assert_eq!(source.read_window(0, 2).unwrap().bytes, before);
+        assert_eq!((view.offset, view.low_nibble), (2, false));
+
+        cancel_paged_edit(&mut source, &mut view, 20);
+        assert!(!source.editing());
+        assert!(!source.has_changes());
+        assert_eq!(&*source.read_window(0, 2).unwrap().bytes, &[0x12, 0x34]);
+        drop(source);
+        std::fs::remove_file(path).unwrap();
     }
 
     /*

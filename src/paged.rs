@@ -821,10 +821,9 @@ impl PagedFile {
     }
 
     /*
-    These queries expose edit mode and logical changes to the future viewer connection.
+    These queries expose edit mode and logical changes to the paged viewer.
     A source-only normalized layout means that no logical change remains.
     */
-    #[allow(dead_code)]
     pub(crate) fn editing(&self) -> bool {
         self.editing
     }
@@ -833,7 +832,6 @@ impl PagedFile {
     This query compares the current layout with its normalized source baseline.
     Undo and cancellation use the same layout shape to report no remaining change.
     */
-    #[allow(dead_code)]
     pub(crate) fn has_changes(&self) -> bool {
         self.layout.len != self.stamp.len
             || self.layout.spans.len() != usize::from(self.stamp.len != 0)
@@ -846,7 +844,6 @@ impl PagedFile {
     Begin edit validates the stable source before it changes the mode flag.
     The existing source layout becomes the cancellation baseline.
     */
-    #[allow(dead_code)]
     pub(crate) fn begin_edit(&mut self) -> io::Result<()> {
         self.validate()?;
         self.editing = true;
@@ -857,7 +854,6 @@ impl PagedFile {
     This method stops a pending two-nibble group at a user-action boundary.
     The current record remains a normal complete undo record.
     */
-    #[allow(dead_code)]
     pub(crate) fn end_hex_group(&mut self) {
         if let Some(record) = self.undo_history.back_mut() {
             record.hex_group = false;
@@ -866,9 +862,8 @@ impl PagedFile {
 
     /*
     Fixed replacement is a small wrapper around the structural splice transaction.
-    L03.3 will use this route for paged Hex overtype.
+    The paged Hex view uses this route for one-byte overtype.
     */
-    #[allow(dead_code)]
     pub(crate) fn replace_bytes(
         &mut self,
         start: u64,
@@ -898,7 +893,6 @@ impl PagedFile {
     All range, allocation, span, live-memory, and history checks precede mutation.
     Equal-byte edits preserve history unless a second nibble completes its open group.
     */
-    #[allow(dead_code)]
     pub(crate) fn splice_bytes(
         &mut self,
         start: u64,
@@ -1028,7 +1022,6 @@ impl PagedFile {
     It closes any nibble group, swaps one alternate layout, and returns the before cursor.
     The combined history cost does not change during this ownership transfer.
     */
-    #[allow(dead_code)]
     pub(crate) fn undo(&mut self) -> io::Result<Option<PagedEditCursor>> {
         self.validate()?;
         self.redo_history
@@ -1049,7 +1042,6 @@ impl PagedFile {
     It swaps one alternate layout and returns the recorded after cursor.
     The combined history cost stays at its accepted value.
     */
-    #[allow(dead_code)]
     pub(crate) fn redo(&mut self) -> io::Result<Option<PagedEditCursor>> {
         self.validate()?;
         self.undo_history
@@ -1069,7 +1061,6 @@ impl PagedFile {
     The action stays available after source changes or history evictions.
     It clears both history branches and leaves the captured source stamp unchanged.
     */
-    #[allow(dead_code)]
     pub(crate) fn cancel_edit(&mut self) {
         let spans = (self.stamp.len != 0)
             .then_some(DataSpan::Source {

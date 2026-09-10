@@ -99,7 +99,7 @@ For ordinary raw files, `--virtual` uses the value as a file offset. Raw ELF fil
 | `F7` | The key starts an ASCII or masked hexadecimal search. |
 | `Shift+F7` | The key finds the next match. |
 | `Ctrl+F7` | The key finds the previous match. |
-| `F9` | The key saves edits or opens the file browser. |
+| `F9` | The key saves buffered edits or opens the file browser. Active paged edits keep their in-memory state. |
 | `Ctrl+S` | The key saves the buffer to a new file. |
 | `Ctrl+T` | The key opens the analysis tools. |
 | `Ctrl+F11` | The key opens the previous input file. |
@@ -224,11 +224,18 @@ The entropy tool uses blocks of at least 4,096 bytes. The tool increases the blo
 
 ## Editing and saving
 
-These editing and saving instructions apply to buffered files through 64 MiB.
+Buffered files through 64 MiB support all editing and saving operations in this section.
+
+Larger regular files support in-memory Hex nibble replacement, undo, redo, and explicit cancellation.
+Paged Hex overtype cannot extend the file at EOF.
+Large-file disk saving remains unavailable.
+File switching and quit remain unavailable until `Esc` cancels all paged edits.
 
 Press `F3` to start editing. Hex mode replaces nibbles, and Code mode assembles one Intel instruction.
 
-Press `Esc` to restore the pre-edit buffer. The application keeps a full memory copy for this cancellation operation.
+Press `Esc` to cancel all active edits.
+Buffered cancellation restores its complete memory baseline.
+Paged cancellation restores the captured logical source layout.
 
 During Code editing, `F2` or `Enter` opens the Intel assembly prompt. A preview shows the proposed patch before buffer changes.
 
@@ -252,7 +259,8 @@ Failed, canceled, and unchanged edits preserve redo history. The history holds u
 
 The application removes the oldest records when necessary. An operation larger than the history byte limit fails before buffer changes.
 
-Press `F9` to replace the current file. Press `Ctrl+S` to save the buffer under a new name.
+For buffered files, press `F9` to replace the current file.
+Press `Ctrl+S` to save the buffered data under a new name.
 
 Successful saves establish a new edit baseline and clear both histories. Failed saves preserve both histories. Edit cancellation clears both histories.
 
@@ -298,9 +306,13 @@ The application keeps terminal input that arrives during a macro delay. A macro 
 
 The application reads regular files through 64 MiB into memory. Editing keeps another complete buffer until you save or cancel edits.
 
-Larger regular files open in a read-only Hex view. The view reads visible data in windows of at most 64 KiB.
+Larger regular files open in a bounded Hex view. The view reads visible data in windows of at most 64 KiB.
 
-Large-file Text, Code, format addresses, editing, saving, search, and analysis remain pending parity work.
+Paged Hex edits use bounded logical spans and stay in memory.
+The view keeps at most 256 undo records within the 130 MiB history limit.
+Press `Esc` to discard those edits and restore source bytes.
+
+Large-file Text, Code, format addresses, saving, search, and analysis remain pending parity work.
 
 For buffered files, comparison also reads the other file into memory. Select file sizes that fit available memory with these copies.
 
@@ -346,6 +358,7 @@ python3 tests/navigation_probe.py target/release/hview-linux
 python3 tests/raw_model_probe.py target/release/hview-linux
 python3 tests/patch_probe.py target/release/hview-linux
 python3 tests/edit_history_probe.py target/release/hview-linux
+python3 tests/paged_lifecycle_probe.py target/release/hview-linux
 python3 scripts/package.py /tmp/hview-linux-package
 ```
 

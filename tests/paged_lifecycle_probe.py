@@ -11,17 +11,24 @@ import tempfile
 from terminal_probe import run_session
 
 
-# These terminal sequences cover quit, unsupported commands, switching, Goto, picker, and movement.
+# These terminal sequences cover navigation, editing, history, switching, and blocked edit commands.
 # The address-space limit stays below the sparse 4 GiB fixture.
 CTRL_Q = b"\x11"
 CTRL_S = b"\x13"
 CTRL_T = b"\x14"
+CTRL_Y = b"\x19"
+CTRL_Z = b"\x1a"
 CTRL_F11 = b"\x1b[23;5~"
 CTRL_F12 = b"\x1b[24;5~"
+ESCAPE = b"\x1b"
+F3 = b"\x1b[13~"
 F5 = b"\x1b[15~"
 F9 = b"\x1b[20~"
+F10 = b"\x1b[21~"
 DOWN = b"\x1b[B"
 RIGHT = b"\x1b[C"
+SHIFT_F3 = b"\x1b[13;2~"
+ALT_A = b"\x1bA"
 ADDRESS_LIMIT = 256 * 1024 * 1024
 
 
@@ -41,6 +48,18 @@ def after_last(output: bytes, marker: bytes) -> bytes:
     if position < 0:
         raise AssertionError(f"The terminal output does not contain {marker!r}.")
     return output[position:]
+
+
+# This assertion helper requires byte sequences in their expected display order.
+# Edit checks use the order to distinguish undo, redo, and cancellation frames.
+def require_order(output: bytes, *values: bytes) -> None:
+    """Require terminal values in order."""
+    position = 0
+    for value in values:
+        position = output.find(value, position)
+        if position < 0:
+            raise AssertionError(f"The terminal output lacks an ordered value: {value!r}")
+        position += len(value)
 
 
 # This helper creates one sparse file and writes only small marker ranges.
@@ -128,6 +147,142 @@ def check_high_offsets(binary: Path, root: Path) -> tuple[Path, int]:
     return source, high
 
 
+# This check edits one large source through grouped nibbles and the complete history controls.
+# All changes must stay in memory until Escape restores the captured source layout.
+def check_paged_edits(binary: Path, source: Path, high: int) -> None:
+    """Check paged Hex edits, retained controls, high offsets, and cancellation."""
+
+    # A resize between the two nibbles must keep one history record.
+    # Blocked commands must preserve the edited bytes, history, cursor, and owned source.
+    output = run_session(
+        binary,
+        ["--mode=hex", str(source)],
+        [
+            F3,
+            b"A",
+            (60, 24, b"EDITMODE"),
+            b"B",
+            F3,
+            SHIFT_F3,
+            F5,
+            b"0",
+            b"\r",
+            b"C",
+            CTRL_Z,
+            CTRL_Y,
+            CTRL_S,
+            b"\r",
+            F9,
+            b"\r",
+            CTRL_F12,
+            b"\r",
+            CTRL_Q,
+            b"\r",
+            F10,
+            b"\r",
+            F3,
+            SHIFT_F3,
+            ESCAPE,
+            F3,
+            F3,
+            b"\r",
+            ESCAPE,
+            CTRL_Q,
+        ],
+        address_limit_bytes=ADDRESS_LIMIT,
+    )
+    require(output, b"Memory edits remain", "A blocked command did not retain edit mode.")
+    require(output, b"Escape in the editor", "A leave command did not explain cancellation.")
+    require(output, b"The undo history is empty", "Cancellation did not clear paged history.")
+    require_order(
+        output,
+        b"A1 42 43 44",
+        b"AB 42 43 44",
+        b"41 42 43 44",
+        b"AB 42 43 44",
+        b"CB 42 43 44",
+        b"AB 42 43 44",
+        b"CB 42 43 44",
+        b"AB 42 43 44",
+        b"CB 42 43 44",
+        b"41 42 43 44",
+    )
+
+    # Goto after one high nibble must reset the destination to its high nibble.
+    # An Alt-modified Hex character must not create an edit record.
+    goto_output = run_session(
+        binary,
+        ["--mode=hex", str(source)],
+        [F3, b"A", F5, b"1", b"\r", b"C", ESCAPE, CTRL_Q],
+        address_limit_bytes=ADDRESS_LIMIT,
+    )
+    require(goto_output, b"A1 C2 43 44", "Goto retained the previous low-nibble state.")
+    modified_output = run_session(
+        binary,
+        ["--mode=hex", str(source)],
+        [F3, ALT_A, F3, b"\r", ESCAPE, CTRL_Q],
+        address_limit_bytes=ADDRESS_LIMIT,
+    )
+    require(
+        modified_output,
+        b"The undo history is empty",
+        "An Alt-modified Hex key changed paged data.",
+    )
+
+    # Normal-mode character aliases must not move the cursor during editing.
+    # The next unmodified Hex digit must still change the first high nibble.
+    alias_output = run_session(
+        binary,
+        ["--mode=hex", str(source)],
+        [F3, b"lA", ESCAPE, CTRL_Q],
+        address_limit_bytes=ADDRESS_LIMIT,
+    )
+    require(
+        alias_output,
+        b"A1 42 43 44",
+        "A normal-mode character alias moved the paged edit cursor.",
+    )
+
+    # A high Goto keeps the complete u64 cursor through edit, undo, and redo.
+    # Escape then restores the original marker and leaves the sparse source unchanged.
+    high_output = run_session(
+        binary,
+        ["--mode=hex", str(source)],
+        [
+            F5,
+            f"{high:X}".encode(),
+            b"\r",
+            F3,
+            b"AB",
+            F3,
+            SHIFT_F3,
+            ESCAPE,
+            CTRL_Q,
+        ],
+        address_limit_bytes=ADDRESS_LIMIT,
+    )
+    require(high_output, f"{high + 1:08X}".encode(), "The edited high cursor was narrowed.")
+    require_order(high_output, b"AB 49 47 48", b"48 49 47 48", b"AB 49 47 48", b"48 49 47 48")
+
+    # Nibble navigation can select EOF, but overtype must refuse file growth.
+    # Dismissing the error keeps edit mode until Escape performs explicit cancellation.
+    eof_output = run_session(
+        binary,
+        ["--mode=hex", "--end", str(source)],
+        [F3, RIGHT, RIGHT, b"F", b"\r", ESCAPE, CTRL_Q],
+        address_limit_bytes=ADDRESS_LIMIT,
+    )
+    require(eof_output, b"cannot extend the file at EOF", "Paged editing did not refuse EOF growth.")
+
+    # The application never publishes the in-memory bytes to the opened file during L03.3.
+    descriptor = os.open(source, os.O_RDONLY)
+    try:
+        if os.pread(descriptor, 4, 0) != b"ABCD" or os.pread(descriptor, 4, high) != b"HIGH":
+            raise AssertionError("Paged cancellation changed source bytes on disk.")
+    finally:
+        os.close(descriptor)
+
+
 # This check switches between buffered and paged sources before a session restart.
 # It verifies the paged offset only in frames after each return.
 def check_switch_and_restart(binary: Path, root: Path, large: Path, high: int) -> None:
@@ -211,6 +366,40 @@ def check_source_changes(binary: Path, root: Path) -> None:
         address_limit_bytes=ADDRESS_LIMIT,
     )
     require(output, b"shrank outside", "Truncation did not stop the paged view.")
+
+    # An external replacement during edit mode must retain the in-memory owner until Escape.
+    # Ctrl+Q cannot discard the edit, and no replacement bytes can enter a validated frame.
+    edited = root / "edited-replacement.bin"
+    edited_old = root / "edited-replacement-old.bin"
+    sparse_file(edited, length, [(0, b"OLD")])
+
+    def replace_edited_path() -> None:
+        """Replace the pathname while one paged edit remains active."""
+        edited.rename(edited_old)
+        sparse_file(edited, length, [(0, b"NEW")])
+
+    output = run_session(
+        binary,
+        ["--mode=hex", str(edited)],
+        [F3, b"A", replace_edited_path, RIGHT, CTRL_Q, ESCAPE],
+        expected_code=1,
+        address_limit_bytes=ADDRESS_LIMIT,
+    )
+    require(output, b"different file", "Edit mode did not report pathname replacement.")
+    require(output, b"Edits remain in memory", "A source error did not retain edit ownership.")
+    if output.count(b"different file") < 2:
+        raise AssertionError("Ctrl+Q discarded the edit session after a source error.")
+    if b"4E 45 57" in output:
+        raise AssertionError("Replacement bytes became visible during the retained edit session.")
+
+    # A new process uses the normal fresh-open lifecycle and sees the replacement source.
+    reopened = run_session(
+        binary,
+        ["--mode=hex", str(edited)],
+        [CTRL_Q],
+        address_limit_bytes=ADDRESS_LIMIT,
+    )
+    require(reopened, b"4E 45 57", "A fresh open did not read the edited replacement source.")
 
 
 # This check selects an invalid UTF-8 pathname through the native picker.
@@ -300,6 +489,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="hview-paged-lifecycle-") as temporary:
         root = Path(temporary)
         large, high = check_high_offsets(binary, root)
+        check_paged_edits(binary, large, high)
         check_switch_and_restart(binary, root, large, high)
         check_source_changes(binary, root)
         check_native_picker(binary, root)

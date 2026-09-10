@@ -25,11 +25,15 @@ Complete and publish each L03 child in sequence after its required checks and As
 L03.1 is complete.
 The published L03.1 commit is `3f71ac608940752d7a321477b15b163f95cff1a2`.
 L03.2 is complete.
-The L03.2 publication commit contains this completion record.
+The published L03.2 commit is `1cf7bb5d2f63e7a20efb3a74f4a1a9b77a9be728`.
+L03.3 and parent L03 are complete.
+The L03.3 publication commit contains this completion record.
+Astra xhigh accepted L03.3 and parent L03 on September 10, 2026.
 Keep all items after L03 `Pending` and unauthorized.
 
-Publish accepted L03.2 to `origin/rust-rewrite`.
-Then implement L03.3 under the recorded L03 authorization.
+Publish accepted L03.3 to `origin/rust-rewrite`.
+Then stop.
+L04.1 remains `Pending` and unauthorized.
 
 Use Astra xhigh (`gpt-6-astra`, effort `xhigh`) for all planning and review.
 Use Sol xhigh subagents (`gpt-5.6-sol`, effort `xhigh`) for all other work.
@@ -41,7 +45,7 @@ Sol xhigh also runs all checks.
 | Project | Commit and branch | State |
 |---|---|---|
 | HView-Windows | `469f13d0959d5bed7fbf068a7c4a5858be16d0a8`, `master` | Clean local parity source |
-| HView-Linux | `3f71ac608940752d7a321477b15b163f95cff1a2`, `rust-rewrite` | Published L03.1 baseline; accepted D07 application baseline at `5e4ef68` |
+| HView-Linux | `1cf7bb5d2f63e7a20efb3a74f4a1a9b77a9be728`, `rust-rewrite` | Published L03.2 baseline before L03.3; accepted D07 application baseline at `5e4ef68` |
 
 The D03 release and D04 through D07 extension remain accepted historical evidence.
 The L02.2 publication commit contains its completion record on `rust-rewrite`.
