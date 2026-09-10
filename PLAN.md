@@ -3,33 +3,211 @@
 Read [TRACKER.md](TRACKER.md) for current progress, verification results, and the next action.
 Update the tracker after each implementation change or verification result.
 
-## Target and approved direction
+## Current target and review gate
 
-Build HView-Linux in Rust from the current HView-Windows application.
-Include all implemented Windows functions through D07.
-The user approved the D04 through D07 extension after the original D03 release.
-Use UPSTREAM_REVIEW.md for the extension requirements and integration checks.
-Use the previous Linux application as a behavior reference.
-Keep the previous Linux code in Git history.
-Start the Rust application on a new orphan branch named `rust-rewrite`.
-Do not copy the previous C application into the new branch.
+Reproduce every implemented function in Windows commit `469f13d0959d5bed7fbf068a7c4a5858be16d0a8`.
+Preserve each documented Windows limit.
+Use current source behavior when historical records or older README text conflict.
+Treat `/home/sweet_cicero/Projects/HView-windows` as read-only without explicit user authorization.
+Use the Windows Rust modules, fixtures, and expected results as the parity source.
+Apply targeted Linux changes in the established modules.
+Retain working Linux terminal, path, native-loading, and save behavior.
+Document each intentional Linux difference.
 
-Rename the local folder, application, and GitHub repository to `HView-Linux`.
-Use `/home/sweet_cicero/Projects/HView-Linux` as the project folder.
-Use `HView-Linux` for the product name.
-Use `hview-linux` for the executable and Cargo package name.
-Keep the existing GitHub repository visibility and history.
-Do not change the default branch until the Rust application passes the release checks.
+HView-Linux is a powerful local hacker toolkit.
+Zero refusals means the product does not block a supported, valid, local operation only because the operation is risky.
+Invalid requests, unsupported requests, permission errors, and operating-system or I/O failures must return accurate errors.
 
-Use Astra High (`gpt-6-astra`, effort `high`) for planning, feature checks, and final review.
-Use Sol xhigh (`gpt-5.6-sol`, effort `xhigh`) for all application code, test code, and build scripts.
+The user authorized the L01.1 and L01.2 planning work.
+L01.1 is complete.
+Application implementation remains unauthorized until L01.2 records its scope.
+Keep all application items `Pending`.
 
-## Analysis baseline
+Use Astra xhigh (`gpt-6-astra`, effort `xhigh`) for all planning and review.
+Use Sol xhigh subagents (`gpt-5.6-sol`, effort `xhigh`) for all other work.
+Sol xhigh creates documentation, application code, tests, and build scripts.
+Sol xhigh also runs all checks.
+
+## Current source state
+
+| Project | Commit and branch | State |
+|---|---|---|
+| HView-Windows | `469f13d0959d5bed7fbf068a7c4a5858be16d0a8`, `master` | Clean local parity source |
+| HView-Linux | `f9c5299f2f21d3531b8295d2d358dcc566cfcb24`, `rust-rewrite` | Accepted D07 application source |
+
+The D03 release and D04 through D07 extension remain accepted historical evidence.
+The older D09-only plan no longer defines current scope or task order.
+The existing product name, package name, branch, and repository setup remain unchanged.
+
+## Current platform decisions
+
+The user accepted the HEM, terminal, and device decisions.
+
+| Area | Linux contract | Status or required resolution |
+|---|---|---|
+| Host | Keep the x86-64 GNU host. Treat ARM, Thumb, and ARM64 as inspected architectures. | Do not add an ARM Linux host port for an instruction feature. |
+| HEM scope | Exclude Windows-specific HEM modules. Retain the remaining HEM functions. | Accepted. Inventory each retained function and its requirements before implementation. |
+| HEM implementation | Use established modules for retained functions. | Accepted. Do not require Wine or a Windows host only for excluded modules. Do not add a speculative plugin framework. |
+| Device model | Map raw drives to whole block devices. Map partitions and logical volumes to logical devices. | Accepted. Preserve fixed device length and actual bounds. |
+| Device writes | Open devices read-only by default. Require explicit writable mode. Permit a user-controlled override for mounted or in-use devices. | Accepted. Also permit the override when exclusive access is unavailable. Do not unmount devices or bypass privilege controls automatically. |
+| Terminal | Match Windows appearance as closely as practical through Linux terminal output. | Accepted. Keep all keys reachable. Allow theme and font differences. |
+| Paths | Preserve valid Linux pathname bytes through `PathBuf` and `OsString`. Keep operational paths separate from display text. | L02.2, L23.2, L24, and L25 own integration. |
+| Libraries | Keep Capstone 5.0.9, Keystone 0.9.2, and Linux native loading. | Verify guest architectures. Reuse the upstream Unicode crates and their notices. |
+
+### Current Linux pathname contract
+
+Use `PathBuf` and `OsString` for native file operations.
+Preserve each valid Linux pathname byte from CLI and picker inputs.
+Accept non-UTF-8 paths through the native CLI and picker.
+Keep operational paths separate from display text.
+Escape invalid bytes and terminal controls for display.
+Never convert display text back into an operational path.
+
+Preserve exact absolute and relative path meanings.
+Preserve literal Linux backslashes, option boundaries, and XDG discovery.
+Return the actual error for an unavailable pathname.
+Do not guess a Windows drive mapping.
+Do not select a different file.
+
+Existing modern configuration and session formats use UTF-8 paths.
+Reject an unrepresentable path before modern configuration or session publication.
+A session representation limit must not block opening, viewing, or editing a valid native path.
+The limit must not block Save or Save As for a valid native path.
+
+Report a persistence failure separately from the native file operation.
+Retain the editor state when persistence fails.
+Preserve the existing session bytes when persistence fails.
+Do not report successful session persistence or convert the path lossily.
+Do not add a new session encoding during L01.1.
+
+### Current legacy OEM pathname contract
+
+Windows uses `GetOEMCP` at `W:src/config.rs:676` and `W:src/config.rs:714`.
+CP437 Text display does not identify the source pathname code page.
+ASCII pathname bytes need no code-page selection.
+For non-ASCII legacy input, require an explicitly selected, supported source OEM code page.
+Decode the pathname strictly.
+Require an exact byte round trip.
+
+Fail when the selection is missing, unsupported, ambiguous, or unrepresentable.
+Use the selected encoding for legacy export with an exact byte round trip.
+Preserve the legacy layout and the fewer-than-260-byte pathname limit.
+Keep modern session paths in UTF-8.
+
+Define the supported code-page inventory and configuration spelling in L23.1.
+Apply strict legacy OEM persistence in L25.1.
+Do not invent configuration syntax during L01.1.
+
+### Current Linux scanner contract
+
+Preserve the 64 MiB buffered-input limit and the 4 MiB top-level rule limit.
+Preserve the 4 MiB combined stdout and stderr limit and the 10,000-row limit.
+Preserve the 60-second deadline and the 512 MiB aggregate child-job memory limit.
+The deadline covers snapshot creation, engine execution, and result parsing.
+
+Canonicalize the selected top-level rule path.
+Use its directory for relative includes.
+Keep included files as engine inputs without snapshotting them.
+Do not apply the 4 MiB top-level limit as an aggregate include limit.
+
+Resolve `HVIEW_YARAX` as the authoritative engine path.
+Otherwise, search an executable sibling named `yr` and then each nonempty `PATH` entry.
+Resolve a complete executable path.
+Use an argument vector without a shell.
+Preserve actual launch errors and diagnostics.
+
+Drain both pipes concurrently with bounded storage.
+Publish only complete, validated results.
+Apply child containment before engine code executes.
+Stop all contained descendants during cancellation, timeout, resource failure, and normal cleanup.
+Also stop descendants that retain output pipes.
+
+Do not claim that a process-group signal stops descendants that leave the group.
+Do not treat a per-process `RLIMIT_AS` as the aggregate Windows job memory limit.
+L28.1 must select the exact Linux containment mechanism and list its host prerequisites.
+L28.1 must enforce aggregate memory and descendant cleanup.
+Return an accurate capability error when the host cannot supply the required controls.
+Do not run with weaker limits.
+
+### Current source comment contract
+
+For each changed source file, add educational block comments to every logical section.
+Explain the section purpose, inputs, data flow, state changes, key decisions, and control flow.
+Connect each logical section to the next section when the connection is not clear.
+Write readable STE for a reader who does not know the source.
+Keep the comments accurate when the related code changes.
+Do not retrofit untouched source files during L01.1.
+
+### Remaining implementation choices
+
+| Choice | Owner |
+|---|---|
+| Preserve native source identity through file lifecycle changes. | L02.2 |
+| Accept native CLI paths and keep escaped display text separate. | L23.2 |
+| Preserve native picker paths and visit-history paths. | L24.1 and L24.2 |
+| Define supported OEM code pages and their configuration spelling. | L23.1 |
+| Apply strict OEM conversion to legacy persistence. | L25.1 |
+| Enforce modern UTF-8 representation and persistence independence. | L25.2 and L25.3 |
+| Select enforceable aggregate scanner containment and host prerequisites. | L28.1 |
+| Add and maintain the required educational block comments. | Each source-changing implementation child |
+
+Preserve Intel disassembly by default.
+Provide AT&T display only through explicit configuration.
+Preserve Intel assembly input and the separate Real16 behavior.
+Preserve Linux metadata rules, guarded saves, directory synchronization, and exclusive Save As publication.
+
+At the raw-device write commit, identify the device and byte range.
+Give one warning about filesystem damage, partial writes, and limited recovery.
+Do not repeat the warning for each edited byte.
+Preserve input validation, permission enforcement, neighboring bytes, flushes, read-back checks, and accurate failure handling.
+Use disposable virtual devices for tests.
+
+## Current dependency sequence
+
+| Stage | Tracker tasks | Exit condition |
+|---|---|---|
+| User review | L01 | The user approves implementation and the platform contracts. |
+| Shared foundation | L02-L06, L15 | Bounded storage, transactions, saves, Text indexes, cancellation, and terminal contracts pass. |
+| Addresses and edit dependencies | L07-L10, L13, L14 | Architectures, mappings, navigation, previews, hashes, and annotations pass. |
+| Product workflows | L11, L12, L16-L24 | Editing, analysis, Unicode, controls, Names, configuration, and file workflows pass. |
+| Persistent and external workflows | L25-L29 | Sessions, macros, batch recovery, signatures, and exports pass. |
+| Platform completion | L30-L32 | Device, HEM, and independent package acceptance pass. |
+| Final acceptance | L33 | Every requirement and Linux difference has current evidence and Astra acceptance. |
+
+Tasks in one stage can have different dependencies.
+The parent dependencies above summarize the implementation groups.
+Use the detailed child dependencies in [TRACKER.md](TRACKER.md) as the authoritative order.
+A parent becomes complete only after all its children pass checks and Astra acceptance.
+The historical D08-first sequence does not control current work.
+
+## Current included and excluded scope
+
+Current scope includes D08-D15, S01-S05, S07-S14, P01-P07, B01-B03, B05-B07, X01, X03, and legacy UI work.
+Only S06, B04, and X02 remain outside the current Windows scope.
+These excluded stages cover headless JSON analysis, Capstone 6, and general plugins or debugging tools.
+
+Current scope includes ELF, ARM-family inspection, Unicode, retained HEM functions, and local signatures.
+Paged tools must match current implemented routes only.
+Patch version one permits equal-length replacements and one final append.
+ARM64 assembly remains unsupported.
+ELF support remains little-endian and excludes ET_CORE, runtime rebasing, symbols, and general relocation analysis.
+Mach-O support remains thin and little-endian.
+
+The 85 current child goals under L01 through L33 appear in [TRACKER.md](TRACKER.md).
+The L31 HEM inventory can add named implementation children for uncovered retained workflows.
+The exact source evidence and limits appear in [UPSTREAM_REVIEW.md](UPSTREAM_REVIEW.md).
+
+## Historical plan and accepted evidence through D07
+
+### Historical analysis baseline
 
 | Project | Baseline | State |
 |---|---|---|
 | HView-Windows | `97a308c4fadffa434e96cf4cab33591a26413f4e` | Clean Rust source; 15 application modules |
 | Previous HView | `35dbd0bbdfba08c1d3062bbeb65d5c6abcd29771` | Clean C source; read-only terminal viewer |
+
+The table records the original D03 analysis baseline.
+The current source state above supersedes the table for planning.
 
 The Windows review covered every application module, embedded test, console probe, package script, source asset reference, and active document.
 The review also covered native dependency metadata and the Windows CI workflow.
@@ -77,7 +255,7 @@ The checks used GCC C17 with strict warnings, AddressSanitizer, and UndefinedBeh
 These checks did not run the complete CMake suite or the real Zydis decoder.
 Diagnostic evidence is in `/tmp/hview-baseline.vMUmt1`.
 
-## Function matrix
+### Historical D03 function matrix
 
 This table records the original D03 analysis baseline. The approved extension below replaces current-byte undo and adds the D04 through D07 functions.
 
@@ -118,7 +296,7 @@ Previous Linux paths refer to commit `35dbd0bbdfba08c1d3062bbeb65d5c6abcd29771`.
 | Native self-test | Headless engine checks in all three widths; `src/main.rs:712` | Absent | Port and include in package checks |
 | Packaging and CI | Pinned native files, hashes, notices, isolated launch, and missing-library checks | CMake targets and seven test programs | Add Linux equivalents |
 
-## Important behavior limits
+### Historical D03 behavior limits
 
 Strings use a minimum length of four characters in the interface.
 Each displayed string has at most 120 characters before its truncation marker.
@@ -152,7 +330,7 @@ The checked PE tools reject ambiguous mappings and arithmetic overflow.
 VA conversion uses the preferred ImageBase from the current buffer.
 The D03 baseline had no runtime base selection. D05 adds an explicit raw model with a checked runtime base.
 
-## Linux adaptations
+### Accepted Linux adaptations through D07
 
 ### Terminal and input
 
@@ -244,7 +422,7 @@ Do not present advisory locking as protection against every external writer.
 Record the remaining concurrent-writer and rename limits.
 Use a local filesystem for initial validation.
 
-## Previous Linux review
+### Historical previous Linux review
 
 The previous C program provides useful interaction references.
 The previous C program does not provide an editing or analysis foundation comparable to the Windows Rust application.
@@ -270,7 +448,7 @@ Keep origin and license information accurate during the rewrite.
 Do not apply the previous C license automatically to imported Windows Rust source.
 Preserve required notices for any retained source or native dependency.
 
-## Implementation phases and acceptance checks
+### Historical D03 phases and acceptance checks
 
 | Phase | Sol xhigh implementation | Astra High acceptance check |
 |---|---|---|
@@ -292,7 +470,7 @@ Keep the source module boundaries unless a Linux requirement needs a change.
 Do not introduce a plugin framework, general backend interface, or shared cross-repository package.
 Do not maintain a second application implementation in C.
 
-### Approved D04 through D07 extension
+### Historical D04 through D07 extension
 
 Use Windows commit `a3b7240ae0288be383f16135fe6a2f31427fc95c` as the extension source reference.
 Keep the Linux adaptations and the accepted D03 release behavior.
@@ -309,6 +487,20 @@ Raw 16-bit mode remains distinct from Real16. Raw settings do not enter the SAV 
 Assembly input remains Intel. Preview display follows the configured disassembly syntax.
 The preview must check current terminal dimensions before applying a patch.
 Synthetic resize events must preserve a hexadecimal edit group.
+
+### Historical D08 and D09 proposal
+
+This proposal used Windows commit `624e3cc924da5c1d3a74a06eca82771079cb80bc`.
+The proposal did not include later implemented Windows work.
+The L01 through L33 plan supersedes its scope, order, and exclusions.
+
+| Stage | Required behavior | Acceptance evidence |
+|---|---|---|
+| D08 | Export and import verified patch records with portable SHA-256 and one undoable application | Round-trip, validation, limits, atomic refusal, safe export, and one undo and redo |
+| D09 | Add bounded annotations and a persistent source-bound session suffix | CRUD, bounds, edit guard, persistence, source mismatch, corrupt suffix, legacy coexistence, and resize |
+| Final | Verify every function through D09 and preserve all Linux adaptations | Full regression checks, isolated package, updated matrix, and Astra acceptance |
+
+Do not use this historical sequence for current implementation.
 
 ## Required verification
 
@@ -334,18 +526,20 @@ For D01, measure decoder preparation separately from terminal output.
 Do not require the Windows timing values on Linux.
 Verify decoder reuse and record Linux timing evidence.
 
-## Excluded Windows backlog
+## Current boundaries
 
-The original parity release ended at D03.
-The approved extension includes branch following, raw runtime bases, assembly preview, and operation undo/redo through D07.
-Exclude verified patch records and annotations.
-Exclude paged file access, changed-range storage, background analysis workers, headless JSON analysis, and expanded Unicode sessions.
-Exclude signatures, ARM64, full ELF navigation, Mach-O, plugins, a decompiler, and a debugger.
-The Linux adaptations above remain required for the application to work correctly on Linux.
+Only S06, B04, and X02 remain outside the current Windows scope.
+Do not apply historical exclusions for Unicode, ELF, ARM, signatures, HEM, paging, or later analysis functions.
+Preserve the narrower limits of each implemented Windows route.
+
+The current review used local source inspection only.
+The review did not run Windows, HEM, device, full PTY, or isolated-package acceptance.
+The current Rust suite has one environment-limited ACL fixture failure.
+See UPSTREAM_REVIEW.md for the exact command, failure, and next check.
 
 ## Completion condition
 
-Every function-matrix row must have an implementation location and passing evidence.
+Every current tracker task must have an implementation location and passing evidence.
 Every operating-system difference must have documented behavior and a corresponding check.
-Astra High must review the final branch after Sol xhigh completes the required checks.
+Astra xhigh must review the final branch after Sol xhigh completes the required checks.
 Feature parity is complete only when the Linux package works independently of both source checkouts.
