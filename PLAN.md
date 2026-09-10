@@ -19,14 +19,15 @@ Zero refusals means the product does not block a supported, valid, local operati
 Invalid requests, unsupported requests, permission errors, and operating-system or I/O failures must return accurate errors.
 
 L01.1, L01.2, L02.1, and L02.2 are complete.
-The user authorized and completed scoped application work on L02.2.
-The completed L02.2 authorization does not cover another application item.
-Keep all other application items `Pending` and unauthorized until their work starts.
-Do not infer authorization for another backlog item.
+The published L02.2 commit is `750a2db4f5919a192970aec45d78e042ab0919be`.
+The user authorized all L03 children through the instruction, “finish out L03.”
+Complete and publish each L03 child in sequence after its required checks and Astra review.
+L03.1 is complete.
+The L03.1 publication commit contains this completion record.
+Keep all items after L03 `Pending` and unauthorized.
 
-Publish accepted L02.2 only to `origin/rust-rewrite`.
-Then stop.
-L03.1 is the next item and remains unauthorized.
+Publish accepted L03.1 to `origin/rust-rewrite`.
+Then implement L03.2 under the recorded L03 authorization.
 
 Use Astra xhigh (`gpt-6-astra`, effort `xhigh`) for all planning and review.
 Use Sol xhigh subagents (`gpt-5.6-sol`, effort `xhigh`) for all other work.
@@ -38,7 +39,7 @@ Sol xhigh also runs all checks.
 | Project | Commit and branch | State |
 |---|---|---|
 | HView-Windows | `469f13d0959d5bed7fbf068a7c4a5858be16d0a8`, `master` | Clean local parity source |
-| HView-Linux | `86e9650293bde582e6acde32a99acc770499ada0`, `rust-rewrite` | Published baseline before L02.2; accepted D07 application baseline at `5e4ef68` |
+| HView-Linux | `750a2db4f5919a192970aec45d78e042ab0919be`, `rust-rewrite` | Published L02.2 baseline; accepted D07 application baseline at `5e4ef68` |
 
 The D03 release and D04 through D07 extension remain accepted historical evidence.
 The L02.2 publication commit contains its completion record on `rust-rewrite`.

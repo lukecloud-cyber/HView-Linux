@@ -4,20 +4,118 @@ The paged form reads small windows at u64 offsets.
 The handle keeps the opened source stable when its pathname changes.
 Metadata checks reject detected source changes before or after each read.
 */
+use std::collections::HashSet;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /*
 Buffered storage accepts sources through 64 MiB.
 Each paged read uses at most 64 KiB of owned memory.
+Each logical splice removes and inserts at most 64 MiB.
+One live layout uses at most 65 MiB and 4,096 spans.
 O_NONBLOCK lets open return before a FIFO supplies a writer.
 The metadata check then rejects every nonregular source.
 */
 pub(crate) const BUFFERED_FILE_LIMIT: u64 = 64 * 1024 * 1024;
 pub(crate) const MAX_READ_BYTES: usize = 64 * 1024;
+const BLOCK_BYTES: usize = 64 * 1024 * 1024;
+const CHANGED_BYTES_LIMIT: usize = 65 * 1024 * 1024;
+const CHANGED_RANGES_LIMIT: usize = 4096;
 const O_NONBLOCK: i32 = 0o4000;
+
+/*
+Logical spans refer to immutable source bytes or immutable changed bytes.
+Source spans keep u64 offsets into the opened descriptor.
+Memory spans share one allocation when a logical edit splits their range.
+The layout length describes the current view without changing the source stamp.
+*/
+#[derive(Clone)]
+enum DataSpan {
+    Source {
+        start: u64,
+        len: u64,
+    },
+    Memory {
+        bytes: Arc<[u8]>,
+        start: usize,
+        len: usize,
+    },
+}
+
+/*
+These methods provide checked span lengths and slices for splice planning.
+Each slice keeps the same immutable backing storage and adjusts its start.
+*/
+impl DataSpan {
+    /*
+    This method returns the logical length of either span kind.
+    Memory lengths convert exactly because usize fits in u64 on this target.
+    */
+    fn len(&self) -> u64 {
+        match self {
+            Self::Source { len, .. } => *len,
+            Self::Memory { len, .. } => *len as u64,
+        }
+    }
+
+    /*
+    This method creates a checked subrange of one span.
+    The caller supplies a contained range from the logical layout walk.
+    A failure leaves the source span and current layout unchanged.
+    */
+    fn slice(&self, start: u64, len: u64) -> io::Result<Self> {
+        match self {
+            Self::Source { start: source, .. } => Ok(Self::Source {
+                start: source.checked_add(start).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "The source span exceeds the address range.",
+                    )
+                })?,
+                len,
+            }),
+            Self::Memory {
+                bytes,
+                start: memory,
+                ..
+            } => {
+                let start = usize::try_from(start)
+                    .ok()
+                    .and_then(|start| memory.checked_add(start))
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "The memory span exceeds the address range.",
+                        )
+                    })?;
+                let len = usize::try_from(len).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "The memory span exceeds the address range.",
+                    )
+                })?;
+                Ok(Self::Memory {
+                    bytes: Arc::clone(bytes),
+                    start,
+                    len,
+                })
+            }
+        }
+    }
+}
+
+/*
+One layout orders all source and memory spans in their current logical sequence.
+Splice planning creates a complete replacement layout before state changes.
+*/
+#[derive(Clone)]
+struct Layout {
+    spans: Vec<DataSpan>,
+    len: u64,
+}
 
 /*
 The source stamp records native identity, length, and nanosecond Linux change times.
@@ -103,7 +201,7 @@ pub(crate) enum OpenedSource {
 
 /*
 A read window owns its bytes independently from the source and later windows.
-The start field keeps the u64 source position with the bounded byte buffer.
+The start field keeps the u64 logical position with the bounded byte buffer.
 */
 #[derive(Debug)]
 pub(crate) struct ReadWindow {
@@ -113,12 +211,14 @@ pub(crate) struct ReadWindow {
 
 /*
 PagedFile owns one read-only descriptor, its native path, and open-time metadata.
+Its layout maps the current logical bytes to source and memory spans.
 The component stores no display text or pathname conversion.
 */
 pub(crate) struct PagedFile {
     file: File,
     path: PathBuf,
     stamp: SourceStamp,
+    layout: Layout,
 }
 
 /*
@@ -143,19 +243,31 @@ impl PagedFile {
                 "The source is not a regular file.",
             ));
         }
+        let stamp = SourceStamp::from_metadata(&metadata);
+        let spans = (stamp.len != 0)
+            .then_some(DataSpan::Source {
+                start: 0,
+                len: stamp.len,
+            })
+            .into_iter()
+            .collect();
         Ok(Self {
             file,
             path: path.to_owned(),
-            stamp: SourceStamp::from_metadata(&metadata),
+            stamp,
+            layout: Layout {
+                spans,
+                len: stamp.len,
+            },
         })
     }
 
     /*
-    Length reports the captured length of the opened source.
-    The next read validates this length before it accesses bytes.
+    Length reports the current logical length after any in-memory splice.
+    The source stamp keeps the separate captured file length for validation.
     */
     pub(crate) fn len(&self) -> u64 {
-        self.stamp.len
+        self.layout.len
     }
 
     /*
@@ -227,10 +339,10 @@ impl PagedFile {
     }
 
     /*
-    This read rejects invalid limits and offsets before memory allocation.
-    A valid request is clipped at EOF and receives one fallibly allocated buffer.
+    This read rejects invalid limits and logical offsets before memory allocation.
+    A valid request is clipped at logical EOF and receives one fallibly allocated buffer.
+    The layout walk combines source and immutable memory spans into that buffer.
     The 64 KiB cap makes the clipped length exact in u64 and usize.
-    Positioned input does not change the shared file offset.
     The final validation prevents publication of a detected stale window.
     */
     pub(crate) fn read_window(&self, start: u64, len: usize) -> io::Result<ReadWindow> {
@@ -242,7 +354,7 @@ impl PagedFile {
         }
 
         self.validate()?;
-        let available = self.stamp.len.checked_sub(start).ok_or_else(|| {
+        let available = self.layout.len.checked_sub(start).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "The read offset is past the file end.",
@@ -255,13 +367,421 @@ impl PagedFile {
             .try_reserve_exact(allocation_len)
             .map_err(|_| io::Error::other("Cannot allocate the read window."))?;
         bytes.resize(allocation_len, 0);
-        self.file.read_exact_at(&mut bytes, start)?;
+        self.read_merged_unchecked_at(start, &mut bytes)?;
         self.validate()?;
 
         Ok(ReadWindow {
             start,
             bytes: bytes.into_boxed_slice(),
         })
+    }
+
+    /*
+    This helper fills one validated logical range from its ordered spans.
+    Source spans use positioned descriptor reads without changing the shared file offset.
+    Memory spans copy the selected bytes from their immutable shared allocation.
+    Checked layout arithmetic prevents a wrapped logical range.
+    */
+    fn read_merged_unchecked_at(&self, start: u64, output: &mut [u8]) -> io::Result<()> {
+        /*
+        First, calculate and check the complete requested logical range.
+        The range check protects all later usize conversions and output slices.
+        */
+        let end = start.checked_add(output.len() as u64).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "The read range exceeds the address range.",
+            )
+        })?;
+        if end > self.layout.len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "The read range extends past the file end.",
+            ));
+        }
+
+        /*
+        Next, walk the ordered spans and copy each overlap to its output position.
+        The logical cursor connects each span boundary to the next span.
+        */
+        let mut logical = 0_u64;
+        for span in &self.layout.spans {
+            let span_end = logical.checked_add(span.len()).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "The logical layout exceeds the address range.",
+                )
+            })?;
+            let overlap_start = logical.max(start);
+            let overlap_end = span_end.min(end);
+            if overlap_start < overlap_end {
+                let span_offset = overlap_start - logical;
+                let target = usize::try_from(overlap_start - start).unwrap();
+                let len = usize::try_from(overlap_end - overlap_start).unwrap();
+                match span {
+                    DataSpan::Source { start: source, .. } => {
+                        let source = source.checked_add(span_offset).ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "The source read exceeds the address range.",
+                            )
+                        })?;
+                        self.file
+                            .read_exact_at(&mut output[target..target + len], source)?;
+                    }
+                    DataSpan::Memory {
+                        bytes,
+                        start: memory,
+                        ..
+                    } => {
+                        let source = memory
+                            .checked_add(usize::try_from(span_offset).unwrap())
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "The memory read exceeds the address range.",
+                                )
+                            })?;
+                        let source_end = source.checked_add(len).ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "The memory read exceeds the address range.",
+                            )
+                        })?;
+                        let selected = bytes.get(source..source_end).ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "The memory span is outside its allocation.",
+                            )
+                        })?;
+                        output[target..target + len].copy_from_slice(selected);
+                    }
+                }
+            }
+            logical = span_end;
+            if logical >= end {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /*
+    This comparison detects an edit that leaves the complete logical range unchanged.
+    It uses one bounded stack buffer and reads each logical section in sequence.
+    Source validation surrounds the full comparison before a no-op result is published.
+    */
+    fn range_matches(&self, start: u64, expected: &[u8]) -> io::Result<bool> {
+        self.validate()?;
+        let mut compared = 0_usize;
+        let mut chunk = [0_u8; MAX_READ_BYTES];
+        while compared < expected.len() {
+            let count = (expected.len() - compared).min(chunk.len());
+            let offset = start.checked_add(compared as u64).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "The comparison range exceeds the address range.",
+                )
+            })?;
+            self.read_merged_unchecked_at(offset, &mut chunk[..count])?;
+            if chunk[..count] != expected[compared..compared + count] {
+                self.validate()?;
+                return Ok(false);
+            }
+            compared += count;
+        }
+        self.validate()?;
+        Ok(true)
+    }
+
+    /*
+    This helper can replace changed bytes with their original source span.
+    The optimization reads at most one 64 KiB source window.
+    Other replacements receive one immutable memory allocation.
+    */
+    fn replacement_span(
+        &self,
+        start: u64,
+        remove_len: u64,
+        replacement: &[u8],
+    ) -> io::Result<Option<DataSpan>> {
+        if replacement.is_empty() {
+            return Ok(None);
+        }
+        if replacement.len() <= MAX_READ_BYTES
+            && remove_len == replacement.len() as u64
+            && start
+                .checked_add(replacement.len() as u64)
+                .is_some_and(|end| end <= self.stamp.len)
+        {
+            let mut source = vec![0_u8; replacement.len()];
+            self.validate()?;
+            self.file.read_exact_at(&mut source, start)?;
+            self.validate()?;
+            if source == replacement {
+                return Ok(Some(DataSpan::Source {
+                    start,
+                    len: replacement.len() as u64,
+                }));
+            }
+        }
+        Ok(Some(DataSpan::Memory {
+            bytes: Arc::from(replacement),
+            start: 0,
+            len: replacement.len(),
+        }))
+    }
+
+    /*
+    This normalization appends one nonempty span to a planned layout.
+    It joins contiguous source offsets and adjacent slices of one memory allocation.
+    Other spans keep their independent order and backing storage.
+    */
+    fn push_span(spans: &mut Vec<DataSpan>, span: DataSpan) -> io::Result<()> {
+        if span.len() == 0 {
+            return Ok(());
+        }
+        match (spans.last_mut(), &span) {
+            (
+                Some(DataSpan::Source {
+                    start: left,
+                    len: left_len,
+                }),
+                DataSpan::Source {
+                    start: right,
+                    len: right_len,
+                },
+            ) if left.checked_add(*left_len) == Some(*right) => {
+                *left_len = left_len.checked_add(*right_len).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "The source span exceeds the address range.",
+                    )
+                })?;
+            }
+            (
+                Some(DataSpan::Memory {
+                    bytes: left_bytes,
+                    start: left,
+                    len: left_len,
+                }),
+                DataSpan::Memory {
+                    bytes: right_bytes,
+                    start: right,
+                    len: right_len,
+                },
+            ) if Arc::ptr_eq(left_bytes, right_bytes)
+                && left.checked_add(*left_len) == Some(*right) =>
+            {
+                *left_len = left_len.checked_add(*right_len).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "The memory span exceeds the address range.",
+                    )
+                })?;
+            }
+            _ => spans.push(span),
+        }
+        Ok(())
+    }
+
+    /*
+    This layout walk appends one logical subrange to a planned span vector.
+    It slices only overlapping spans and normalizes each resulting boundary.
+    */
+    fn extend_slice(
+        spans: &mut Vec<DataSpan>,
+        layout: &Layout,
+        start: u64,
+        end: u64,
+    ) -> io::Result<()> {
+        let mut logical = 0_u64;
+        for span in &layout.spans {
+            let span_end = logical.checked_add(span.len()).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "The logical layout exceeds the address range.",
+                )
+            })?;
+            let overlap_start = logical.max(start);
+            let overlap_end = span_end.min(end);
+            if overlap_start < overlap_end {
+                Self::push_span(
+                    spans,
+                    span.slice(overlap_start - logical, overlap_end - overlap_start)?,
+                )?;
+            }
+            logical = span_end;
+            if logical >= end {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /*
+    This planner builds prefix, replacement, and suffix spans without changing live state.
+    It checks the removed range, Linux file-offset range, allocation, and span count.
+    The caller checks the complete live memory cost before assignment.
+    */
+    fn plan_splice(
+        layout: &Layout,
+        start: u64,
+        remove_len: u64,
+        replacement: Option<DataSpan>,
+        replacement_len: u64,
+    ) -> io::Result<Layout> {
+        /*
+        First, check the removed range and calculate the new logical length.
+        The signed ceiling preserves the supported Linux file-offset range.
+        */
+        let end = start
+            .checked_add(remove_len)
+            .filter(|end| *end <= layout.len)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "The paged edit extends past the file end.",
+                )
+            })?;
+        let len = layout
+            .len
+            .checked_sub(remove_len)
+            .and_then(|len| len.checked_add(replacement_len))
+            .filter(|len| *len <= i64::MAX as u64)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "The edited file length exceeds the supported Linux file-offset range.",
+                )
+            })?;
+
+        /*
+        Next, allocate one complete candidate and append its three logical parts.
+        Normalization occurs at each part boundary before the span-limit check.
+        */
+        let mut spans = Vec::new();
+        spans
+            .try_reserve(layout.spans.len().saturating_add(2))
+            .map_err(|_| io::Error::other("Cannot allocate the paged edit layout."))?;
+        Self::extend_slice(&mut spans, layout, 0, start)?;
+        if let Some(span) = replacement {
+            Self::push_span(&mut spans, span)?;
+        }
+        Self::extend_slice(&mut spans, layout, end, layout.len)?;
+        if spans.len() > CHANGED_RANGES_LIMIT {
+            return Err(io::Error::other(
+                "Paged changes cannot exceed 4096 source or memory spans.",
+            ));
+        }
+        Ok(Layout { spans, len })
+    }
+
+    /*
+    This accounting counts span storage and each immutable allocation one time.
+    Shared slices count their complete backing allocation instead of visible bytes.
+    Fallible set reservation prevents hidden allocation failure during limit checks.
+    */
+    fn layout_cost(layout: &Layout) -> io::Result<usize> {
+        let descriptors = layout
+            .spans
+            .capacity()
+            .checked_mul(std::mem::size_of::<DataSpan>())
+            .ok_or_else(|| io::Error::other("The paged edit memory cost is too large."))?;
+        let mut allocations = HashSet::new();
+        allocations
+            .try_reserve(layout.spans.len())
+            .map_err(|_| io::Error::other("Cannot allocate the paged edit memory check."))?;
+        let mut cost = descriptors;
+        for span in &layout.spans {
+            if let DataSpan::Memory { bytes, .. } = span {
+                let identity = Arc::as_ptr(bytes) as *const u8 as usize;
+                if allocations.insert(identity) {
+                    cost = cost.checked_add(bytes.len()).ok_or_else(|| {
+                        io::Error::other("The paged edit memory cost is too large.")
+                    })?;
+                }
+            }
+        }
+        Ok(cost)
+    }
+
+    /*
+    This operation applies one replacement, insertion, or deletion to the logical layout.
+    All range, allocation, span, and live-memory checks finish before layout assignment.
+    Equal-byte edits return false and preserve the exact current layout.
+    L03.2 will add cursor state and operation history to this entry point.
+    */
+    #[allow(dead_code)]
+    pub(crate) fn splice_bytes(
+        &mut self,
+        start: u64,
+        remove_len: u64,
+        replacement: &[u8],
+    ) -> io::Result<bool> {
+        /*
+        First, reject oversized operations and invalid logical ranges.
+        These checks do not allocate replacement storage or change the layout.
+        */
+        if remove_len > BLOCK_BYTES as u64 || replacement.len() > BLOCK_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "A paged file edit cannot exceed 64 MiB.",
+            ));
+        }
+        let end = start.checked_add(remove_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "The paged edit exceeds the address range.",
+            )
+        })?;
+        if end > self.layout.len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "The paged edit extends past the file end.",
+            ));
+        }
+        let replacement_len = replacement.len() as u64;
+        self.layout
+            .len
+            .checked_sub(remove_len)
+            .and_then(|len| len.checked_add(replacement_len))
+            .filter(|len| *len <= i64::MAX as u64)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "The edited file length exceeds the supported Linux file-offset range.",
+                )
+            })?;
+
+        /*
+        Next, preserve exact state for a logical no-op.
+        A real operation receives one fully checked candidate layout.
+        */
+        if remove_len == replacement_len && self.range_matches(start, replacement)? {
+            return Ok(false);
+        }
+        let replacement_span = self.replacement_span(start, remove_len, replacement)?;
+        let planned = Self::plan_splice(
+            &self.layout,
+            start,
+            remove_len,
+            replacement_span,
+            replacement_len,
+        )?;
+        if Self::layout_cost(&planned)? > CHANGED_BYTES_LIMIT {
+            return Err(io::Error::other(
+                "Paged source and memory spans cannot exceed 65 MiB.",
+            ));
+        }
+
+        /*
+        Finally, validate the stable source after all candidate work.
+        Assignment publishes the candidate only after every required check passes.
+        */
+        self.validate()?;
+        self.layout = planned;
+        Ok(true)
     }
 }
 
@@ -287,13 +807,17 @@ mod tests {
     Sparse fixtures cover high u64 positions without large memory use.
     Native-path and FIFO fixtures cover Linux path and source boundaries.
     */
-    use super::{BUFFERED_FILE_LIMIT, MAX_READ_BYTES, OpenedSource, PagedFile, open_source};
+    use super::{
+        BLOCK_BYTES, BUFFERED_FILE_LIMIT, CHANGED_BYTES_LIMIT, CHANGED_RANGES_LIMIT, DataSpan,
+        Layout, MAX_READ_BYTES, OpenedSource, PagedFile, open_source,
+    };
     use std::ffi::CString;
     use std::fs::{self, File, FileTimes, OpenOptions};
     use std::io;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::FileExt;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -374,6 +898,519 @@ mod tests {
             file.write_all_at(bytes, *offset)?;
         }
         file.sync_all()
+    }
+
+    /*
+    This helper collects a complete logical view through normal bounded windows.
+    Small tests use the result as a direct byte oracle after structural edits.
+    */
+    fn read_all(source: &PagedFile) -> io::Result<Vec<u8>> {
+        let capacity = usize::try_from(source.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "The test source is too large for a complete oracle.",
+            )
+        })?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(capacity)
+            .map_err(|_| io::Error::other("Cannot allocate the complete test source oracle."))?;
+        let mut start = 0_u64;
+        while start < source.len() {
+            let window = source.read_window(start, MAX_READ_BYTES)?;
+            start += window.bytes.len() as u64;
+            bytes.extend_from_slice(&window.bytes);
+        }
+        Ok(bytes)
+    }
+
+    /*
+    This helper describes span kind, start, length, and memory identity.
+    Tests compare the description before and after rejected or no-op operations.
+    */
+    fn layout_signature(layout: &Layout) -> Vec<(u8, u64, u64, usize)> {
+        layout
+            .spans
+            .iter()
+            .map(|span| match span {
+                DataSpan::Source { start, len } => (0, *start, *len, 0),
+                DataSpan::Memory { bytes, start, len } => (
+                    1,
+                    *start as u64,
+                    *len as u64,
+                    Arc::as_ptr(bytes) as *const u8 as usize,
+                ),
+            })
+            .collect()
+    }
+
+    /*
+    These checks exercise the public splice entry for replacement, insertion, and deletion.
+    Restoration bytes map back to one normalized source span.
+    Equal bytes preserve the exact current layout and return a no-op result.
+    */
+    #[test]
+    fn logical_splices_replace_insert_delete_and_restore_source() -> io::Result<()> {
+        let fixture = Fixture::new("logical-splices")?;
+        let path = fixture.file("source.bin");
+        fs::write(&path, b"0123456789")?;
+        let mut source = PagedFile::open(&path)?;
+
+        assert!(source.splice_bytes(2, 3, b"AB")?);
+        assert_eq!(read_all(&source)?, b"01AB56789");
+        assert!(source.splice_bytes(source.len(), 0, b"XYZ")?);
+        assert_eq!(read_all(&source)?, b"01AB56789XYZ");
+        assert!(source.splice_bytes(4, 5, b"")?);
+        assert_eq!(read_all(&source)?, b"01ABXYZ");
+
+        let signature = layout_signature(&source.layout);
+        assert!(!source.splice_bytes(2, 2, b"AB")?);
+        assert_eq!(layout_signature(&source.layout), signature);
+
+        let restore_path = fixture.file("restore.bin");
+        fs::write(&restore_path, b"0123456789")?;
+        let mut restored = PagedFile::open(&restore_path)?;
+        assert!(restored.splice_bytes(2, 2, b"XY")?);
+        assert_eq!(restored.layout.spans.len(), 3);
+        assert!(restored.splice_bytes(2, 2, b"23")?);
+        assert_eq!(read_all(&restored)?, b"0123456789");
+        assert_eq!(restored.layout.spans.len(), 1);
+        assert!(matches!(
+            restored.layout.spans[0],
+            DataSpan::Source { start: 0, len: 10 }
+        ));
+        Ok(())
+    }
+
+    /*
+    Empty and EOF operations establish the valid structural boundaries.
+    Insertion can add bytes to an empty view and can append at exact logical EOF.
+    Past-EOF operations fail without changing the current bytes.
+    */
+    #[test]
+    fn empty_and_eof_splices_keep_checked_boundaries() -> io::Result<()> {
+        let fixture = Fixture::new("empty-splices")?;
+        let path = fixture.file("source.bin");
+        File::create(&path)?;
+        let mut source = PagedFile::open(&path)?;
+
+        assert!(!source.splice_bytes(0, 0, b"")?);
+        assert!(source.splice_bytes(0, 0, b"abc")?);
+        assert!(source.splice_bytes(3, 0, b"def")?);
+        assert_eq!(read_all(&source)?, b"abcdef");
+        assert!(source.splice_bytes(0, 6, b"")?);
+        assert_eq!(source.len(), 0);
+        assert!(source.layout.spans.is_empty());
+
+        let signature = layout_signature(&source.layout);
+        assert!(source.splice_bytes(1, 0, b"x").is_err());
+        assert!(source.splice_bytes(0, 1, b"").is_err());
+        assert_eq!(source.len(), 0);
+        assert_eq!(layout_signature(&source.layout), signature);
+        Ok(())
+    }
+
+    /*
+    One changed range crosses the 64 KiB window boundary in the source.
+    Bounded reads combine source, memory, and source bytes without missing data.
+    Returned windows remain independent after a later edit and source closure.
+    */
+    #[test]
+    fn mixed_spans_cross_window_boundaries_and_own_results() -> io::Result<()> {
+        let fixture = Fixture::new("mixed-window")?;
+        let path = fixture.file("source.bin");
+        let original: Vec<u8> = (0..MAX_READ_BYTES + 32)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        fs::write(&path, &original)?;
+        let mut source = PagedFile::open(&path)?;
+        let start = MAX_READ_BYTES as u64 - 4;
+        assert!(source.splice_bytes(start, 8, b"changed!")?);
+
+        let mut expected = original.clone();
+        expected.splice(
+            start as usize..start as usize + 8,
+            b"changed!".iter().copied(),
+        );
+        let crossing = source.read_window(start - 4, 16)?;
+        assert_eq!(
+            &*crossing.bytes,
+            &expected[start as usize - 4..start as usize + 12]
+        );
+        let prefix = source.read_window(0, 8)?;
+        assert!(source.splice_bytes(1, 2, b"later")?);
+        drop(source);
+        assert_eq!(&*prefix.bytes, &original[..8]);
+        Ok(())
+    }
+
+    /*
+    Direct layout fixtures isolate span splitting and normalization from file I/O.
+    Contiguous source spans merge by source offset.
+    Adjacent memory slices merge only when both slices share one allocation.
+    */
+    #[test]
+    fn source_and_shared_memory_slices_merge_only_when_contiguous() -> io::Result<()> {
+        let shared: Arc<[u8]> = Arc::from(&b"abcdef"[..]);
+        let mut spans = Vec::new();
+        PagedFile::push_span(&mut spans, DataSpan::Source { start: 2, len: 3 })?;
+        PagedFile::push_span(&mut spans, DataSpan::Source { start: 5, len: 4 })?;
+        PagedFile::push_span(
+            &mut spans,
+            DataSpan::Memory {
+                bytes: Arc::clone(&shared),
+                start: 0,
+                len: 2,
+            },
+        )?;
+        PagedFile::push_span(
+            &mut spans,
+            DataSpan::Memory {
+                bytes: Arc::clone(&shared),
+                start: 2,
+                len: 4,
+            },
+        )?;
+        PagedFile::push_span(
+            &mut spans,
+            DataSpan::Memory {
+                bytes: Arc::from(&b"x"[..]),
+                start: 0,
+                len: 1,
+            },
+        )?;
+
+        assert_eq!(spans.len(), 3);
+        assert!(matches!(spans[0], DataSpan::Source { start: 2, len: 7 }));
+        assert!(matches!(
+            spans[1],
+            DataSpan::Memory {
+                start: 0,
+                len: 6,
+                ..
+            }
+        ));
+
+        let layout = Layout {
+            spans: vec![DataSpan::Memory {
+                bytes: Arc::clone(&shared),
+                start: 0,
+                len: 6,
+            }],
+            len: 6,
+        };
+        let mut slices = Vec::new();
+        PagedFile::extend_slice(&mut slices, &layout, 1, 5)?;
+        assert!(matches!(
+            slices[0],
+            DataSpan::Memory {
+                start: 1,
+                len: 4,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    /*
+    A deterministic edit sequence compares every logical result with Vec splice behavior.
+    The sequence includes growth, shrinkage, replacement, and exact EOF insertion.
+    */
+    #[test]
+    fn mixed_splice_sequence_matches_vec_oracle() -> io::Result<()> {
+        let fixture = Fixture::new("splice-oracle")?;
+        let path = fixture.file("source.bin");
+        let original: Vec<u8> = (0_u8..80).collect();
+        fs::write(&path, &original)?;
+        let mut source = PagedFile::open(&path)?;
+        let mut oracle = original;
+        let operations: &[(usize, usize, &[u8])] = &[
+            (10, 5, b"alpha"),
+            (0, 0, b"HEAD"),
+            (30, 9, b"x"),
+            (3, 7, b"middle-range"),
+            (usize::MAX, 0, b"TAIL"),
+            (1, 12, b""),
+        ];
+
+        for &(start, remove, replacement) in operations {
+            let start = start.min(oracle.len());
+            let remove = remove.min(oracle.len() - start);
+            assert!(source.splice_bytes(start as u64, remove as u64, replacement)?);
+            oracle.splice(start..start + remove, replacement.iter().copied());
+            assert_eq!(source.len(), oracle.len() as u64);
+            assert_eq!(read_all(&source)?, oracle);
+        }
+        Ok(())
+    }
+
+    /*
+    This helper creates many valid but noncontiguous source spans without file data.
+    Numeric limit tests can use the layout planner without large fixture files.
+    */
+    fn nonmerging_source_layout(count: usize) -> Layout {
+        let spans = (0..count)
+            .map(|index| DataSpan::Source {
+                start: if index.is_multiple_of(2) { 0 } else { 2 },
+                len: 1,
+            })
+            .collect();
+        Layout {
+            spans,
+            len: count as u64,
+        }
+    }
+
+    /*
+    Planner fixtures check wrapped ranges and the Linux signed file-offset ceiling.
+    Each error occurs before a replacement layout can become current.
+    */
+    #[test]
+    fn splice_planner_rejects_range_and_result_overflow() {
+        let small = Layout {
+            spans: vec![DataSpan::Source { start: 0, len: 4 }],
+            len: 4,
+        };
+        assert!(PagedFile::plan_splice(&small, u64::MAX, 1, None, 0).is_err());
+        assert!(PagedFile::plan_splice(&small, 3, 2, None, 0).is_err());
+
+        let maximum = Layout {
+            spans: vec![DataSpan::Source {
+                start: 0,
+                len: i64::MAX as u64,
+            }],
+            len: i64::MAX as u64,
+        };
+        assert!(
+            PagedFile::plan_splice(
+                &maximum,
+                maximum.len,
+                0,
+                Some(DataSpan::Memory {
+                    bytes: Arc::from(&b"x"[..]),
+                    start: 0,
+                    len: 1,
+                }),
+                1,
+            )
+            .is_err()
+        );
+    }
+
+    /*
+    The span planner accepts exactly 4,096 normalized spans and rejects one more.
+    The failed plan cannot change either compact input layout.
+    */
+    #[test]
+    fn span_count_limit_accepts_boundary_and_refuses_next_span() -> io::Result<()> {
+        let accepted_source = nonmerging_source_layout(CHANGED_RANGES_LIMIT - 1);
+        let accepted_signature = layout_signature(&accepted_source);
+        let accepted = PagedFile::plan_splice(
+            &accepted_source,
+            1,
+            0,
+            Some(DataSpan::Memory {
+                bytes: Arc::from(&b"x"[..]),
+                start: 0,
+                len: 1,
+            }),
+            1,
+        )?;
+        assert_eq!(accepted.spans.len(), CHANGED_RANGES_LIMIT);
+        assert_eq!(layout_signature(&accepted_source), accepted_signature);
+
+        let refused_source = nonmerging_source_layout(CHANGED_RANGES_LIMIT);
+        let refused_signature = layout_signature(&refused_source);
+        assert!(
+            PagedFile::plan_splice(
+                &refused_source,
+                1,
+                0,
+                Some(DataSpan::Memory {
+                    bytes: Arc::from(&b"x"[..]),
+                    start: 0,
+                    len: 1,
+                }),
+                1,
+            )
+            .is_err()
+        );
+        assert_eq!(layout_signature(&refused_source), refused_signature);
+        Ok(())
+    }
+
+    /*
+    This public refusal uses readable source spans from one small real file.
+    A rejected 4,097th span preserves length, capacity, identities, and visible bytes.
+    */
+    #[test]
+    fn public_span_limit_refusal_preserves_the_live_layout() -> io::Result<()> {
+        let fixture = Fixture::new("public-span-limit")?;
+        let path = fixture.file("source.bin");
+        fs::write(&path, b"abc")?;
+        let mut source = PagedFile::open(&path)?;
+        source.layout = nonmerging_source_layout(CHANGED_RANGES_LIMIT);
+
+        let length = source.len();
+        let capacity = source.layout.spans.capacity();
+        let signature = layout_signature(&source.layout);
+        let bytes = source.read_window(0, 8)?.bytes;
+        assert!(source.splice_bytes(1, 0, b"x").is_err());
+        assert_eq!(source.len(), length);
+        assert_eq!(source.layout.spans.capacity(), capacity);
+        assert_eq!(layout_signature(&source.layout), signature);
+        assert_eq!(source.read_window(0, 8)?.bytes, bytes);
+        Ok(())
+    }
+
+    /*
+    This accounting fixture uses two slices from one larger memory allocation.
+    The cost includes the full shared allocation once and all vector capacity.
+    */
+    #[test]
+    fn live_cost_counts_each_complete_allocation_once() -> io::Result<()> {
+        let shared: Arc<[u8]> = vec![0_u8; 1024].into();
+        let spans = vec![
+            DataSpan::Memory {
+                bytes: Arc::clone(&shared),
+                start: 0,
+                len: 1,
+            },
+            DataSpan::Source { start: 0, len: 1 },
+            DataSpan::Memory {
+                bytes: Arc::clone(&shared),
+                start: 1023,
+                len: 1,
+            },
+        ];
+        let layout = Layout { spans, len: 3 };
+        assert_eq!(
+            PagedFile::layout_cost(&layout)?,
+            layout.spans.capacity() * std::mem::size_of::<DataSpan>() + shared.len()
+        );
+
+        let descriptor = std::mem::size_of::<DataSpan>();
+        let exact_len = CHANGED_BYTES_LIMIT - descriptor;
+        let exact_spans = vec![DataSpan::Memory {
+            bytes: vec![0_u8; exact_len].into(),
+            start: 0,
+            len: exact_len,
+        }];
+        let exact = Layout {
+            spans: exact_spans,
+            len: exact_len as u64,
+        };
+        assert_eq!(PagedFile::layout_cost(&exact)?, CHANGED_BYTES_LIMIT);
+        drop(exact);
+
+        let refused_spans = vec![DataSpan::Memory {
+            bytes: vec![0_u8; exact_len + 1].into(),
+            start: 0,
+            len: exact_len + 1,
+        }];
+        let refused = Layout {
+            spans: refused_spans,
+            len: exact_len as u64 + 1,
+        };
+        assert!(PagedFile::layout_cost(&refused)? > CHANGED_BYTES_LIMIT);
+        Ok(())
+    }
+
+    /*
+    Public boundary checks accept exact 64 MiB operations and reject larger operations.
+    A one-byte slice still owns its complete 64 MiB allocation after deletion.
+    A later live-cost refusal preserves that byte, length, capacity, and span identity.
+    */
+    #[test]
+    fn operation_and_live_memory_limits_preserve_state() -> io::Result<()> {
+        let fixture = Fixture::new("edit-limits")?;
+        let empty_path = fixture.file("empty.bin");
+        File::create(&empty_path)?;
+        let mut source = PagedFile::open(&empty_path)?;
+        let replacement = vec![0x5a_u8; BLOCK_BYTES];
+        assert!(source.splice_bytes(0, 0, &replacement)?);
+        drop(replacement);
+        assert_eq!(source.len(), BLOCK_BYTES as u64);
+        assert_eq!(&*source.read_window(0, 1)?.bytes, &[0x5a]);
+        assert_eq!(
+            &*source.read_window(BLOCK_BYTES as u64 - 1, 1)?.bytes,
+            &[0x5a]
+        );
+
+        assert!(source.splice_bytes(0, BLOCK_BYTES as u64 - 1, b"")?);
+        assert_eq!(source.len(), 1);
+        assert_eq!(&*source.read_window(0, 1)?.bytes, &[0x5a]);
+        let signature = layout_signature(&source.layout);
+        let capacity = source.layout.spans.capacity();
+        let extra = vec![0x33_u8; 1024 * 1024];
+        assert!(
+            source
+                .splice_bytes(source.len(), 0, &extra)
+                .unwrap_err()
+                .to_string()
+                .contains("65 MiB")
+        );
+        assert_eq!(source.len(), 1);
+        assert_eq!(source.layout.spans.capacity(), capacity);
+        assert_eq!(layout_signature(&source.layout), signature);
+        assert_eq!(&*source.read_window(0, 1)?.bytes, &[0x5a]);
+
+        let too_large = vec![0_u8; BLOCK_BYTES + 1];
+        assert!(source.splice_bytes(0, 0, &too_large).is_err());
+        assert!(source.splice_bytes(0, BLOCK_BYTES as u64 + 1, b"").is_err());
+        assert_eq!(source.layout.spans.capacity(), capacity);
+        assert_eq!(layout_signature(&source.layout), signature);
+
+        let removal_path = fixture.file("removal.bin");
+        sparse_file(&removal_path, BLOCK_BYTES as u64 + 2, &[])?;
+        let mut removal = PagedFile::open(&removal_path)?;
+        assert!(removal.splice_bytes(0, BLOCK_BYTES as u64, b"")?);
+        assert_eq!(removal.len(), 2);
+        Ok(())
+    }
+
+    /*
+    A sparse source keeps logical edits and reads above the 4 GiB boundary.
+    The replacement changes only one bounded memory span near the high offset.
+    */
+    #[test]
+    fn logical_spans_keep_offsets_above_four_gib() -> io::Result<()> {
+        let fixture = Fixture::new("high-edit")?;
+        let path = fixture.file("source.bin");
+        let high = 4 * 1024 * 1024 * 1024_u64 + 123;
+        sparse_file(&path, high + 8, &[(high, b"original")])?;
+        let mut source = PagedFile::open(&path)?;
+
+        assert!(source.splice_bytes(high + 1, 3, b"XYZ")?);
+        assert_eq!(&*source.read_window(high, 8)?.bytes, b"oXYZinal");
+        assert_eq!(source.len(), high + 8);
+        Ok(())
+    }
+
+    /*
+    Source validation remains active when the requested logical bytes are in memory.
+    Changed metadata and pathname replacement both stop a later mixed-view read.
+    */
+    #[test]
+    fn source_changes_after_edits_stop_memory_reads() -> io::Result<()> {
+        let fixture = Fixture::new("edited-source-change")?;
+        let changed_path = fixture.file("changed.bin");
+        fs::write(&changed_path, b"abcdef")?;
+        let mut changed = PagedFile::open(&changed_path)?;
+        assert!(changed.splice_bytes(1, 1, b"X")?);
+        let file = OpenOptions::new().write(true).open(&changed_path)?;
+        file.set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1)))?;
+        assert!(changed.read_window(1, 1).is_err());
+
+        let replaced_path = fixture.file("replaced.bin");
+        let old_path = fixture.file("old.bin");
+        fs::write(&replaced_path, b"abcdef")?;
+        let mut replaced = PagedFile::open(&replaced_path)?;
+        assert!(replaced.splice_bytes(1, 1, b"Y")?);
+        fs::rename(&replaced_path, &old_path)?;
+        fs::write(&replaced_path, b"uvwxyz")?;
+        assert!(replaced.read_window(1, 1).is_err());
+        Ok(())
     }
 
     /*

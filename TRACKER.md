@@ -10,15 +10,15 @@ Read [UPSTREAM_REVIEW.md](UPSTREAM_REVIEW.md) for the historical and current Win
 
 - Current scope: all implemented functions in Windows commit `469f13d0959d5bed7fbf068a7c4a5858be16d0a8`.
 - Current Windows source: clean local `master` at `469f13d0959d5bed7fbf068a7c4a5858be16d0a8`.
-- Published baseline before L02.2: local and remote `rust-rewrite` at `86e9650293bde582e6acde32a99acc770499ada0`.
-- Current Linux branch: `rust-rewrite`. The L02.2 publication commit contains this completion record.
+- Published L02.2 baseline: local and remote `rust-rewrite` at `750a2db4f5919a192970aec45d78e042ab0919be`.
+- Current Linux branch: `rust-rewrite`. The L03.1 publication commit contains this completion record.
 - Accepted Linux application baseline: D07 source at `5e4ef68`.
-- Current authorization: completed scoped application work on L02.2 only. No other application item is authorized.
+- Current authorization: the user instruction “finish out L03” authorizes all L03 children.
 - Planning status: L01.1, L01.2, and parent L01 are `Complete`.
-- Application implementation: L02.2 and parent L02 are `Complete`. All other incomplete application items remain `Pending` and unauthorized.
-- Detailed plan: four current children are `Complete`; 81 children are `Pending`.
-- Next action: Publish accepted L02.2 only to `origin/rust-rewrite`. Then stop. L03.1 is the next item and remains unauthorized.
-- Request boundary: end this request after L02.2 publication. Do not start another item.
+- Application implementation: L02 and all children are `Complete`. L03.1 is `Complete`. Later L03 children are authorized and `Pending`.
+- Detailed plan: five current children are `Complete`; 80 children are `Pending`.
+- Next action: publish accepted L03.1 to `origin/rust-rewrite`. Then implement L03.2 under the recorded L03 authorization.
+- Request boundary: complete and publish each L03 child in sequence. Stop after parent L03 is complete.
 - Accepted platform decisions: retain scoped HEM functions, closely match the Windows terminal, and support raw-device editing.
 - Device policy: use read-only defaults and explicit writable mode. Permit a user-controlled override for mounted, in-use, or nonexclusive devices.
 - Product policy: do not block a supported, valid, local operation only because the operation is risky.
@@ -33,7 +33,7 @@ Read [UPSTREAM_REVIEW.md](UPSTREAM_REVIEW.md) for the historical and current Win
 - Reviewer: Astra xhigh performs all planning and review.
 - Publication: commit and push reviewed goals only to `origin/rust-rewrite`.
 - Astra High accepted the detailed 85-goal plan after text review; all implementation goals remain pending until explicit user authorization.
-- Current modified files: `README.md`, `PLAN.md`, `TRACKER.md`, `VERIFICATION.md`, three Rust files, and three terminal probes.
+- Current modified files: `PLAN.md`, `TRACKER.md`, and `src/paged.rs`.
 - Removed temporary file: `tests/paged_reads.rs`. The normal application target now compiles `src/paged.rs`.
 - Project folder: `/home/sweet_cicero/Projects/HView-Linux`.
 - Repository: [HView-Linux](https://github.com/lukecloud-cyber/HView-Linux).
@@ -144,7 +144,7 @@ Linux stores one `Vec<u8>` at `L:src/editor.rs:81`.
 
 | ID | Status | Deliverable | Why and context | Dependencies | Acceptance | Boundary |
 |---|---|---|---|---|---|---|
-| L03.1 | Pending | Add logical edit spans. | Large edits need current bytes without copying the complete source. | L02 | Check replacement, insertion, deletion, EOF, span splitting, merging, checked lengths, and reads across boundaries. | Preserve 65 MiB changed memory and 4,096 spans. Check limits before mutation. |
+| L03.1 | Complete | Add logical edit spans. | Large edits need current bytes without copying the complete source. | L02 | Check replacement, insertion, deletion, EOF, span splitting, merging, checked lengths, and reads across boundaries. | Preserve 65 MiB changed memory and 4,096 spans. Check limits before mutation. |
 | L03.2 | Pending | Extend operation history. | Logical spans must retain exact undo and redo state like buffered edits. | L03.1 | Check 256 records, 130 MiB history, cursor and length restoration, grouped nibbles, redo invalidation, and no-op preservation. | Reuse the existing history behavior. Refuse oversized operations atomically. |
 | L03.3 | Pending | Connect transactions to the edit lifecycle. | Save, cancel, and file switching can otherwise leave stale edit state. | L03.2 | Check all existing edit callers, baseline reset, canceled edits, source changes, and buffered or paged agreement. | Keep disk saving in L04. Add no separate transaction framework. |
 
@@ -483,6 +483,8 @@ The L02.2 serialized host suite passed all active tests.
 
 | Date | Change | Result | Next action |
 |---|---|---|---|
+| 2026-09-10 | Complete L03.1 logical edit spans. | Astra xhigh accepted the complete diff and required check evidence. The logical-span limits and atomic-refusal checks passed. | Publish L03.1. Then implement L03.2 under the recorded authorization. |
+| 2026-09-10 | Implement L03.1 logical edit spans. | The focused span tests and required Rust checks passed. | Have Astra xhigh review the complete candidate and evidence. |
 | 2026-09-10 | Complete L02.2 file-lifecycle integration. | All required checks and Astra xhigh review passed. | Publish L02.2 to `origin/rust-rewrite`. Then stop. |
 | 2026-09-10 | Implement L02.2 file-lifecycle integration. | The application and release terminal checks passed. The final host Rust suite passed. | Have Astra xhigh review the complete diff and evidence. |
 | 2026-09-10 | Start L02.2 file-lifecycle integration. | The user authorized L02.2 only. Astra xhigh bounded the implementation. | Connect the paged Hex view and its session lifecycle. |
@@ -620,6 +622,37 @@ The final serialized host suite passed 101 tests.
 One manual benchmark stayed ignored.
 The original sandbox and transient lock failures remain recorded with their rerun results.
 Large-file modes, editing, saving, search, and analysis remain pending under their assigned goals.
+
+### L03.1 implementation evidence
+
+| Command | Result |
+|---|---|
+| `cargo test --locked --offline paged::tests -- --test-threads=1` | Passed all 25 focused paged tests. |
+| `cargo fmt --all -- --check` | Passed. |
+| `cargo clippy --locked --offline --all-targets -- -D warnings` | Passed. |
+| `cargo build --locked --offline --release` | Passed. |
+| `cargo test --locked --offline --all-targets -- --test-threads=1` in the host environment | Passed 113 tests. One manual benchmark stayed ignored. |
+| `git diff --check` | Passed for the complete candidate. |
+
+`PagedFile` now stores one logical layout with source and immutable memory spans.
+Bounded reads combine the spans while they preserve source validation and owned output windows.
+
+One splice path supports replacement, insertion, and deletion without a complete source copy.
+The path checks the logical range and the supported Linux file-offset range before mutation.
+The path limits each operation to 64 MiB.
+
+The final layout permits at most 4,096 spans and 65 MiB of live storage.
+Live storage includes each span vector capacity and each complete unique memory allocation.
+Failed and equal-byte operations preserve the exact current layout.
+
+The focused tests cover EOF, empty files, span normalization, high offsets, and mixed boundary reads.
+The tests also cover operation limits, live-cost limits, source changes, atomic refusal, and a `Vec` byte oracle.
+L03.2 will add cursor state and retained operation history to the splice path.
+
+The L03.1 serialized host Rust suite passed all 113 active tests.
+One manual benchmark stayed ignored.
+Astra xhigh accepted the complete L03.1 diff and required check evidence.
+The logical-span limits and atomic-refusal checks passed.
 
 ## Current stage sequence
 
@@ -951,9 +984,8 @@ The findings and limits above remain the persistent evidence summary.
 9. Assign an authorized dependency-ready item to Sol xhigh.
 10. Record results and the next action in this tracker.
 
-Current resume action: publish accepted L02.2 only to `origin/rust-rewrite`.
-Then stop.
-L03.1 is the next item and remains unauthorized.
+Current resume action: publish accepted L03.1 to `origin/rust-rewrite`.
+Then implement L03.2 under the recorded L03 authorization.
 
 ## Historical D04 through D07 Windows review
 
