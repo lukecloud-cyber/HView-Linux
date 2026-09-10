@@ -4,7 +4,7 @@
 
 Review date: September 10, 2026.
 Windows source: clean local `master` at `469f13d0959d5bed7fbf068a7c4a5858be16d0a8`.
-Linux source: local `rust-rewrite` at `f9c5299f2f21d3531b8295d2d358dcc566cfcb24`.
+Linux branch: local and remote `rust-rewrite` at `1a3877a459aa7bea0f4e6f9d3249b1adb4554fdc`.
 The Linux application source remains the accepted D07 source.
 
 `W:` identifies `/home/sweet_cicero/Projects/HView-windows`.
@@ -232,9 +232,15 @@ The review did not run the Windows application, HEM modules, an external signatu
 The review did not run a current full PTY or isolated-package suite.
 September 5 package and regression results remain historical evidence.
 
-The exact next action is the user-authorized L01.2 planning item.
-Record application implementation authorization and identify L02.1 as the first application item.
-Keep the application gate closed until L01.2 records its scope.
+The user authorized L01.2 and scoped application work on L02.1.
+Current application authorization covers L02.1 only.
+L02.1 adds owned bounded regular-file reads with 64 KiB windows and `u64` offsets.
+The item preserves bounded allocation, short reads, EOF behavior, and actual I/O errors.
+Acceptance includes files above 64 MiB and 4 GiB.
+File-lifecycle integration remains in L02.2.
+
+The exact next action is: Plan L02.1 with Astra xhigh.
+Assign its bounded implementation to Sol xhigh under the recorded authorization.
 
 ## Historical update reviews
 

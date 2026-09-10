@@ -18,10 +18,14 @@ HView-Linux is a powerful local hacker toolkit.
 Zero refusals means the product does not block a supported, valid, local operation only because the operation is risky.
 Invalid requests, unsupported requests, permission errors, and operating-system or I/O failures must return accurate errors.
 
-The user authorized the L01.1 and L01.2 planning work.
-L01.1 is complete.
-Application implementation remains unauthorized until L01.2 records its scope.
-Keep all application items `Pending`.
+L01.1 and L01.2 are complete.
+The user authorized scoped application work on L02.1.
+Current application authorization covers L02.1 only.
+Keep L02.1 and all other application items `Pending` until their work starts.
+Do not infer authorization for another backlog item.
+
+Plan L02.1 with Astra xhigh.
+Assign its bounded implementation to Sol xhigh under the recorded authorization.
 
 Use Astra xhigh (`gpt-6-astra`, effort `xhigh`) for all planning and review.
 Use Sol xhigh subagents (`gpt-5.6-sol`, effort `xhigh`) for all other work.
@@ -33,9 +37,10 @@ Sol xhigh also runs all checks.
 | Project | Commit and branch | State |
 |---|---|---|
 | HView-Windows | `469f13d0959d5bed7fbf068a7c4a5858be16d0a8`, `master` | Clean local parity source |
-| HView-Linux | `f9c5299f2f21d3531b8295d2d358dcc566cfcb24`, `rust-rewrite` | Accepted D07 application source |
+| HView-Linux | `1a3877a459aa7bea0f4e6f9d3249b1adb4554fdc`, `rust-rewrite` | Published L01.1 records; accepted D07 application source at `5e4ef68` |
 
 The D03 release and D04 through D07 extension remain accepted historical evidence.
+The remote `rust-rewrite` branch matched the L01.1 commit after publication.
 The older D09-only plan no longer defines current scope or task order.
 The existing product name, package name, branch, and repository setup remain unchanged.
 
@@ -166,7 +171,7 @@ Use disposable virtual devices for tests.
 
 | Stage | Tracker tasks | Exit condition |
 |---|---|---|
-| User review | L01 | The user approves implementation and the platform contracts. |
+| Authorization records | L01 | Accepted platform contracts and scoped application authorization are recorded. |
 | Shared foundation | L02-L06, L15 | Bounded storage, transactions, saves, Text indexes, cancellation, and terminal contracts pass. |
 | Addresses and edit dependencies | L07-L10, L13, L14 | Architectures, mappings, navigation, previews, hashes, and annotations pass. |
 | Product workflows | L11, L12, L16-L24 | Editing, analysis, Unicode, controls, Names, configuration, and file workflows pass. |

@@ -10,14 +10,14 @@ Read [UPSTREAM_REVIEW.md](UPSTREAM_REVIEW.md) for the historical and current Win
 
 - Current scope: all implemented functions in Windows commit `469f13d0959d5bed7fbf068a7c4a5858be16d0a8`.
 - Current Windows source: clean local `master` at `469f13d0959d5bed7fbf068a7c4a5858be16d0a8`.
-- Current Linux source: local `rust-rewrite` at `f9c5299f2f21d3531b8295d2d358dcc566cfcb24`.
+- Current Linux branch: local and remote `rust-rewrite` at `1a3877a459aa7bea0f4e6f9d3249b1adb4554fdc`.
 - Accepted Linux application baseline: D07 source at `5e4ef68`.
-- Current authorization: L01.1 planning records only.
-- Planning status: L01.1 is `Complete`. L01.2 is user-authorized and remains `Pending` until work starts.
-- Application implementation: L01.2 and all application items remain `Pending`.
-- Detailed plan: one current child is `Complete`; 84 current children are `Pending`.
-- Next action: execute L01.2. Record application authorization and identify L02.1 as the first application item.
-- Review gate: do not start application code, tests, build scripts, or dependency changes before user approval.
+- Current authorization: scoped application work on L02.1 only.
+- Planning status: L01.1, L01.2, and parent L01 are `Complete`.
+- Application implementation: L02.1 is authorized and `Pending`. All other application items remain `Pending` and unauthorized.
+- Detailed plan: two current children are `Complete`; 83 children are `Pending`.
+- Next action: Plan L02.1 with Astra xhigh. Assign its bounded implementation to Sol xhigh under the recorded authorization.
+- Review gate: L02.1 is authorized. Do not add another approval gate for L02.1.
 - Accepted platform decisions: retain scoped HEM functions, closely match the Windows terminal, and support raw-device editing.
 - Device policy: use read-only defaults and explicit writable mode. Permit a user-controlled override for mounted, in-use, or nonexclusive devices.
 - Product policy: do not block a supported, valid, local operation only because the operation is risky.
@@ -30,9 +30,9 @@ Read [UPSTREAM_REVIEW.md](UPSTREAM_REVIEW.md) for the historical and current Win
 - Execution owner: Sol xhigh performs all execution and code generation.
 - Sol xhigh creates documentation, application code, tests, and build scripts. Sol xhigh also runs all checks.
 - Reviewer: Astra xhigh performs all planning and review.
-- Publication: after Astra xhigh acceptance, commit and push only to `origin/rust-rewrite`.
+- Publication: commit and push reviewed goals only to `origin/rust-rewrite`.
 - Astra High accepted the detailed 85-goal plan after text review; all implementation goals remain pending until explicit user authorization.
-- Current modified records: `AGENTS.md`, `PLAN.md`, `TRACKER.md`, and `UPSTREAM_REVIEW.md`.
+- Current modified records: `PLAN.md`, `TRACKER.md`, and `UPSTREAM_REVIEW.md`.
 - Project folder: `/home/sweet_cicero/Projects/HView-Linux`.
 - Repository: [HView-Linux](https://github.com/lukecloud-cyber/HView-Linux).
 
@@ -66,7 +66,7 @@ Each task stays at its recorded status until its checks and Astra acceptance pas
 
 | ID | Upstream work | Coverage | Dependencies | Required task | Required acceptance |
 |---|---|---|---|---|---|
-| L01 | P01-P07, X03 | Partial records | None | Record the accepted HEM, terminal, and device scope. Resolve path and process-control proposals. | Obtain user approval for the complete implementation plan. Do not start implementation before approval. |
+| L01 | P01-P07, X03 | Complete records | None | Record the accepted HEM, terminal, device, path, and process-control contracts. | Record scoped application authorization and identify the first dependency-ready application item. |
 | L02 | S01, REQ01 | Missing | L01 | Add bounded regular-file access with stable ownership and `u64` positions. | Check files above 64 MiB, 4 GiB, and memory limits. Check both ends and source changes. |
 | L03 | S02, D07, REQ01/10 | Partial | L02 | Add logical spans and current edit transactions. Retain exact buffered undo state. | Check 256 records, 130 MiB history, 65 MiB changed memory, and 4,096 spans. Check atomic refusal. |
 | L04 | S02, R03/R04 | Scale missing | L03 | Extend guarded Linux saves to logical spans and sparse files. | Check metadata, ACLs, identities, holes, races, reopening, failures, and recovery paths. |
@@ -122,7 +122,7 @@ The user accepted the HEM exclusion, terminal direction, and device override.
 | ID | Status | Deliverable | Why and context | Dependencies | Acceptance | Boundary |
 |---|---|---|---|---|---|---|
 | L01.1 | Complete | Record implementation contracts. | Native path, legacy OEM, scanner containment, and source-comment contracts have durable records. | None | Documentation checks and Astra xhigh acceptance passed. | Planning only. No application file changed. |
-| L01.2 | Pending | Record application implementation authorization. | The user authorized L01.2 planning work. The application gate stays closed until L01.2 records its scope. | L01.1 | Record application authorization and identify L02.1 as the first application item. | Do not change application code, tests, build scripts, or dependencies until L01.2 records authorization. |
+| L01.2 | Complete | Record application implementation authorization. | The user authorized L01.2 and scoped application work on L02.1. | L01.1 | Documentation checks and Astra xhigh acceptance passed. | Planning only. Do not start L02.1 during this documentation child. |
 
 ### L02: bounded regular-file storage
 
@@ -479,6 +479,8 @@ The current full Rust suite has an environment-limited ACL failure.
 
 | Date | Change | Result | Next action |
 |---|---|---|---|
+| 2026-09-10 | Complete L01.2 authorization records. | The records authorize L02.1 only. Documentation checks and Astra xhigh review passed. | Plan L02.1 with Astra xhigh. Assign its bounded implementation to Sol xhigh under the recorded authorization. |
+| 2026-09-10 | Publish L01.1 implementation contracts. | Commit `1a3877a459aa7bea0f4e6f9d3249b1adb4554fdc` reached `HView-Linux` `rust-rewrite`. Remote verification matched. | Execute L01.2. |
 | 2026-09-10 | Complete L01.1 implementation contracts. | Documentation checks and Astra xhigh review passed. Application files remain unchanged. | Execute the user-authorized L01.2 planning item. |
 | 2026-09-10 | Update the current model assignment. | Astra xhigh performs all planning and review. Sol xhigh performs all other work and runs all checks. Historical model evidence remains unchanged. | Start the first user-authorized tracker item. |
 | 2026-09-10 | Split L01 through L33 into 85 small logical child goals. | The tracker records purpose, source context, dependencies, acceptance, boundaries, and independent Pending status. No application source or check result changed. | Obtain independent Astra review. Then present the detailed plan for user review before application implementation. |
@@ -498,11 +500,27 @@ Astra xhigh accepted L01.1 on September 10, 2026.
 The review confirmed native pathname handling, strict OEM conversion, scanner limits, accepted platform policies, and educational source comments.
 Documentation checks passed. Application files remain unchanged.
 
+### L01.2 documentation evidence
+
+| Command | Result |
+|---|---|
+| `git diff -- PLAN.md TRACKER.md UPSTREAM_REVIEW.md` | Inspected the complete L01.2 documentation diff. |
+| `git diff --check` | Passed. |
+| `rg -n "Current authorization:\|L01\\.2\|L02\\.1\|L02\\.2\|approval gate\|application authorization covers" PLAN.md TRACKER.md UPSTREAM_REVIEW.md` | Verified the authorization boundary, selected item, dependencies, and current status. |
+| `git diff --name-only -- src tests scripts Cargo.toml Cargo.lock .github AGENTS.md` | Produced no output. Application files and AGENTS.md remain unchanged. |
+
+No application suite ran because L01.2 changes documentation only.
+
+Astra xhigh accepted L01.2 on September 10, 2026.
+The user instruction ‘k, do the next thing’ authorizes the next selected item.
+Current application authorization covers L02.1 only.
+Documentation checks passed. Application files remain unchanged.
+
 ## Current stage sequence
 
 | Stage | Tasks | Exit condition |
 |---|---|---|
-| User review | L01 | The user approves implementation and the required platform contracts. |
+| Authorization records | L01 | Accepted platform contracts and scoped application authorization are recorded. |
 | Shared foundation | L02-L06, L15 | Bounded storage, transactions, saves, Text indexing, cancellation, and terminal contracts pass. |
 | Addresses and edit dependencies | L07-L10, L13, L14 | Architectures, mappings, navigation, previews, hashing, and annotation state pass. |
 | Product workflows | L11, L12, L16-L24 | Editing, analysis, Unicode, controls, Names, configuration, and file workflows pass. |
@@ -824,13 +842,12 @@ The findings and limits above remain the persistent evidence summary.
 5. Resolve any difference before selecting the next task.
 6. Use Astra xhigh for all planning and review.
 7. Use Sol xhigh for all execution, code generation, and check runs.
-8. Obtain user approval before application implementation.
-9. After approval, assign the next dependency-ready task to Sol xhigh.
+8. Check recorded authorization before application implementation.
+9. Assign an authorized dependency-ready item to Sol xhigh.
 10. Record results and the next action in this tracker.
 
-Current resume action: execute the user-authorized L01.2 planning item.
-Record application implementation authorization and identify L02.1 as the first application item.
-Keep the application gate closed until L01.2 records its scope.
+Current resume action: Plan L02.1 with Astra xhigh.
+Assign its bounded implementation to Sol xhigh under the recorded authorization.
 
 ## Historical D04 through D07 Windows review
 
