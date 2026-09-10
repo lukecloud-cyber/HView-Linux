@@ -356,6 +356,53 @@ def check_paged_saves(binary: Path, root: Path) -> None:
     if read_at(destination, 4) != b"\xcdXYZ":
         raise AssertionError("Paged Save As did not publish the logical bytes.")
 
+    # An existing Save As destination causes a reachable prepublication refusal.
+    # Undo, Redo, modal dismissal, and cancellation must retain the active paged edit session.
+    refusal_source = root / "paged-refusal-source.bin"
+    refusal_destination = root / "paged-refusal-destination.bin"
+    sparse_file(refusal_source, length, [(0, b"WXYZ"), (length - 1, b"R")])
+    refusal_destination.write_bytes(b"occupied")
+    output = run_session(
+        binary,
+        ["--mode=hex", str(refusal_source)],
+        [
+            ALT_E,
+            b"ab",
+            b"cd",
+            CTRL_Z,
+            CTRL_S,
+            os.fsencode(refusal_destination),
+            b"\r",
+            b"\r",
+            CTRL_Y,
+            CTRL_Z,
+            CTRL_Z,
+            CTRL_Y,
+            ESCAPE,
+            CTRL_Q,
+        ],
+        address_limit_bytes=ADDRESS_LIMIT,
+    )
+    require(
+        output,
+        b"The Save As destination already exists.",
+        "Paged Save As did not report the existing destination.",
+    )
+    require_order(
+        output,
+        b"AB CD 59 5A",
+        b"AB 58 59 5A",
+        b"AB CD 59 5A",
+        b"AB 58 59 5A",
+        b"57 58 59 5A",
+        b"AB 58 59 5A",
+        b"57 58 59 5A",
+    )
+    if refusal_destination.read_bytes() != b"occupied":
+        raise AssertionError("Paged Save As changed the existing destination.")
+    if read_at(refusal_source, 4) != b"WXYZ":
+        raise AssertionError("Paged Save As refusal changed the original source.")
+
     # One high-offset replacement proves the save remains bounded below the 4 GiB fixture size.
     # Sparse target and backup allocation must remain small after publication.
     high_length = (1 << 32) + 0x2000
