@@ -1,3 +1,8 @@
 /target/
 __pycache__/
 *.py[cod]
+AGENTS.md
+PLAN.md
+TRACKER.md
+UPSTREAM_REVIEW.md
+VERIFICATION.md

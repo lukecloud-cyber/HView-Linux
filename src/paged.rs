@@ -3,10 +3,13 @@ This module selects buffered or paged storage from one regular-file handle.
 The paged form reads small windows at u64 offsets.
 The handle keeps the opened source stable when its pathname changes.
 Metadata checks reject detected source changes before or after each read.
+Staged writes stream logical spans without loading the complete source.
 */
 use std::collections::{HashSet, VecDeque};
+use std::ffi::c_int;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,6 +21,8 @@ Each logical splice removes and inserts at most 64 MiB.
 One live layout uses at most 65 MiB and 4,096 spans.
 O_NONBLOCK lets open return before a FIFO supplies a writer.
 The metadata check then rejects every nonregular source.
+
+SEEK_DATA and SEEK_HOLE identify allocated source extents for sparse staging.
 */
 pub(crate) const BUFFERED_FILE_LIMIT: u64 = 64 * 1024 * 1024;
 pub(crate) const MAX_READ_BYTES: usize = 64 * 1024;
@@ -27,6 +32,23 @@ const EDIT_HISTORY_BYTES: usize = 130 * 1024 * 1024;
 const CHANGED_BYTES_LIMIT: usize = 65 * 1024 * 1024;
 const CHANGED_RANGES_LIMIT: usize = 4096;
 const O_NONBLOCK: i32 = 0o4000;
+const SEEK_DATA: c_int = 3;
+const SEEK_HOLE: c_int = 4;
+const ENXIO: i32 = 6;
+const EINVAL: i32 = 22;
+const ENOSYS: i32 = 38;
+const EOPNOTSUPP: i32 = 95;
+
+/*
+Linux exposes sparse-file extents through lseek on the owned source descriptor.
+The project target uses a signed 64-bit off_t, which matches the supported file-offset range.
+Extent visibility depends on the source filesystem and its SEEK_DATA and SEEK_HOLE implementation.
+Unsupported extent queries use a bounded scan that leaves all-zero chunks sparse.
+Other query failures keep their operating-system errors.
+*/
+unsafe extern "C" {
+    fn lseek(fd: c_int, offset: i64, whence: c_int) -> i64;
+}
 
 /*
 Logical spans refer to immutable source bytes or immutable changed bytes.
@@ -255,8 +277,8 @@ pub(crate) struct PagedFile {
 }
 
 /*
-These methods open, validate, classify, and read one owned regular-file descriptor.
-All published data passes source validation before and after its read operation.
+These methods open, validate, classify, read, and stage one owned regular-file descriptor.
+All published data passes source validation before and after its source operation.
 */
 impl PagedFile {
     /*
@@ -503,6 +525,338 @@ impl PagedFile {
             }
         }
         Ok(())
+    }
+
+    /*
+    This check proves that each logical span fits its backing source or memory allocation.
+    It also proves that the ordered span lengths equal the recorded logical length.
+    The signed ceiling keeps every later Linux file offset representable.
+    A failure occurs before the staging file changes.
+    */
+    fn validate_staged_layout(&self) -> io::Result<()> {
+        if self.layout.len > i64::MAX as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "The staged file length exceeds the supported Linux file-offset range.",
+            ));
+        }
+
+        let mut logical = 0_u64;
+        for span in &self.layout.spans {
+            match span {
+                DataSpan::Source { start, len } => {
+                    start
+                        .checked_add(*len)
+                        .filter(|end| *end <= self.stamp.len)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "A source span is outside the captured source.",
+                            )
+                        })?;
+                }
+                DataSpan::Memory { bytes, start, len } => {
+                    start
+                        .checked_add(*len)
+                        .filter(|end| *end <= bytes.len())
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "A memory span is outside its allocation.",
+                            )
+                        })?;
+                }
+            }
+            logical = logical.checked_add(span.len()).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "The staged layout exceeds the address range.",
+                )
+            })?;
+        }
+        if logical != self.layout.len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "The staged layout length is inconsistent.",
+            ));
+        }
+        Ok(())
+    }
+
+    /*
+    This helper asks Linux for the next source data or hole offset.
+    Positioned reads do not use the shared offset changed by lseek.
+    The caller handles ENXIO only where Linux defines the result as normal completion.
+    */
+    fn seek_extent(&self, offset: u64, whence: c_int) -> io::Result<u64> {
+        let offset = i64::try_from(offset).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "The source extent exceeds the supported Linux file-offset range.",
+            )
+        })?;
+        // SAFETY: The owned file keeps the descriptor valid for this call.
+        let result = unsafe { lseek(self.file.as_raw_fd(), offset, whence) };
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(result as u64)
+        }
+    }
+
+    /*
+    This helper copies one source range to its mapped logical destination.
+    The fixed stack buffer keeps every source read and destination write at 64 KiB or less.
+    All-zero chunks stay sparse even when a filesystem reports coarse data extents.
+    Standard exact positioned I/O handles interruptions and incomplete operations.
+    */
+    fn copy_source_extent(
+        &self,
+        output: &File,
+        mut source: u64,
+        mut destination: u64,
+        end: u64,
+    ) -> io::Result<()> {
+        let mut chunk = [0_u8; MAX_READ_BYTES];
+        while source < end {
+            let count = usize::try_from((end - source).min(MAX_READ_BYTES as u64)).unwrap();
+            self.file.read_exact_at(&mut chunk[..count], source)?;
+            if chunk[..count].iter().any(|byte| *byte != 0) {
+                output.write_all_at(&chunk[..count], destination)?;
+            }
+            source = source.checked_add(count as u64).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "The source extent exceeds the address range.",
+                )
+            })?;
+            destination = destination.checked_add(count as u64).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "The staged destination exceeds the address range.",
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    /*
+    This fallback scans one source span when its filesystem does not expose sparse extents.
+    The fixed buffer bounds memory and each positioned read to 64 KiB.
+    All-zero chunks need no write because the fresh staging file already contains a hole.
+    Nonzero chunks preserve exact bytes and complete writes.
+    */
+    fn write_source_span_bounded(
+        &self,
+        output: &File,
+        source: u64,
+        len: u64,
+        destination: u64,
+    ) -> io::Result<()> {
+        let end = source.checked_add(len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "The source span exceeds the address range.",
+            )
+        })?;
+        self.copy_source_extent(output, source, destination, end)
+    }
+
+    /*
+    These Linux errors mean that the descriptor or filesystem lacks usable extent queries.
+    The staging writer can then preserve bytes through the bounded zero-aware scan.
+    Other errors identify actual query failures and must remain unchanged.
+    */
+    fn extent_query_is_unsupported(error: &io::Error) -> bool {
+        matches!(error.raw_os_error(), Some(EINVAL | ENOSYS | EOPNOTSUPP))
+    }
+
+    /*
+    This helper maps allocated parts of one source span into the staging file.
+    SEEK_DATA skips source holes, and SEEK_HOLE bounds each copied data extent.
+    ENXIO from SEEK_DATA means that the source span has no more allocated data.
+    An unsupported query selects the bounded zero-aware scan for the complete span.
+    Every accepted extent result must move forward to prevent an endless walk.
+    */
+    fn write_source_span_with<F>(
+        &self,
+        output: &File,
+        source_start: u64,
+        len: u64,
+        logical_start: u64,
+        mut seek: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(u64, c_int) -> io::Result<u64>,
+    {
+        let source_end = source_start.checked_add(len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "The source span exceeds the address range.",
+            )
+        })?;
+        let mut search = source_start;
+        while search < source_end {
+            let data = match seek(search, SEEK_DATA) {
+                Ok(data) => data,
+                Err(error) if error.raw_os_error() == Some(ENXIO) => break,
+                Err(error) if Self::extent_query_is_unsupported(&error) => {
+                    return self.write_source_span_bounded(
+                        output,
+                        source_start,
+                        len,
+                        logical_start,
+                    );
+                }
+                Err(error) => return Err(error),
+            };
+            if data < search {
+                return Err(io::Error::other(
+                    "The source extent query did not move forward.",
+                ));
+            }
+            if data >= source_end {
+                break;
+            }
+
+            let hole = match seek(data, SEEK_HOLE) {
+                Ok(hole) => hole,
+                Err(error) if Self::extent_query_is_unsupported(&error) => {
+                    return self.write_source_span_bounded(
+                        output,
+                        source_start,
+                        len,
+                        logical_start,
+                    );
+                }
+                Err(error) => return Err(error),
+            };
+            if hole <= data {
+                return Err(io::Error::other(
+                    "The source hole query did not move forward.",
+                ));
+            }
+            let extent_end = hole.min(source_end);
+            let destination = logical_start
+                .checked_add(data - source_start)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "The staged destination exceeds the address range.",
+                    )
+                })?;
+            self.copy_source_extent(output, data, destination, extent_end)?;
+            search = extent_end;
+        }
+        Ok(())
+    }
+
+    /*
+    This helper writes one immutable memory span into its exact logical destination.
+    Memory bytes always override a source hole, including an all-zero replacement.
+    Each positioned write stays within the shared allocation and the 64 KiB operation bound.
+    */
+    fn write_memory_span(output: &File, bytes: &[u8], mut destination: u64) -> io::Result<()> {
+        for chunk in bytes.chunks(MAX_READ_BYTES) {
+            output.write_all_at(chunk, destination)?;
+            destination = destination.checked_add(chunk.len() as u64).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "The staged destination exceeds the address range.",
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    /*
+    This helper streams the current logical layout with one extent-query function.
+    The caller supplies a fresh, empty regular file that does not identify the source.
+    Validation and range checks occur before the first output change.
+    The final source check prevents publication of bytes from a detected changed source.
+    The method cannot change edit layouts, history, cursors, grouping, or the source stamp.
+    */
+    fn write_staged_with<F>(&self, output: &File, mut seek: F) -> io::Result<()>
+    where
+        F: FnMut(u64, c_int) -> io::Result<u64>,
+    {
+        /*
+        First, reject invalid staging identities and contents before any truncation or write.
+        Descriptor identity checks do not depend on a pathname or text conversion.
+        */
+        let output_metadata = output.metadata()?;
+        if !output_metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "The staging output is not a regular file.",
+            ));
+        }
+        if output_metadata.dev() == self.stamp.device && output_metadata.ino() == self.stamp.inode {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "The staging output identifies the source file.",
+            ));
+        }
+        if output_metadata.len() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "The staging output is not empty.",
+            ));
+        }
+        self.validate_staged_layout()?;
+        self.validate()?;
+
+        /*
+        Next, set the final length so skipped source holes and trailing holes stay sparse.
+        The span walk maps source extents and memory bytes to checked logical positions.
+        */
+        output.set_len(self.layout.len)?;
+        let mut logical = 0_u64;
+        for span in &self.layout.spans {
+            match span {
+                DataSpan::Source { start, len } => {
+                    self.write_source_span_with(output, *start, *len, logical, &mut seek)?;
+                }
+                DataSpan::Memory { bytes, start, len } => {
+                    let end = start.checked_add(*len).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "The memory span exceeds the address range.",
+                        )
+                    })?;
+                    let selected = bytes.get(*start..end).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "The memory span is outside its allocation.",
+                        )
+                    })?;
+                    Self::write_memory_span(output, selected, logical)?;
+                }
+            }
+            logical = logical.checked_add(span.len()).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "The staged layout exceeds the address range.",
+                )
+            })?;
+        }
+
+        /*
+        Finally, flush the complete staging file before the second source validation.
+        A failure leaves only the private output with possible partial bytes.
+        */
+        output.sync_all()?;
+        self.validate()
+    }
+
+    /*
+    This public component operation supplies real Linux queries to the staging helper.
+    Later guarded publication code can use the completed private file without a full source copy.
+    L04.2 will remove the temporary dead-code allowance when it connects guarded publication.
+    */
+    #[allow(dead_code)]
+    pub(crate) fn write_staged(&self, output: &File) -> io::Result<()> {
+        self.write_staged_with(output, |offset, whence| self.seek_extent(offset, whence))
     }
 
     /*
@@ -1104,14 +1458,14 @@ mod tests {
     */
     use super::{
         BLOCK_BYTES, BUFFERED_FILE_LIMIT, CHANGED_BYTES_LIMIT, CHANGED_RANGES_LIMIT, DataSpan,
-        EDIT_HISTORY_BYTES, EDIT_HISTORY_LIMIT, EditRecord, Layout, MAX_READ_BYTES, OpenedSource,
-        PagedEditCursor, PagedFile, open_source,
+        EDIT_HISTORY_BYTES, EDIT_HISTORY_LIMIT, EINVAL, EditRecord, Layout, MAX_READ_BYTES,
+        OpenedSource, PagedEditCursor, PagedFile, SEEK_DATA, SourceStamp, open_source,
     };
     use std::ffi::CString;
     use std::fs::{self, File, FileTimes, OpenOptions};
     use std::io;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
-    use std::os::unix::fs::FileExt;
+    use std::os::unix::fs::{FileExt, MetadataExt};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1201,6 +1555,108 @@ mod tests {
     }
 
     /*
+    This helper creates one empty regular file for direct staging tests.
+    Read access lets each test inspect selected output bytes through positioned I/O.
+    The exclusive create operation keeps accidental reuse visible as a test error.
+    */
+    fn staging_file(path: &Path) -> io::Result<File> {
+        OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(path)
+    }
+
+    /*
+    One layout snapshot records logical length, span capacity, and backing identities.
+    Staging tests use this value for the current layout and each alternate history layout.
+    */
+    #[derive(Debug, Eq, PartialEq)]
+    struct LayoutSignature {
+        len: u64,
+        spans: Vec<(u8, u64, u64, usize)>,
+        span_capacity: usize,
+    }
+
+    /*
+    One record snapshot combines its alternate layout with cursor and grouping state.
+    Separate undo and redo vectors preserve both history order and ownership details.
+    */
+    #[derive(Debug, Eq, PartialEq)]
+    struct RecordSignature {
+        alternate: LayoutSignature,
+        before_cursor: PagedEditCursor,
+        after_cursor: PagedEditCursor,
+        hex_group: bool,
+        group_start: u64,
+        group_len: usize,
+    }
+
+    /*
+    One edit snapshot records the state that a staging operation must not change.
+    The snapshot includes the current layout, histories, mode, byte cost, and source stamp.
+    */
+    #[derive(Debug, Eq, PartialEq)]
+    struct EditStateSignature {
+        layout: LayoutSignature,
+        editing: bool,
+        undo: Vec<RecordSignature>,
+        redo: Vec<RecordSignature>,
+        history_bytes: usize,
+        stamp: SourceStamp,
+    }
+
+    /*
+    This helper captures one layout without copying source or memory bytes.
+    Memory pointer identities show whether staging replaces a backing allocation.
+    */
+    fn layout_state_signature(layout: &Layout) -> LayoutSignature {
+        LayoutSignature {
+            len: layout.len,
+            spans: layout_signature(layout),
+            span_capacity: layout.spans.capacity(),
+        }
+    }
+
+    /*
+    This helper captures one history record and its complete alternate layout description.
+    The returned value also keeps every cursor and nibble-group field.
+    */
+    fn record_state_signature(record: &EditRecord) -> RecordSignature {
+        RecordSignature {
+            alternate: layout_state_signature(&record.alternate),
+            before_cursor: record.before_cursor,
+            after_cursor: record.after_cursor,
+            hex_group: record.hex_group,
+            group_start: record.group_start,
+            group_len: record.group_len,
+        }
+    }
+
+    /*
+    This helper captures one complete edit snapshot before a staging operation.
+    Tests compare the returned value after success or failure.
+    */
+    fn edit_state_signature(source: &PagedFile) -> EditStateSignature {
+        EditStateSignature {
+            layout: layout_state_signature(&source.layout),
+            editing: source.editing,
+            undo: source
+                .undo_history
+                .iter()
+                .map(record_state_signature)
+                .collect(),
+            redo: source
+                .redo_history
+                .iter()
+                .map(record_state_signature)
+                .collect(),
+            history_bytes: source.history_bytes,
+            stamp: source.stamp,
+        }
+    }
+
+    /*
     This helper collects a complete logical view through normal bounded windows.
     Small tests use the result as a direct byte oracle after structural edits.
     */
@@ -1273,6 +1729,301 @@ mod tests {
         let before = cursor(start, start, false);
         let after = cursor(start + replacement.len() as u64, start, false);
         source.splice_bytes(start, remove_len, replacement, before, after, false)
+    }
+
+    /*
+    These staged writes cover unchanged bytes and each structural edit kind.
+    One changed range crosses the 64 KiB boundary, and one insertion grows EOF.
+    The output keeps exact bytes and length while the source keeps all edit state.
+    A complete deletion also produces an empty staged file.
+    */
+    #[test]
+    fn staged_writes_preserve_logical_bytes_lengths_and_edit_state() -> io::Result<()> {
+        let fixture = Fixture::new("staged-logical")?;
+        let source_path = fixture.file("source.bin");
+        let original: Vec<u8> = (0..MAX_READ_BYTES * 2 + 37)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        fs::write(&source_path, &original)?;
+        let mut source = PagedFile::open(&source_path)?;
+
+        let unchanged_path = fixture.file("unchanged.stage");
+        let unchanged = staging_file(&unchanged_path)?;
+        source.write_staged(&unchanged)?;
+        assert_eq!(fs::read(&unchanged_path)?, original);
+        assert_eq!(unchanged.metadata()?.len(), original.len() as u64);
+
+        let mut expected = original.clone();
+        let replace_start = MAX_READ_BYTES - 4;
+        assert!(splice(
+            &mut source,
+            replace_start as u64,
+            9,
+            b"replacement"
+        )?);
+        expected.splice(
+            replace_start..replace_start + 9,
+            b"replacement".iter().copied(),
+        );
+        let insert_at = expected.len();
+        assert!(splice(&mut source, insert_at as u64, 0, b"tail")?);
+        expected.extend_from_slice(b"tail");
+        assert!(splice(&mut source, 7, 11, b"")?);
+        expected.drain(7..18);
+
+        let state = edit_state_signature(&source);
+        let changed_path = fixture.file("changed.stage");
+        let changed = staging_file(&changed_path)?;
+        source.write_staged(&changed)?;
+        assert_eq!(fs::read(&changed_path)?, expected);
+        assert_eq!(changed.metadata()?.len(), expected.len() as u64);
+        assert_eq!(edit_state_signature(&source), state);
+
+        let deleted_path = fixture.file("deleted-source.bin");
+        fs::write(&deleted_path, b"delete all bytes")?;
+        let mut deleted = PagedFile::open(&deleted_path)?;
+        let deleted_len = deleted.len();
+        assert!(splice(&mut deleted, 0, deleted_len, b"")?);
+        let empty_path = fixture.file("empty.stage");
+        let empty = staging_file(&empty_path)?;
+        deleted.write_staged(&empty)?;
+        assert_eq!(empty.metadata()?.len(), 0);
+        assert!(fs::read(&empty_path)?.is_empty());
+        Ok(())
+    }
+
+    /*
+    This injected unsupported query selects the production bounded scan deterministically.
+    The source has separate zero and nonzero 64 KiB chunks plus one memory replacement.
+    The output keeps exact bytes and uses little storage for skipped zero chunks.
+    Another injected query error must keep its operating-system error and edit state.
+    */
+    #[test]
+    fn unsupported_extent_queries_use_the_bounded_sparse_scan() -> io::Result<()> {
+        let fixture = Fixture::new("staged-fallback")?;
+        let source_path = fixture.file("source.bin");
+        let len = MAX_READ_BYTES * 8;
+        sparse_file(
+            &source_path,
+            len as u64,
+            &[
+                (MAX_READ_BYTES as u64 + 3, b"FIRST"),
+                (MAX_READ_BYTES as u64 * 5 + 7, b"SECOND"),
+                (len as u64 - 1, b"Z"),
+            ],
+        )?;
+        let mut source = PagedFile::open(&source_path)?;
+        let changed = MAX_READ_BYTES as u64 * 3 + 9;
+        assert!(splice(&mut source, changed, 1, b"M")?);
+        let state = edit_state_signature(&source);
+
+        let output_path = fixture.file("fallback.stage");
+        let output = staging_file(&output_path)?;
+        source.write_staged_with(&output, |_, _| Err(io::Error::from_raw_os_error(EINVAL)))?;
+        let mut expected = vec![0_u8; len];
+        expected[MAX_READ_BYTES + 3..MAX_READ_BYTES + 8].copy_from_slice(b"FIRST");
+        expected[MAX_READ_BYTES * 5 + 7..MAX_READ_BYTES * 5 + 13].copy_from_slice(b"SECOND");
+        expected[len - 1] = b'Z';
+        expected[changed as usize] = b'M';
+        assert_eq!(fs::read(&output_path)?, expected);
+        assert_eq!(output.metadata()?.len(), len as u64);
+        assert!(output.metadata()?.blocks() * 512 < (MAX_READ_BYTES * 5) as u64);
+        assert_eq!(edit_state_signature(&source), state);
+
+        let error_path = fixture.file("query-error.stage");
+        let error_output = staging_file(&error_path)?;
+        let error = source
+            .write_staged_with(&error_output, |_, _| Err(io::Error::from_raw_os_error(5)))
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(5));
+        assert_eq!(edit_state_signature(&source), state);
+        Ok(())
+    }
+
+    /*
+    This real extent walk stages a sparse edited source above the 4 GiB boundary.
+    Structural insertion and deletion shift later source spans to new logical positions.
+    A memory byte inside a source hole becomes allocated output data.
+    Selected reads prove the mapped bytes without a complete large-file allocation.
+    */
+    #[test]
+    fn sparse_staging_maps_shifted_spans_above_four_gib() -> io::Result<()> {
+        let fixture = Fixture::new("staged-sparse-high")?;
+        let source_path = fixture.file("source.bin");
+        let high = 4 * 1024 * 1024 * 1024_u64 + 123;
+        let source_len = high + MAX_READ_BYTES as u64 * 2 + 1;
+        sparse_file(
+            &source_path,
+            source_len,
+            &[(0, b"HEAD"), (high, b"HIGH"), (source_len - 1, b"Z")],
+        )?;
+        let mut source = PagedFile::open(&source_path)?;
+        let extent = source.seek_extent(0, SEEK_DATA)?;
+        assert_eq!(extent, 0);
+
+        assert!(splice(&mut source, 0, 0, b"I")?);
+        assert!(splice(&mut source, 2, 2, b"")?);
+        let changed_source = high - MAX_READ_BYTES as u64;
+        let changed_logical = changed_source - 1;
+        assert!(splice(&mut source, changed_logical, 1, b"M")?);
+        let state = edit_state_signature(&source);
+
+        let output_path = fixture.file("sparse.stage");
+        let output = staging_file(&output_path)?;
+        source.write_staged(&output)?;
+        assert_eq!(output.metadata()?.len(), source_len - 1);
+        let mut prefix = [0_u8; 3];
+        output.read_exact_at(&mut prefix, 0)?;
+        assert_eq!(&prefix, b"IHD");
+        let mut changed_byte = [0_u8; 1];
+        output.read_exact_at(&mut changed_byte, changed_logical)?;
+        assert_eq!(&changed_byte, b"M");
+        let mut high_marker = [0_u8; 4];
+        output.read_exact_at(&mut high_marker, high - 1)?;
+        assert_eq!(&high_marker, b"HIGH");
+        let mut final_byte = [0_u8; 1];
+        output.read_exact_at(&mut final_byte, source_len - 2)?;
+        assert_eq!(&final_byte, b"Z");
+        assert!(output.metadata()?.blocks() * 512 < 16 * 1024 * 1024);
+        assert_eq!(edit_state_signature(&source), state);
+        Ok(())
+    }
+
+    /*
+    These failures cover source aliases, prior output bytes, and a read-only staging descriptor.
+    Each error keeps the complete edit layout and history state.
+    Alias and nonempty checks also keep every existing output byte unchanged.
+    */
+    #[test]
+    fn staged_output_refusals_preserve_output_and_edit_state() -> io::Result<()> {
+        let fixture = Fixture::new("staged-refusals")?;
+        let source_path = fixture.file("source.bin");
+        fs::write(&source_path, b"source bytes")?;
+        let alias_path = fixture.file("alias.bin");
+        fs::hard_link(&source_path, &alias_path)?;
+        let mut source = PagedFile::open(&source_path)?;
+        assert!(splice(&mut source, 1, 2, b"XY")?);
+        let state = edit_state_signature(&source);
+
+        let alias = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&alias_path)?;
+        assert!(
+            source
+                .write_staged(&alias)
+                .unwrap_err()
+                .to_string()
+                .contains("identifies")
+        );
+        assert_eq!(fs::read(&alias_path)?, b"source bytes");
+
+        let occupied_path = fixture.file("occupied.stage");
+        fs::write(&occupied_path, b"keep")?;
+        let occupied = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&occupied_path)?;
+        assert_eq!(
+            source.write_staged(&occupied).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&occupied_path)?, b"keep");
+
+        let directory = File::open(&fixture.path)?;
+        assert_eq!(
+            source.write_staged(&directory).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        let read_only_path = fixture.file("read-only.stage");
+        File::create(&read_only_path)?;
+        let read_only = File::open(&read_only_path)?;
+        source.validate()?;
+        assert!(
+            source
+                .write_staged(&read_only)
+                .unwrap_err()
+                .raw_os_error()
+                .is_some()
+        );
+        assert_eq!(read_only.metadata()?.len(), 0);
+        assert_eq!(edit_state_signature(&source), state);
+        Ok(())
+    }
+
+    /*
+    Source replacement and truncation must fail before the staging output changes.
+    Both cases keep the source stamp, logical spans, history records, and edit mode.
+    The empty private outputs remain available for later cleanup by their caller.
+    */
+    #[test]
+    fn source_changes_refuse_staging_without_edit_state_changes() -> io::Result<()> {
+        let fixture = Fixture::new("staged-source-errors")?;
+        let replaced_path = fixture.file("replaced.bin");
+        let old_path = fixture.file("old.bin");
+        fs::write(&replaced_path, b"original")?;
+        let mut replaced = PagedFile::open(&replaced_path)?;
+        assert!(splice(&mut replaced, 1, 1, b"X")?);
+        let replaced_state = edit_state_signature(&replaced);
+        fs::rename(&replaced_path, &old_path)?;
+        fs::write(&replaced_path, b"replacement")?;
+        let replaced_output_path = fixture.file("replaced.stage");
+        let replaced_output = staging_file(&replaced_output_path)?;
+        assert!(replaced.write_staged(&replaced_output).is_err());
+        assert_eq!(replaced_output.metadata()?.len(), 0);
+        assert_eq!(edit_state_signature(&replaced), replaced_state);
+
+        let truncated_path = fixture.file("truncated.bin");
+        fs::write(&truncated_path, b"abcdefgh")?;
+        let mut truncated = PagedFile::open(&truncated_path)?;
+        assert!(splice(&mut truncated, 2, 2, b"YZ")?);
+        let truncated_state = edit_state_signature(&truncated);
+        OpenOptions::new()
+            .write(true)
+            .open(&truncated_path)?
+            .set_len(3)?;
+        let truncated_output_path = fixture.file("truncated.stage");
+        let truncated_output = staging_file(&truncated_output_path)?;
+        assert!(truncated.write_staged(&truncated_output).is_err());
+        assert_eq!(truncated_output.metadata()?.len(), 0);
+        assert_eq!(edit_state_signature(&truncated), truncated_state);
+        Ok(())
+    }
+
+    /*
+    This query callback replaces the source pathname after initial validation.
+    The retained descriptor still supplies complete original bytes to the staging file.
+    Final validation rejects publication because the pathname now identifies another file.
+    The completed private bytes and all edit state remain available for recovery.
+    */
+    #[test]
+    fn final_source_validation_rejects_late_path_replacement() -> io::Result<()> {
+        let fixture = Fixture::new("staged-late-replacement")?;
+        let source_path = fixture.file("source.bin");
+        let old_path = fixture.file("old.bin");
+        fs::write(&source_path, b"abcdef")?;
+        let mut source = PagedFile::open(&source_path)?;
+        assert!(splice(&mut source, 1, 1, b"X")?);
+        let state = edit_state_signature(&source);
+        let output_path = fixture.file("late.stage");
+        let output = staging_file(&output_path)?;
+        let mut replaced = false;
+
+        let error = source
+            .write_staged_with(&output, |offset, whence| {
+                if !replaced {
+                    fs::rename(&source_path, &old_path)?;
+                    fs::write(&source_path, b"uvwxyz")?;
+                    replaced = true;
+                }
+                source.seek_extent(offset, whence)
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("different"));
+        assert_eq!(fs::read(&output_path)?, b"aXcdef");
+        assert_eq!(edit_state_signature(&source), state);
+        Ok(())
     }
 
     /*
