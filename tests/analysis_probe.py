@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Check analysis workflows through a Linux pseudoterminal."""
 
+# These imports build bounded executable fixtures and disposable terminal sessions.
+# The shared terminal helper verifies process exit and terminal restoration.
 from pathlib import Path
 import struct
 import sys
@@ -9,20 +11,23 @@ import tempfile
 from terminal_probe import run_session
 
 
+# These byte sequences select the mapped analysis, edit, search, save, and movement controls.
+# Each Alt sequence uses the raw Escape-prefixed form parsed by Console.
 CTRL_Q = b"\x11"
 CTRL_T = b"\x14"
 DOWN = b"\x1b[B"
 ENTER = b"\r"
 ESC = b"\x1b"
-F3 = b"\x1b[13~"
-F7 = b"\x1b[18~"
-F9 = b"\x1b[20~"
-NEXT_MATCH = b"\x1b[18;2~"
+ALT_E = b"\x1be"
+ALT_F = b"\x1bf"
+ALT_S = b"\x1bs"
+ALT_R = b"\x1br"
 PAGE_DOWN = b"\x1b[6~"
-PREVIOUS_MATCH = b"\x1b[18;5~"
+ALT_B = b"\x1bb"
 RIGHT = b"\x1b[C"
 
 
+# This assertion requires each decoded text item in captured terminal output.
 def require(output: bytes, *texts: str) -> None:
     """Require each text value in terminal output."""
     for text in texts:
@@ -30,6 +35,7 @@ def require(output: bytes, *texts: str) -> None:
             raise AssertionError(f"The terminal output lacks: {text}")
 
 
+# This assertion requires a minimum result count for repeated search positions.
 def require_count(output: bytes, text: str, count: int) -> None:
     """Require a minimum number of text occurrences."""
     actual = output.count(text.encode())
@@ -37,11 +43,13 @@ def require_count(output: bytes, text: str, count: int) -> None:
         raise AssertionError(f"The terminal output contains {actual} instances of {text}. Expected at least {count}.")
 
 
+# This formatter creates the exact selected-offset header used by result checks.
 def header(offset: int) -> str:
     """Return the selected-offset header text."""
     return f"{offset:08X}│HView-Linux"
 
 
+# These writers place controlled little-endian fields into the PE fixture buffer.
 def put16(data: bytearray, offset: int, value: int) -> None:
     struct.pack_into("<H", data, offset, value)
 
@@ -54,8 +62,11 @@ def put64(data: bytearray, offset: int, value: int) -> None:
     struct.pack_into("<Q", data, offset, value)
 
 
+# This builder creates one bounded PE32 or PE32+ image with controlled tables.
+# The returned runtime base lets later checks calculate exact mapped addresses.
 def pe_fixture(plus: bool) -> tuple[bytes, int]:
     """Create one checked PE fixture with imports, exports, and overlay bytes."""
+    # This section builds the DOS, COFF, and optional headers for the selected PE width.
     data = bytearray(0x810)
     data[:2] = b"MZ"
     put32(data, 0x3C, 0x80)
@@ -78,6 +89,7 @@ def pe_fixture(plus: bool) -> tuple[bytes, int]:
     put32(data, optional + 60, 0x200)
     put32(data, optional + (108 if plus else 92), 16)
 
+    # This section maps the export, import, and security directories to controlled fixture ranges.
     directories = optional + (112 if plus else 96)
     put32(data, directories, 0x1100)
     put32(data, directories + 4, 0xA0)
@@ -86,6 +98,7 @@ def pe_fixture(plus: bool) -> tuple[bytes, int]:
     put32(data, directories + 32, 0x808)
     put32(data, directories + 36, 8)
 
+    # This section defines one readable section that maps runtime addresses to bounded file bytes.
     section = optional + optional_size
     data[section : section + 8] = b".rdata\0\0"
     put32(data, section + 8, 0x600)
@@ -94,6 +107,7 @@ def pe_fixture(plus: bool) -> tuple[bytes, int]:
     put32(data, section + 20, 0x200)
     put32(data, section + 36, 0x40000040)
 
+    # This section builds import descriptors, lookup entries, names, and ordinal imports for both widths.
     put32(data, 0x200, 0x1040)
     put32(data, 0x20C, 0x1080)
     put32(data, 0x210, 0x1060)
@@ -111,6 +125,7 @@ def pe_fixture(plus: bool) -> tuple[bytes, int]:
     put16(data, 0x290, 0x1234)
     data[0x292:0x29E] = b"ExitProcess\0"
 
+    # This section builds export tables, names, a forwarder, and a final certificate overlay marker.
     put32(data, 0x30C, 0x1140)
     put32(data, 0x310, 1)
     put32(data, 0x314, 3)
@@ -131,11 +146,14 @@ def pe_fixture(plus: bool) -> tuple[bytes, int]:
     data[0x370:0x37D] = b"OTHER.Target\0"
     data[0x800:0x810] = b"TAILCERTIFICATE!"
 
+    # These final checks connect mapped fields to the expected runtime values returned with the bytes.
     assert 0x1000 + 0x210 - 0x200 == 0x1010
     assert base + 0x1010 in (0x401010, 0x140001010)
     return bytes(data), base
 
 
+# This check drives exact and wildcard searches through Alt+F, Alt+R, and Alt+B.
+# Selected-offset headers confirm search positions in both directions.
 def check_search(binary: Path, root: Path) -> None:
     """Check exact and masked search directions."""
     exact = root / "exact.bin"
@@ -146,7 +164,7 @@ def check_search(binary: Path, root: Path) -> None:
     output = run_session(
         binary,
         ["/Ot=0", str(exact)],
-        [F7, b"TARGET", ENTER, NEXT_MATCH, PREVIOUS_MATCH, CTRL_Q],
+        [ALT_F, b"TARGET", ENTER, ALT_R, ALT_B, CTRL_Q],
     )
     require_count(output, header(0x10), 2)
     require(output, header(0x30))
@@ -159,12 +177,13 @@ def check_search(binary: Path, root: Path) -> None:
     output = run_session(
         binary,
         ["/Oh=0", str(masked)],
-        [F7, b"A? ?F", ENTER, NEXT_MATCH, PREVIOUS_MATCH, F7, b"A", ENTER, ENTER, CTRL_Q],
+        [ALT_F, b"A? ?F", ENTER, ALT_R, ALT_B, ALT_F, b"A", ENTER, ENTER, CTRL_Q],
     )
     require_count(output, header(0x18), 2)
     require(output, header(0x38), "Enter complete hex byte pairs. Use ? for a wildcard nibble.")
 
 
+# This check opens each bounded inspector and verifies its selected byte-order output.
 def check_inspection(binary: Path, root: Path) -> None:
     """Check strings, integers, and browser selection."""
     path = root / "inspection.bin"
@@ -194,6 +213,7 @@ def check_inspection(binary: Path, root: Path) -> None:
     )
 
 
+# This check supplies controlled low-entropy and high-entropy blocks to the entropy browser.
 def check_entropy(binary: Path, root: Path) -> None:
     """Check entropy values and browser paging."""
     path = root / "entropy.bin"
@@ -214,6 +234,7 @@ def check_entropy(binary: Path, root: Path) -> None:
     )
 
 
+# This check compares unsaved bytes and verifies that Escape preserves active edit state.
 def check_compare_and_cancel(binary: Path, root: Path) -> None:
     """Check comparison against the unsaved buffer and edit cancellation."""
     current = root / "current.bin"
@@ -226,7 +247,7 @@ def check_compare_and_cancel(binary: Path, root: Path) -> None:
     output = run_session(
         binary,
         ["/Oh=10", str(current)],
-        [F3, b"FF", CTRL_T, b"d", str(other).encode(), ENTER, DOWN, ENTER, ESC, CTRL_Q],
+        [ALT_E, b"FF", CTRL_T, b"d", str(other).encode(), ENTER, DOWN, ENTER, ESC, CTRL_Q],
     )
     require(
         output,
@@ -238,6 +259,8 @@ def check_compare_and_cancel(binary: Path, root: Path) -> None:
         raise AssertionError("Edit cancellation changed the comparison file.")
 
 
+# This check applies Fill and XOR ranges through Editor history, then saves accepted bytes.
+# Rejected and canceled inputs must keep the prior buffer and file state.
 def check_ranges(binary: Path, root: Path) -> None:
     """Check XOR, fill, edit requirements, and rejected ranges."""
     path = root / "ranges.bin"
@@ -246,7 +269,7 @@ def check_ranges(binary: Path, root: Path) -> None:
         binary,
         ["/Oh=0", str(path)],
         [
-            F3,
+            ALT_E,
             CTRL_T,
             b"x",
             b"0 4",
@@ -259,7 +282,7 @@ def check_ranges(binary: Path, root: Path) -> None:
             ENTER,
             b"AA 55",
             ENTER,
-            F9,
+            ALT_S,
             CTRL_Q,
         ],
     )
@@ -275,13 +298,14 @@ def check_ranges(binary: Path, root: Path) -> None:
     output = run_session(
         binary,
         ["/Oh=0", str(rejected)],
-        [CTRL_T, b"x", ENTER, F3, CTRL_T, b"x", b"7 2", ENTER, b"FF", ENTER, ENTER, ESC, CTRL_Q],
+        [CTRL_T, b"x", ENTER, ALT_E, CTRL_T, b"x", b"7 2", ENTER, b"FF", ENTER, ENTER, ESC, CTRL_Q],
     )
-    require(output, "Press F3 to enter edit mode first.", "The block extends past the file end.")
+    require(output, "Press Alt+E to enter edit mode first.", "The block extends past the file end.")
     if rejected.read_bytes() != original:
         raise AssertionError("A rejected range changed the file.")
 
 
+# This check browses controlled PE structures and requires their mapped file rows.
 def check_structures(binary: Path, path: Path) -> None:
     """Check PE structure rows, horizontal movement, and cancellation."""
     before = path.read_bytes()
@@ -309,6 +333,7 @@ def check_structures(binary: Path, path: Path) -> None:
         raise AssertionError("PE browser cancellation changed the file.")
 
 
+# This check converts PE32 file, RVA, and VA values and verifies rejected addresses.
 def check_pe32_addresses(binary: Path, path: Path) -> None:
     """Check PE32 addresses against current and restored image bases."""
     before = path.read_bytes()
@@ -316,7 +341,7 @@ def check_pe32_addresses(binary: Path, path: Path) -> None:
         binary,
         ["/Oh=B6", str(path)],
         [
-            F3,
+            ALT_E,
             b"50",
             CTRL_T,
             b"a",
@@ -359,6 +384,7 @@ def check_pe32_addresses(binary: Path, path: Path) -> None:
         raise AssertionError("PE edit cancellation changed the file.")
 
 
+# This check repeats address conversion at PE32+ width with a 64-bit image base.
 def check_pe32_plus_addresses(binary: Path, path: Path) -> None:
     """Check PE32+ file, RVA, and preferred-base VA conversion."""
     output = run_session(
@@ -393,6 +419,8 @@ def check_pe32_plus_addresses(binary: Path, path: Path) -> None:
     require_count(output, expected, 3)
 
 
+# This entry point builds all disposable fixtures and runs each analysis control group.
+# A successful result means every child session also restored its terminal.
 def main() -> None:
     """Run the analysis checks."""
     if len(sys.argv) != 2:

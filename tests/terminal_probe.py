@@ -161,10 +161,7 @@ def main() -> None:
                 b"\x1bOP",
                 (20, 5, b"\x1b[5;1H"),
                 b"z",
-                b"\r",
-                b"\r",
                 (12, 3),
-                b"H\r",
                 b"\x11",
             ],
         )
@@ -177,43 +174,89 @@ def main() -> None:
         for key in [b"p", b"r", b"x"]:
             run_session(binary, [str(text_file)], [key, b"\x11"])
 
+        # This section checks Help, Text wrap, the line notice, and picker cancellation.
+        # Each raw Escape-prefixed letter must select only its accepted Alt action.
+        help_output = run_session(
+            binary,
+            [str(text_file)],
+            [b"\x1bh", b"\x1bh", b"\x11"],
+        )
+        if b"Editor controls" not in help_output or b"Alt+L Line notice" not in help_output:
+            raise AssertionError("Alt+H did not show the complete shortcut help.")
+        wrap_output = run_session(binary, [str(text_file)], [b"\x1bw", b"\x11"])
+        if b"W Unwrap" not in wrap_output or b"W Wrap" not in wrap_output:
+            raise AssertionError("Alt+W did not change the Text wrap action.")
+        line_output = run_session(
+            binary,
+            [str(text_file)],
+            [b"\x1bl", b"\r", b"\x11"],
+        )
+        if b"Alternate line-feed handling" not in line_output:
+            raise AssertionError("Alt+L did not show the Text line-feed notice.")
+        picker_output = run_session(
+            binary,
+            [str(text_file)],
+            [b"\x1bo", b"\x11", b"\x11"],
+        )
+        if b"Enter Open" not in picker_output:
+            raise AssertionError("Alt+O did not open the file picker.")
+
         # This section enters Hex editing and sends interrupted control input.
-        # Quit must still restore the pseudoterminal settings.
+        # Alt+S saves the accepted nibble before Ctrl+Q restores the terminal.
         edit_file = root / "edit.bin"
         edit_file.write_bytes(b"\x00")
         run_session(
             binary,
             ["/Oh=0", str(edit_file)],
             [
-                b"\x1b[13~",
+                b"\x1be",
                 b"\x1b[3~",
                 b"\x01\x03\x06",
                 b"a",
-                b"\x1b[20~",
+                b"\x1bs",
                 b"\x11",
             ],
         )
         if edit_file.read_bytes() != b"\xa0":
             raise AssertionError("The Delete sequence canceled or changed the hex edit.")
 
-        # This section checks Save As bytes and a split modified function-key sequence.
-        # Both sessions must preserve input and restore terminal settings.
+        # This section proves that a mapped Alt letter cannot become an edited Hex digit.
+        # The following plain uppercase digit remains valid and Alt+S saves only that nibble.
+        alt_edit_file = root / "alt-edit.bin"
+        alt_edit_file.write_bytes(b"\x12")
+        run_session(
+            binary,
+            ["/Oh=0", str(alt_edit_file)],
+            [b"\x1be", b"\x1bb", b"A", b"\x1bs", b"\x11"],
+        )
+        if alt_edit_file.read_bytes() != b"\xA2":
+            raise AssertionError("A mapped Alt letter changed buffered Hex data.")
+
+        # This section checks Save As bytes and one retired physical function-key sequence.
+        # The retired key must not start a search or delay Ctrl+Q.
         save_as = root / "copy.bin"
         run_session(
             binary,
             [str(text_file)],
-            [b"\x13", b"\x01\x03\x06", str(save_as).encode(), b"\r", b"\x11"],
+            [
+                b"\x13",
+                b"\x01\x03\x06",
+                b"\x1bx",
+                str(save_as).encode(),
+                b"\r",
+                b"\x11",
+            ],
         )
         if save_as.read_bytes() != text_file.read_bytes():
             raise AssertionError("Ctrl+S did not save the current bytes.")
 
-        search_output = run_session(
+        retired_output = run_session(
             binary,
             ["/Oh=0", str(text_file)],
-            [[b"\x1b[", b"18;2", b"~"], b"\x1b", b"\x11"],
+            [[b"\x1b[", b"18;2", b"~", b"\x11"]],
         )
-        if b"Press F7" not in search_output:
-            raise AssertionError("The modified F7 sequence did not reach the search action.")
+        if b"Press Alt+F" in retired_output or b"ASCII: _" in retired_output:
+            raise AssertionError("A retired physical function key reached the search action.")
 
         # This section checks native Code decoding and explicit AT&T display configuration.
         # Controlled instruction bytes make both expected outputs deterministic.
@@ -239,6 +282,11 @@ def main() -> None:
 
         # This section checks creation after resize, tools after resize, empty input, and CLI errors.
         # Each case verifies one terminal-state transition or error path.
+        rejected_create = root / "alt-create.bin"
+        run_session(binary, [str(rejected_create)], [b"\x1bc"])
+        if rejected_create.exists():
+            raise AssertionError("Alt+C created a missing file.")
+
         created_file = root / "created.bin"
         run_session(
             binary,

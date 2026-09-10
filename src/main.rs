@@ -32,16 +32,17 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 /*
-These constants define the visible key bars and bounded navigation history.
-Each view selects the key bar that matches its available operations.
+These constants define compact shortcut bars and bounded navigation history.
+Each view selects the shortcut bar that matches its available operations.
 */
-const NORMAL_KEYS: &str = " 1Help   2PutBlk 3Edit   4Mode   5Goto   6DatRef 7Search 8Header 9Files 10Quit  11Hem   12Names ";
-const TEXT_KEYS: &str = " 1Help   2Unwrap 3       4Mode   5Goto   6LnFeed 7Search 8Table  9Files 10Quit  11Hem   12      ";
-const EDIT_KEYS: &str = " 1Help   2       3Undo   4Byte   5Word   6Dword  7Crypt  8Xor    9Update10Trunc 11      12      ";
-const PAGED_KEYS: &str =
-    " F1 Help  F3 Edit  F5 Goto  F9 Files  F10 Quit  Ctrl+F11 Prev  Ctrl+F12 Next ";
+const NORMAL_KEYS: &str = " Alt: H Help E Edit M Mode G Goto F Find O Files | Ctrl+Q Quit ";
+const TEXT_KEYS: &str = " Alt: H Help W Unwrap L Lines M Mode G Goto F Find O Files | Ctrl+Q Quit ";
+const EDIT_KEYS: &str = " Alt+H Help  Ctrl+Z/Y Undo/Redo  Alt+S Save  Ctrl+S Save As  Esc Cancel ";
+const CODE_EDIT_KEYS: &str =
+    " Alt+H Help  Alt+A Assemble  Ctrl+Z/Y Undo/Redo  Alt+S Save  Esc Cancel ";
+const PAGED_KEYS: &str = " Alt: H Help E Edit G Goto O Files P/N Prev/Next | Ctrl+Q Quit ";
 const PAGED_EDIT_KEYS: &str =
-    " Memory edits  No disk save  F3 Undo  Shift+F3 Redo  F5 Goto  Esc Cancel ";
+    " Memory edits  No disk save  Ctrl+Z/Y Undo/Redo  Alt+G Goto  Esc Cancel ";
 const RETURN_HISTORY_LIMIT: usize = 256;
 const X86_MAX_INSTRUCTION_BYTES: usize = 15;
 
@@ -230,11 +231,10 @@ fn frame(
     let text_keys = if view.wrap {
         TEXT_KEYS.to_owned()
     } else {
-        TEXT_KEYS.replace("2Unwrap", "2Wrap  ")
+        TEXT_KEYS.replace("W Unwrap", "W Wrap  ")
     };
-    let code_edit_keys = EDIT_KEYS.replace("2       ", "2Asm    ");
     let keys = if view.editing && view.mode == Mode::Code {
-        &code_edit_keys
+        CODE_EDIT_KEYS
     } else if view.editing {
         EDIT_KEYS
     } else if view.mode == Mode::Text {
@@ -921,10 +921,13 @@ fn select_file(console: &Console, mut folder: PathBuf) -> io::Result<Option<Path
 
         /*
         Input changes the selection, enters a directory, returns a file, or cancels.
-        Unsupported function keys show the existing capability notice.
+        Escape and Ctrl+Q cancel the picker. Legacy macro F10 records remain compatible.
         */
-        match console.key()?.code {
+        let key = console.key()?;
+        let ctrl = key.control & 12 != 0;
+        match key.code {
             27 | 121 => return Ok(None),
+            81 if ctrl => return Ok(None),
             38 => selected = selected.saturating_sub(1),
             40 => selected = (selected + 1).min(entries.len().saturating_sub(1)),
             13 => {
@@ -1232,7 +1235,7 @@ fn open_source(console: &Console, path: &Path) -> io::Result<Option<paged::Opene
         Ok(source) => Ok(Some(source)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let key = console.modal(&[], "File not found. Press 'C' for create")?;
-            if !key.character.eq_ignore_ascii_case(&'c') {
+            if !key.accepts_text() || !key.character.eq_ignore_ascii_case(&'c') {
                 return Ok(None);
             }
             OpenOptions::new().write(true).create_new(true).open(path)?;
@@ -1763,14 +1766,20 @@ fn open_paged_editor(
             cancel_paged_edit(&mut source, &mut view, console.height().saturating_sub(2));
             continue;
         }
-        if source.editing() && key.code == 120 {
+        if source.editing() && (key.code == 120 || key.is_alt(b'S')) {
             console.modal(
                 &lines,
                 "No large-file save. Memory edits remain. Press Escape in the editor to cancel.",
             )?;
             continue;
         }
-        if source.editing() && ((ctrl && matches!(key.code, 81 | 122 | 123)) || key.code == 121) {
+        if source.editing()
+            && ((ctrl && matches!(key.code, 81 | 122 | 123))
+                || key.code == 121
+                || key.is_alt(b'O')
+                || key.is_alt(b'P')
+                || key.is_alt(b'N'))
+        {
             console.modal(
                 &lines,
                 "Memory edits remain. Press Escape in the editor before you leave this file.",
@@ -1792,13 +1801,13 @@ fn open_paged_editor(
         if (ctrl && key.code == 81) || matches!(key.code, 27 | 121) {
             return Ok((EditorAction::Quit, PagedClosed { path, view }));
         }
-        if ctrl && key.code == 123 {
+        if (ctrl && key.code == 123) || key.is_alt(b'N') {
             return Ok((EditorAction::Next, PagedClosed { path, view }));
         }
-        if ctrl && key.code == 122 {
+        if (ctrl && key.code == 122) || key.is_alt(b'P') {
             return Ok((EditorAction::Previous, PagedClosed { path, view }));
         }
-        if ctrl && matches!(key.code, 83 | 84) {
+        if (ctrl && matches!(key.code, 83 | 84)) || key.is_alt(b'S') {
             console.modal(
                 &lines,
                 "This operation is unavailable for the bounded Hex view.",
@@ -1819,13 +1828,15 @@ fn open_paged_editor(
             35 => Some(if ctrl { Key::FileEnd } else { Key::End }),
             33 => Some(Key::PageUp),
             34 => Some(Key::PageDown),
-            _ if !ctrl && !source.editing() => match key.character.to_ascii_lowercase() {
-                'h' => Some(Key::Left),
-                'l' => Some(Key::Right),
-                'k' => Some(Key::Up),
-                'j' => Some(Key::Down),
-                _ => None,
-            },
+            _ if key.accepts_text() && !source.editing() => {
+                match key.character.to_ascii_lowercase() {
+                    'h' => Some(Key::Left),
+                    'l' => Some(Key::Right),
+                    'k' => Some(Key::Up),
+                    'j' => Some(Key::Down),
+                    _ => None,
+                }
+            }
             _ => None,
         };
         if let Some(key) = navigation {
@@ -1850,7 +1861,9 @@ fn open_paged_editor(
         }
 
         /*
-        Remaining function keys manage help, edit history, edit entry, Goto, and the picker.
+        Alt shortcuts manage help, edit entry, Goto, and the picker.
+        Ctrl+Z and Ctrl+Y manage edit history.
+        Legacy macro function-key records keep their historical contextual actions.
         Unsupported operations leave the paged source and display state unchanged.
         */
         match key.code {
@@ -1858,13 +1871,13 @@ fn open_paged_editor(
             Help reports controls for the current mode and explains the in-memory edit limit.
             The modal does not change the source, history, or selected position.
             */
-            112 => {
+            code if key.is_alt(b'H') || code == 112 => {
                 console.modal(
                     &lines,
                     if source.editing() {
-                        "Memory edits have no disk save. F3 undoes. Shift+F3 redoes. Escape cancels."
+                        "Memory edits have no disk save. Ctrl+Z undoes. Ctrl+Y redoes. Escape cancels."
                     } else {
-                        "Paged files support Hex navigation, F3 editing, Goto, file selection, switching, and quit."
+                        "Paged Hex uses Alt+E Edit, Alt+G Goto, Alt+O Files, Alt+P/N Switch, and Ctrl+Q Quit."
                     },
                 )?;
             }
@@ -1875,7 +1888,7 @@ fn open_paged_editor(
             */
             code if source.editing()
                 && ((code == 114 && key.control & 16 != 0)
-                    || (code == 89 && key.control & 8 != 0)) =>
+                    || (code == 89 && key.control & 12 != 0)) =>
             {
                 match source.redo() {
                     Ok(Some(cursor)) => view.restore_edit_cursor(
@@ -1893,7 +1906,7 @@ fn open_paged_editor(
             }
             code if source.editing()
                 && ((code == 114 && key.control & 16 == 0)
-                    || (code == 90 && key.control & 8 != 0)) =>
+                    || (code == 90 && key.control & 12 != 0)) =>
             {
                 match source.undo() {
                     Ok(Some(cursor)) => view.restore_edit_cursor(
@@ -1910,23 +1923,26 @@ fn open_paged_editor(
                 }
             }
             /*
-            F3 enters edit mode directly when no edit session exists.
+            Alt+E enters edit mode directly when no edit session exists.
             Source validation must pass before the new session accepts Hex input.
+            Legacy macro F3 records use the same contextual entry action.
             */
-            114 => match source.begin_edit() {
-                Ok(()) => {
-                    view.low_nibble = false;
-                    view.hex_start = None;
+            code if !source.editing() && (key.is_alt(b'E') || code == 114) => {
+                match source.begin_edit() {
+                    Ok(()) => {
+                        view.low_nibble = false;
+                        view.hex_start = None;
+                    }
+                    Err(error) => {
+                        console.modal(&lines, &error.to_string())?;
+                    }
                 }
-                Err(error) => {
-                    console.modal(&lines, &error.to_string())?;
-                }
-            },
+            }
             /*
             Goto parses one full u64 file offset and keeps the target inside logical bytes.
             The helper clears an interrupted nibble group before the next Hex input.
             */
-            116 => {
+            code if key.is_alt(b'G') || code == 116 => {
                 if let Some(value) = console.prompt(&lines, "Goto file offset")? {
                     match cli::parse_number(value.as_bytes()) {
                         Ok((offset, _)) if offset < source.len() => {
@@ -1944,17 +1960,20 @@ fn open_paged_editor(
                 }
             }
             /*
-            Normal mode can select another native path through the existing picker.
-            Other function keys report the bounded-view limit without changing state.
+            Alt+O selects another native path through the existing picker in normal mode.
+            Legacy macro F9 records keep the same picker action.
+            Other mapped Alt actions report the bounded-view limit without changing state.
             */
-            120 => {
+            code if key.is_alt(b'O') || code == 120 => {
                 if let Some(next) =
                     select_file(console, path.parent().unwrap_or(Path::new(".")).to_owned())?
                 {
                     return Ok((EditorAction::Pick(next), PagedClosed { path, view }));
                 }
             }
-            113..=119 => {
+            code if (113..=119).contains(&code)
+                || b"WAMLFRB".iter().copied().any(|letter| key.is_alt(letter)) =>
+            {
                 console.modal(
                     &lines,
                     if source.editing() {
@@ -2087,7 +2106,10 @@ fn open_editor(
         );
         console.draw(&lines)?;
         let key = console.key()?;
-        let hex_digit = view.editing && view.mode == Mode::Hex && key.character.is_ascii_hexdigit();
+        let hex_digit = view.editing
+            && view.mode == Mode::Hex
+            && key.accepts_text()
+            && key.character.is_ascii_hexdigit();
         if view.editing && !hex_digit && key.code != 0 {
             view.end_hex_group();
         }
@@ -2139,24 +2161,27 @@ fn open_editor(
             step_history.clear();
             continue;
         }
-        if key.code == 112 {
+        if key.is_alt(b'H') || key.code == 112 {
             workbench::help(console)?;
             continue;
         }
 
         /*
-        Repeat search and file-switch commands run before ordinary navigation.
+        Mapped repeat-search and file-switch commands run before ordinary navigation.
+        Stored macro function-key records keep the corresponding legacy action.
         File switches return the complete active Editor for bounded runtime-state conversion.
         */
-        if key.code == 118 && !view.editing && (ctrl || key.control & 16 != 0) {
-            let start = if ctrl {
+        let next_match = key.is_alt(b'R') || (key.code == 118 && !ctrl && key.control & 16 != 0);
+        let previous_match = key.is_alt(b'B') || (key.code == 118 && ctrl);
+        if !view.editing && (next_match || previous_match) {
+            let start = if previous_match {
                 (view.offset as usize).checked_sub(1)
             } else {
                 (view.offset as usize).checked_add(1)
             };
             match search.as_ref() {
                 Some(pattern) => {
-                    match start.and_then(|start| pattern.find(&view.data, start, ctrl)) {
+                    match start.and_then(|start| pattern.find(&view.data, start, previous_match)) {
                         Some(offset) => {
                             workbench::jump(&mut view, offset, console.height().saturating_sub(2));
                             step_history.clear();
@@ -2167,16 +2192,16 @@ fn open_editor(
                     }
                 }
                 None => {
-                    console.modal(&lines, "Press F7 to enter a search pattern first.")?;
+                    console.modal(&lines, "Press Alt+F to enter a search pattern first.")?;
                 }
             }
             continue;
         }
-        if ctrl && !view.editing {
-            if key.code == 123 {
+        if !view.editing {
+            if (ctrl && key.code == 123) || key.is_alt(b'N') {
                 return Ok((EditorAction::Next, Some((path, view))));
             }
-            if key.code == 122 {
+            if (ctrl && key.code == 122) || key.is_alt(b'P') {
                 return Ok((EditorAction::Previous, Some((path, view))));
             }
         }
@@ -2194,7 +2219,7 @@ fn open_editor(
             35 => Some(if ctrl { Key::FileEnd } else { Key::End }),
             33 => Some(Key::PageUp),
             34 => Some(Key::PageDown),
-            _ if !ctrl && !view.editing => match key.character.to_ascii_lowercase() {
+            _ if key.accepts_text() && !view.editing => match key.character.to_ascii_lowercase() {
                 'h' => Some(Key::Left),
                 'l' => Some(Key::Right),
                 'k' => Some(Key::Up),
@@ -2262,7 +2287,7 @@ fn open_editor(
         }
 
         /*
-        Active Hex editing consumes a hexadecimal digit before function-key dispatch.
+        Active Hex editing consumes a valid plain or Shift hexadecimal digit before shortcut dispatch.
         The remaining dispatch handles edit, search, mode, save, and analysis commands.
         */
         if hex_digit {
@@ -2310,59 +2335,66 @@ fn open_editor(
             Code editing prepares assembly bytes, validates their range, and builds a preview.
             Confirmed bytes enter one Editor replacement transaction.
             */
-            13 | 113 if view.editing && view.mode == Mode::Code => loop {
-                let metadata = view.metadata();
-                let lines = frame(
-                    &view,
-                    &path,
-                    console,
-                    updated,
-                    writable,
-                    &metadata,
-                    &mut decoder,
-                );
-                let seed = assembly_seed(&view, &metadata).unwrap_or_default();
-                let Some(text) = console.prompt_seed(&lines, "Assembler", &seed)? else {
-                    break;
-                };
-                let proposed = (|| {
-                    let metadata = metadata.as_ref().map_err(Clone::clone)?;
-                    let address = metadata.code_address(view.offset)?.0;
-                    let bytes = assembler::assemble(&text, view.decode_bits(), address)?;
-                    let start = usize::try_from(view.offset)
-                        .map_err(|_| "The offset exceeds the address range.")?;
-                    let end = start
-                        .checked_add(bytes.len())
-                        .ok_or("The instruction exceeds the address range.")?;
-                    view.validate_raw_len(view.data.len().max(end))?;
-                    let preview = assembly_preview(&view, metadata, &mut decoder, &bytes)?;
-                    Ok::<_, String>((bytes, start, end, preview))
-                })();
-                match proposed {
-                    Ok((bytes, start, end, preview)) => {
-                        if !confirm_assembly(console, &preview)? {
-                            break;
+            code if view.editing
+                && view.mode == Mode::Code
+                && (code == 13 || code == 113 || key.is_alt(b'A')) =>
+            {
+                loop {
+                    let metadata = view.metadata();
+                    let lines = frame(
+                        &view,
+                        &path,
+                        console,
+                        updated,
+                        writable,
+                        &metadata,
+                        &mut decoder,
+                    );
+                    let seed = assembly_seed(&view, &metadata).unwrap_or_default();
+                    let Some(text) = console.prompt_seed(&lines, "Assembler", &seed)? else {
+                        break;
+                    };
+                    let proposed = (|| {
+                        let metadata = metadata.as_ref().map_err(Clone::clone)?;
+                        let address = metadata.code_address(view.offset)?.0;
+                        let bytes = assembler::assemble(&text, view.decode_bits(), address)?;
+                        let start = usize::try_from(view.offset)
+                            .map_err(|_| "The offset exceeds the address range.")?;
+                        let end = start
+                            .checked_add(bytes.len())
+                            .ok_or("The instruction exceeds the address range.")?;
+                        view.validate_raw_len(view.data.len().max(end))?;
+                        let preview = assembly_preview(&view, metadata, &mut decoder, &bytes)?;
+                        Ok::<_, String>((bytes, start, end, preview))
+                    })();
+                    match proposed {
+                        Ok((bytes, start, end, preview)) => {
+                            if !confirm_assembly(console, &preview)? {
+                                break;
+                            }
+                            if let Err(error) =
+                                view.replace_bytes(start, bytes, (end as u64, view.top))
+                            {
+                                console.modal(&lines, &error)?;
+                                continue;
+                            }
                         }
-                        if let Err(error) = view.replace_bytes(start, bytes, (end as u64, view.top))
-                        {
+                        Err(error) => {
                             console.modal(&lines, &error)?;
-                            continue;
                         }
-                    }
-                    Err(error) => {
-                        console.modal(&lines, &error)?;
                     }
                 }
-            },
+            }
             /*
-            These edit-state commands cancel, quit, undo, redo, or toggle editing.
+            These edit-state commands cancel, quit, undo, redo, or enter editing.
             History failures produce notices and preserve current bytes.
+            Legacy macro F3 records retain their historical contextual Undo and edit-entry actions.
             */
             27 if view.editing => view.cancel_edit(),
             27 | 121 if !view.editing => break,
             code if view.editing
                 && ((code == 114 && key.control & 16 != 0)
-                    || (code == 89 && key.control & 8 != 0)) =>
+                    || (code == 89 && key.control & 12 != 0)) =>
             {
                 match view.redo() {
                     Ok(true) => {}
@@ -2376,7 +2408,7 @@ fn open_editor(
             }
             code if view.editing
                 && ((code == 114 && key.control & 16 == 0)
-                    || (code == 90 && key.control & 8 != 0)) =>
+                    || (code == 90 && key.control & 12 != 0)) =>
             {
                 match view.undo() {
                     Ok(true) => {}
@@ -2388,7 +2420,7 @@ fn open_editor(
                     }
                 }
             }
-            114 => {
+            code if !view.editing && (key.is_alt(b'E') || code == 114) => {
                 if let Err(error) = view.toggle_edit() {
                     console.modal(&lines, &error)?;
                 } else {
@@ -2396,25 +2428,31 @@ fn open_editor(
                 }
             }
             /*
-            F9 publishes buffered edits through the guarded replacement path.
+            Alt+S publishes buffered edits through the guarded replacement path.
+            Legacy macro F9 records keep the same save action.
             A successful save resets the saved comparison bytes and dirty state.
             */
-            120 if view.editing => match save::replace(&path, &saved, &view.data) {
-                Ok(_) => {
-                    saved.clone_from(&view.data);
-                    view.saved();
-                    updated = true;
+            code if view.editing && (key.is_alt(b'S') || code == 120) => {
+                match save::replace(&path, &saved, &view.data) {
+                    Ok(_) => {
+                        saved.clone_from(&view.data);
+                        view.saved();
+                        updated = true;
+                    }
+                    Err(error) => {
+                        console.modal(&lines, &error.to_string())?;
+                    }
                 }
-                Err(error) => {
-                    console.modal(&lines, &error.to_string())?;
-                }
-            },
+            }
             /*
             Mode selection rebuilds Text or Hex views and retains shared Code settings.
             The Code-width command resets decoder and navigation caches after a change.
             */
             code if !view.editing
-                && (code == 115 || code == 13 || key.character.eq_ignore_ascii_case(&'m')) =>
+                && (code == 115
+                    || code == 13
+                    || key.is_alt(b'M')
+                    || (key.accepts_text() && key.character.eq_ignore_ascii_case(&'m'))) =>
             {
                 if let Some(mode) = console.prompt(&lines, "Mode: T Text, H Hex, C Code")? {
                     match mode.to_ascii_uppercase().as_str() {
@@ -2450,6 +2488,7 @@ fn open_editor(
             }
             _ if !view.editing
                 && view.mode == Mode::Code
+                && key.accepts_text()
                 && key.character.eq_ignore_ascii_case(&'o') =>
             {
                 match cycle_code_mode(&mut view) {
@@ -2467,7 +2506,7 @@ fn open_editor(
             Goto parses one bounded file position.
             Search stores one valid pattern and moves to its first matching byte.
             */
-            116 if !view.editing => {
+            code if !view.editing && (key.is_alt(b'G') || code == 116) => {
                 if let Some(value) = console.prompt(&lines, "Goto")? {
                     match cli::parse_number(value.as_bytes()) {
                         Ok((offset, _)) if offset < view.data.len() as u64 => {
@@ -2483,7 +2522,7 @@ fn open_editor(
                     }
                 }
             }
-            118 if !view.editing => {
+            code if !view.editing && (key.is_alt(b'F') || code == 118) => {
                 if let Some(value) = console.prompt(
                     &lines,
                     if view.mode == Mode::Hex {
@@ -2523,14 +2562,17 @@ fn open_editor(
                 }
             }
             /*
-            Remaining mode and picker commands update display settings or return another native path.
-            Other function keys report the existing reconstruction limit.
+            Remaining mapped commands update display settings or return another native path.
+            Legacy macro function-key records keep the corresponding contextual action.
+            Other legacy function-key records report the existing reconstruction limit.
             */
-            113 if view.mode == Mode::Text => view.wrap = !view.wrap,
-            117 if view.mode == Mode::Text => {
+            code if view.mode == Mode::Text && (key.is_alt(b'W') || code == 113) => {
+                view.wrap = !view.wrap;
+            }
+            code if view.mode == Mode::Text && (key.is_alt(b'L') || code == 117) => {
                 console.modal(&lines, "Alternate line-feed handling is not reconstructed.")?;
             }
-            120 if !view.editing => {
+            code if !view.editing && (key.is_alt(b'O') || code == 120) => {
                 if let Some(next) =
                     select_file(console, path.parent().unwrap_or(Path::new(".")).to_owned())?
                 {

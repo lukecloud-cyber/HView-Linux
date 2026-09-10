@@ -385,7 +385,7 @@ impl Editor {
         A byte-identical fixed replacement returns before history or data changes.
         */
         if !self.editing {
-            return Err("Press F3 to enter edit mode.".into());
+            return Err("Press Alt+E to enter edit mode.".into());
         }
         if replacement.is_empty() {
             return Err("An edit must replace at least one byte.".into());
@@ -628,7 +628,7 @@ impl Editor {
         The raw model check prevents an invalid appended byte before history changes.
         */
         if !self.editing || self.mode != Mode::Hex {
-            return Err("Press F3 to enter hex edit mode.".into());
+            return Err("Press Alt+E to enter Hex edit mode.".into());
         }
         let digit = c.to_digit(16).ok_or("Enter a hexadecimal digit.")? as u8;
         let index =

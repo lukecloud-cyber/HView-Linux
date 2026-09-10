@@ -18,17 +18,16 @@ CTRL_S = b"\x13"
 CTRL_T = b"\x14"
 CTRL_Y = b"\x19"
 CTRL_Z = b"\x1a"
-CTRL_F11 = b"\x1b[23;5~"
-CTRL_F12 = b"\x1b[24;5~"
 ESCAPE = b"\x1b"
-F3 = b"\x1b[13~"
-F5 = b"\x1b[15~"
-F9 = b"\x1b[20~"
-F10 = b"\x1b[21~"
+ALT_E = b"\x1be"
+ALT_G = b"\x1bg"
+ALT_N = b"\x1bn"
+ALT_O = b"\x1bo"
+ALT_P = b"\x1bp"
+ALT_S = b"\x1bs"
 DOWN = b"\x1b[B"
 RIGHT = b"\x1b[C"
-SHIFT_F3 = b"\x1b[13;2~"
-ALT_A = b"\x1bA"
+ALT_A = b"\x1ba"
 ADDRESS_LIMIT = 256 * 1024 * 1024
 
 
@@ -125,11 +124,11 @@ def check_high_offsets(binary: Path, root: Path) -> tuple[Path, int]:
     require(final, f"{length - 1:08X}".encode(), "The final high address was narrowed.")
     require(final, b"5A", "The paged view did not show the final byte.")
 
-    # F5 must parse and display a full u64 file offset and its marker bytes.
+    # Alt+G must parse and display a full u64 file offset and its marker bytes.
     selected = run_session(
         binary,
         ["--mode=hex", str(source)],
-        [F5, f"{high:X}".encode(), b"\r", CTRL_Q],
+        [ALT_G, f"{high:X}".encode(), b"\r", CTRL_Q],
         address_limit_bytes=ADDRESS_LIMIT,
     )
     require(selected, f"{high:08X}".encode(), "Goto narrowed the high file offset.")
@@ -158,13 +157,13 @@ def check_paged_edits(binary: Path, source: Path, high: int) -> None:
         binary,
         ["--mode=hex", str(source)],
         [
-            F3,
+            ALT_E,
             b"A",
             (60, 24, b"EDITMODE"),
             b"B",
-            F3,
-            SHIFT_F3,
-            F5,
+            CTRL_Z,
+            CTRL_Y,
+            ALT_G,
             b"0",
             b"\r",
             b"C",
@@ -172,19 +171,19 @@ def check_paged_edits(binary: Path, source: Path, high: int) -> None:
             CTRL_Y,
             CTRL_S,
             b"\r",
-            F9,
+            ALT_S,
             b"\r",
-            CTRL_F12,
+            ALT_N,
             b"\r",
             CTRL_Q,
             b"\r",
-            F10,
+            ALT_O,
             b"\r",
-            F3,
-            SHIFT_F3,
+            CTRL_Z,
+            CTRL_Y,
             ESCAPE,
-            F3,
-            F3,
+            ALT_E,
+            CTRL_Z,
             b"\r",
             ESCAPE,
             CTRL_Q,
@@ -213,14 +212,14 @@ def check_paged_edits(binary: Path, source: Path, high: int) -> None:
     goto_output = run_session(
         binary,
         ["--mode=hex", str(source)],
-        [F3, b"A", F5, b"1", b"\r", b"C", ESCAPE, CTRL_Q],
+        [ALT_E, b"A", ALT_G, b"1", b"\r", b"C", ESCAPE, CTRL_Q],
         address_limit_bytes=ADDRESS_LIMIT,
     )
     require(goto_output, b"A1 C2 43 44", "Goto retained the previous low-nibble state.")
     modified_output = run_session(
         binary,
         ["--mode=hex", str(source)],
-        [F3, ALT_A, F3, b"\r", ESCAPE, CTRL_Q],
+        [ALT_E, ALT_A, b"\r", CTRL_Z, b"\r", ESCAPE, CTRL_Q],
         address_limit_bytes=ADDRESS_LIMIT,
     )
     require(
@@ -234,7 +233,7 @@ def check_paged_edits(binary: Path, source: Path, high: int) -> None:
     alias_output = run_session(
         binary,
         ["--mode=hex", str(source)],
-        [F3, b"lA", ESCAPE, CTRL_Q],
+        [ALT_E, b"lA", ESCAPE, CTRL_Q],
         address_limit_bytes=ADDRESS_LIMIT,
     )
     require(
@@ -249,13 +248,13 @@ def check_paged_edits(binary: Path, source: Path, high: int) -> None:
         binary,
         ["--mode=hex", str(source)],
         [
-            F5,
+            ALT_G,
             f"{high:X}".encode(),
             b"\r",
-            F3,
+            ALT_E,
             b"AB",
-            F3,
-            SHIFT_F3,
+            CTRL_Z,
+            CTRL_Y,
             ESCAPE,
             CTRL_Q,
         ],
@@ -269,7 +268,7 @@ def check_paged_edits(binary: Path, source: Path, high: int) -> None:
     eof_output = run_session(
         binary,
         ["--mode=hex", "--end", str(source)],
-        [F3, RIGHT, RIGHT, b"F", b"\r", ESCAPE, CTRL_Q],
+        [ALT_E, RIGHT, RIGHT, b"F", b"\r", ESCAPE, CTRL_Q],
         address_limit_bytes=ADDRESS_LIMIT,
     )
     require(eof_output, b"cannot extend the file at EOF", "Paged editing did not refuse EOF growth.")
@@ -296,7 +295,7 @@ def check_switch_and_restart(binary: Path, root: Path, large: Path, high: int) -
     output = run_session(
         binary,
         ["--mode=hex", "--session", str(session), str(small), str(large)],
-        [CTRL_F12, F5, f"{high:X}".encode(), b"\r", CTRL_F11, RIGHT, CTRL_F12, CTRL_Q],
+        [ALT_N, ALT_G, f"{high:X}".encode(), b"\r", ALT_P, RIGHT, ALT_N, CTRL_Q],
         address_limit_bytes=ADDRESS_LIMIT,
     )
     require(output, b"small.bin", "The buffered file did not open during mixed switching.")
@@ -381,7 +380,7 @@ def check_source_changes(binary: Path, root: Path) -> None:
     output = run_session(
         binary,
         ["--mode=hex", str(edited)],
-        [F3, b"A", replace_edited_path, RIGHT, CTRL_Q, ESCAPE],
+        [ALT_E, b"A", replace_edited_path, RIGHT, CTRL_Q, ESCAPE],
         expected_code=1,
         address_limit_bytes=ADDRESS_LIMIT,
     )
@@ -419,7 +418,7 @@ def check_native_picker(binary: Path, root: Path) -> None:
         os.write(descriptor, b"NATIVE")
     finally:
         os.close(descriptor)
-    output = run_session(binary, ["--mode=hex", str(first)], [F9, DOWN, DOWN, b"\r", CTRL_Q])
+    output = run_session(binary, ["--mode=hex", str(first)], [ALT_O, DOWN, DOWN, b"\r", CTRL_Q])
     require(output, b"b-native-\\xFF.bin", "The picker did not escape invalid pathname bytes.")
     require(output, b"4E 41 54 49-56 45", "The picker did not open the native pathname.")
 
@@ -453,8 +452,8 @@ def check_session_error_preservation(binary: Path, root: Path) -> None:
             terminal_destination,
             b"\r",
             b"\r",
-            CTRL_F12,
-            CTRL_F11,
+            ALT_N,
+            ALT_P,
             CTRL_Q,
         ],
     )

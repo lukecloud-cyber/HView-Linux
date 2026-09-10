@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check nonmutating assembly patch previews."""
 
+# These imports provide disposable code files and checked terminal sessions.
 from pathlib import Path
 import sys
 import tempfile
@@ -8,16 +9,18 @@ import tempfile
 from terminal_probe import run_session
 
 
+# These byte sequences select mapped assembler, edit, save, and retained Control actions.
 CTRL_Q = b"\x11"
 CTRL_T = b"\x14"
 ENTER = b"\r"
 ESCAPE = b"\x1b"
-F2 = b"\x1b[12~"
-F3 = b"\x1b[13~"
-F9 = b"\x1b[20~"
+ALT_A = b"\x1ba"
+ALT_E = b"\x1be"
+ALT_S = b"\x1bs"
 RIGHT = b"\x1b[C"
 
 
+# These assertions require terminal values and exact saved file bytes.
 def require(output: bytes, *values: bytes) -> None:
     """Require each terminal value."""
     for value in values:
@@ -31,11 +34,13 @@ def require_bytes(path: Path, expected: bytes, reason: str) -> None:
         raise AssertionError(reason)
 
 
+# This action builder selects one raw model through the retained Tools control.
 def raw_model(value: str) -> list[bytes]:
     """Return actions that set one raw model."""
     return [CTRL_T, b"r", value.encode(), ENTER]
 
 
+# This check resizes a longer overlapping patch before confirmed application and Save.
 def check_overlap_and_resize(binary: Path, root: Path, config: Path) -> None:
     """Check longer overlap, live resize, and guarded application."""
     path = root / "overlap.bin"
@@ -46,8 +51,8 @@ def check_overlap_and_resize(binary: Path, root: Path, config: Path) -> None:
         ["--config", str(config), "--mode=code", str(path)],
         [
             (60, 24, b"\x1b[24;1H"),
-            F3,
-            F2,
+            ALT_E,
+            ALT_A,
             b"mov eax,1\r",
             (30, 5, ENTER, b"Resize to at least 60 columns"),
             (60, 24, b"Assembly patch preview"),
@@ -55,10 +60,10 @@ def check_overlap_and_resize(binary: Path, root: Path, config: Path) -> None:
             lambda: require_bytes(
                 path,
                 original,
-                "An applied preview changed the file before F9.",
+                "An applied preview changed the file before Alt+S.",
             ),
             ESCAPE,
-            F9,
+            ALT_S,
             CTRL_Q,
         ],
     )
@@ -89,6 +94,7 @@ def check_overlap_and_resize(binary: Path, root: Path, config: Path) -> None:
     )
 
 
+# This check applies a shorter instruction and verifies retained tail bytes.
 def check_shorter_apply(binary: Path, root: Path, config: Path) -> None:
     """Check a shorter patch and its retained tail."""
     path = root / "shorter.bin"
@@ -98,17 +104,17 @@ def check_shorter_apply(binary: Path, root: Path, config: Path) -> None:
         binary,
         ["--config", str(config), "--mode=code", str(path)],
         [
-            F3,
-            F2,
+            ALT_E,
+            ALT_A,
             b"nop\r",
             ENTER,
             lambda: require_bytes(
                 path,
                 original,
-                "An applied preview changed the file before F9.",
+                "An applied preview changed the file before Alt+S.",
             ),
             ESCAPE,
-            F9,
+            ALT_S,
             CTRL_Q,
         ],
     )
@@ -125,10 +131,11 @@ def check_shorter_apply(binary: Path, root: Path, config: Path) -> None:
     require_bytes(
         path,
         bytes.fromhex("90 44 33 22 11 C3"),
-        "F9 did not save the exact shorter patch and retained tail.",
+        "Alt+S did not save the exact shorter patch and retained tail.",
     )
 
 
+# This check assembles at EOF and verifies exact buffered growth after Save.
 def check_eof_growth(binary: Path, root: Path, config: Path) -> None:
     """Check an applied patch at the end of the file."""
     path = root / "eof.bin"
@@ -139,17 +146,17 @@ def check_eof_growth(binary: Path, root: Path, config: Path) -> None:
         ["--config", str(config), "--mode=code", str(path)],
         [
             RIGHT,
-            F3,
-            F2,
+            ALT_E,
+            ALT_A,
             b"ret\r",
             ENTER,
             lambda: require_bytes(
                 path,
                 original,
-                "EOF growth changed the file before F9.",
+                "EOF growth changed the file before Alt+S.",
             ),
             ESCAPE,
-            F9,
+            ALT_S,
             CTRL_Q,
         ],
     )
@@ -164,9 +171,10 @@ def check_eof_growth(binary: Path, root: Path, config: Path) -> None:
         b"EOF growth: 1 byte(s) will be appended.",
         b"F:1 ret",
     )
-    require_bytes(path, b"\x90\xC3", "F9 did not save the EOF growth.")
+    require_bytes(path, b"\x90\xC3", "Alt+S did not save the EOF growth.")
 
 
+# This check previews a relative call at a raw runtime address and preserves the file after cancellation.
 def check_raw_runtime_address(binary: Path, root: Path) -> None:
     """Check address-aware assembly with a raw runtime base."""
     path = root / "raw.bin"
@@ -177,11 +185,11 @@ def check_raw_runtime_address(binary: Path, root: Path) -> None:
         ["--mode=code", str(path)],
         [
             *raw_model("X86 32 LE 10000000"),
-            F3,
-            F2,
+            ALT_E,
+            ALT_A,
             b"call 10000008\r",
             ESCAPE,
-            F9,
+            ALT_S,
             CTRL_Q,
         ],
     )
@@ -195,6 +203,7 @@ def check_raw_runtime_address(binary: Path, root: Path) -> None:
     require_bytes(path, original, "A canceled raw-address preview changed the file.")
 
 
+# This check keeps AT&T display syntax while assembly input remains Intel syntax.
 def check_att_display(binary: Path, root: Path) -> None:
     """Check Intel assembly input with AT&T display rows."""
     config = root / "att.ini"
@@ -207,7 +216,7 @@ def check_att_display(binary: Path, root: Path) -> None:
     output = run_session(
         binary,
         ["--config", str(config), "--mode=code", str(path)],
-        [F3, F2, b"mov eax,1\r", ESCAPE, F9, CTRL_Q],
+        [ALT_E, ALT_A, b"mov eax,1\r", ESCAPE, ALT_S, CTRL_Q],
     )
     require(
         output,
@@ -219,8 +228,10 @@ def check_att_display(binary: Path, root: Path) -> None:
     require_bytes(path, original, "A canceled AT&T preview changed the file.")
 
 
+# This check combines Real16 assembly, invalid-byte fallback, and unsupported instruction errors.
 def check_real16_and_fallback(binary: Path, root: Path) -> None:
     """Check Real16 preview decoding and strict replacement decoding."""
+    # This section creates the shared Real16 and invalid-byte fallback configuration.
     config = root / "fallback.ini"
     config.write_bytes(
         b"[HView-Linux 1]\nDefaultCodeSize=16\nInvalidCode=Byte\n"
@@ -231,7 +242,7 @@ def check_real16_and_fallback(binary: Path, root: Path) -> None:
     output = run_session(
         binary,
         ["--config", str(config), "--mode=code", str(real)],
-        [b"o", b"o", b"o", F3, F2, b"mov ax,5678\r", ESCAPE, F9, CTRL_Q],
+        [b"o", b"o", b"o", ALT_E, ALT_A, b"mov ax,5678\r", ESCAPE, ALT_S, CTRL_Q],
     )
     require(
         output,
@@ -243,12 +254,13 @@ def check_real16_and_fallback(binary: Path, root: Path) -> None:
     )
     require_bytes(real, original, "A canceled Real16 preview changed the file.")
 
+    # This section previews a replacement over one invalid byte without changing the canceled file.
     invalid = root / "invalid.bin"
     invalid.write_bytes(b"\x0F")
     output = run_session(
         binary,
         ["--config", str(config), "--mode=code", str(invalid)],
-        [F3, F2, b"nop\r", ESCAPE, F9, CTRL_Q],
+        [ALT_E, ALT_A, b"nop\r", ESCAPE, ALT_S, CTRL_Q],
     )
     require(
         output,
@@ -259,6 +271,7 @@ def check_real16_and_fallback(binary: Path, root: Path) -> None:
     )
     require_bytes(invalid, b"\x0F", "A fallback preview changed the file.")
 
+    # This section rejects replacement bytes that the selected Real16 decoder cannot verify.
     protected = root / "protected.bin"
     protected.write_bytes(b"\x90")
     output = run_session(
@@ -268,12 +281,12 @@ def check_real16_and_fallback(binary: Path, root: Path) -> None:
             b"o",
             b"o",
             b"o",
-            F3,
-            F2,
+            ALT_E,
+            ALT_A,
             b"arpl ax, ax\r",
             ENTER,
             ESCAPE,
-            F9,
+            ALT_S,
             CTRL_Q,
         ],
     )
@@ -287,6 +300,7 @@ def check_real16_and_fallback(binary: Path, root: Path) -> None:
     )
 
 
+# This entry point creates the shared Code configuration and runs each preview group.
 def main() -> None:
     """Run the assembly patch preview checks."""
     if len(sys.argv) != 2:

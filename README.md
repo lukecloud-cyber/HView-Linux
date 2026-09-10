@@ -87,27 +87,30 @@ For ordinary raw files, `--virtual` uses the value as a file offset. Raw ELF fil
 
 | Key | Action |
 | --- | --- |
-| `F1` | The key shows help. |
-| `F2` or `Enter` | The key opens the Intel assembler during Code editing. |
-| `F3` | The key starts editing. During editing, the key undoes one operation. |
+| `Alt+H` | The key shows or closes help. |
+| `Alt+W` | The key changes Text wrapping. |
+| `Alt+A` or `Enter` | The key opens the Intel assembler during Code editing. |
+| `Alt+E` | The key starts editing. |
 | `Ctrl+Z` | The key undoes one operation during editing. |
-| `Shift+F3` or `Ctrl+Y` | The key redoes one operation during editing. |
-| `F4` or `M` | The key selects Text, Hex, or Code mode outside editing. |
+| `Ctrl+Y` | The key redoes one operation during editing. |
+| `Alt+M` or `M` | The key selects Text, Hex, or Code mode outside editing. |
 | `Enter` | Outside editing, the key selects mode in Text/Hex or follows a direct branch in Code. |
 | `Backspace` | In Code view outside editing, the key returns from a followed branch. |
-| `F5` | The key goes to a file offset. |
-| `F7` | The key starts an ASCII or masked hexadecimal search. |
-| `Shift+F7` | The key finds the next match. |
-| `Ctrl+F7` | The key finds the previous match. |
-| `F9` | The key saves buffered edits or opens the file browser. Active paged edits keep their in-memory state. |
+| `Alt+G` | The key goes to a file offset. |
+| `Alt+L` | The key shows the current Text line-feed capability notice. |
+| `Alt+F` | The key starts an ASCII or masked hexadecimal search. |
+| `Alt+R` | The key finds the next match. |
+| `Alt+B` | The key finds the previous match. |
+| `Alt+S` | The key saves buffered edits. Active paged edits keep their in-memory state. |
+| `Alt+O` | The key opens the file browser outside editing. |
 | `Ctrl+S` | The key saves the buffer to a new file. |
 | `Ctrl+T` | The key opens the analysis tools. |
-| `Ctrl+F11` | The key opens the previous input file. |
-| `Ctrl+F12` | The key opens the next input file. |
+| `Alt+P` | The key opens the previous input file. |
+| `Alt+N` | The key opens the next input file. |
 | `O` | The key cycles 16-bit, 32-bit, 64-bit, and Real16 Code modes. |
 | `H`, `J`, `K`, or `L` | These keys move the cursor outside editing. |
 | `Esc` | The key cancels editing or closes the current screen. |
-| `F10` or `Ctrl+Q` | The key exits the application. |
+| `Ctrl+Q` | The key exits the application or closes the file browser. |
 
 Arrow, Home, End, Page Up, and Page Down keys also move the cursor.
 
@@ -231,13 +234,13 @@ Paged Hex overtype cannot extend the file at EOF.
 Large-file disk saving remains unavailable.
 File switching and quit remain unavailable until `Esc` cancels all paged edits.
 
-Press `F3` to start editing. Hex mode replaces nibbles, and Code mode assembles one Intel instruction.
+Press `Alt+E` to start editing. Hex mode replaces nibbles, and Code mode assembles one Intel instruction.
 
 Press `Esc` to cancel all active edits.
 Buffered cancellation restores its complete memory baseline.
 Paged cancellation restores the captured logical source layout.
 
-During Code editing, `F2` or `Enter` opens the Intel assembly prompt. A preview shows the proposed patch before buffer changes.
+During Code editing, `Alt+A` or `Enter` opens the Intel assembly prompt. A preview shows the proposed patch before buffer changes.
 
 The preview shows exact bytes, mapped addresses, affected instructions, retained bytes, overwritten bytes, and extension beyond EOF.
 
@@ -249,7 +252,7 @@ The preview requires at least 60 columns and enough rows for the complete patch 
 
 The preview marks clipped instruction rows. The replacement instruction must decode completely, including when `InvalidCode=Byte` is active.
 
-Press `F3` or `Ctrl+Z` to undo one operation during editing. Press `Shift+F3` or `Ctrl+Y` to redo one operation.
+Press `Ctrl+Z` to undo one operation during editing. Press `Ctrl+Y` to redo one operation.
 
 One completed hexadecimal byte, confirmed assembly patch, Fill range, or XOR range forms one edit record.
 
@@ -259,7 +262,7 @@ Failed, canceled, and unchanged edits preserve redo history. The history holds u
 
 The application removes the oldest records when necessary. An operation larger than the history byte limit fails before buffer changes.
 
-For buffered files, press `F9` to replace the current file.
+For buffered files, press `Alt+S` to replace the current file.
 Press `Ctrl+S` to save the buffered data under a new name.
 
 Successful saves establish a new edit baseline and clear both histories. Failed saves preserve both histories. Edit cancellation clears both histories.

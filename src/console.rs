@@ -1,6 +1,14 @@
+/*
+This module owns Linux terminal mode, bounded input parsing, screen output, and macro key delivery.
+Physical terminal input and stored macro input share one Key shape after their separate input boundaries.
+*/
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 compile_error!("HView-Linux currently supports Linux on x86-64.");
 
+/*
+These standard types store terminal state, pending input, formatted output, and bounded macro delays.
+The module uses direct libc calls because no external terminal dependency is necessary.
+*/
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::ffi::{c_int, c_void};
@@ -8,6 +16,10 @@ use std::fmt::Write as _;
 use std::io::{self, Write as _};
 use std::time::{Duration, Instant};
 
+/*
+These Linux ABI constants describe stdin polling, raw terminal flags, window queries, and control-character indexes.
+The values match the supported x86-64 GNU host.
+*/
 const STDIN: c_int = 0;
 const POLLIN: i16 = 0x001;
 const EINTR: i32 = 4;
@@ -27,6 +39,10 @@ const IEXTEN: u32 = 0o100000;
 const VTIME: usize = 5;
 const VMIN: usize = 6;
 
+/*
+These C-compatible records carry terminal settings, dimensions, and poll results across the libc boundary.
+Unit tests verify the host layouts before normal terminal operations depend on them.
+*/
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Termios {
@@ -56,6 +72,10 @@ struct PollFd {
     returned: i16,
 }
 
+/*
+These libc functions provide the small Linux terminal interface used by Console.
+Callers check every operational result and preserve the returned operating-system error.
+*/
 #[link(name = "c")]
 unsafe extern "C" {
     fn isatty(fd: c_int) -> c_int;
@@ -66,10 +86,18 @@ unsafe extern "C" {
     fn read(fd: c_int, buffer: *mut c_void, count: usize) -> isize;
 }
 
+/*
+This check rejects redirected input or output before raw terminal state changes.
+Interactive operation requires both standard descriptors to refer to terminals.
+*/
 pub fn redirected() -> bool {
     unsafe { isatty(0) == 0 || isatty(1) == 0 }
 }
 
+/*
+Console owns the original terminal state and cached dimensions for one application run.
+It also keeps macro playback and physical keys that arrive while a macro delay runs.
+*/
 pub struct Console {
     old_termios: Termios,
     width: Cell<usize>,
@@ -78,6 +106,10 @@ pub struct Console {
     pending_keys: RefCell<VecDeque<Key>>,
 }
 
+/*
+Key stores one application key code, its decoded character, and Windows-compatible modifier bits.
+Control uses bits 4 and 8. Alt uses bits 1 and 2. Shift uses bit 16.
+*/
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Key {
     pub code: u16,
@@ -85,6 +117,30 @@ pub struct Key {
     pub control: u32,
 }
 
+impl Key {
+    /*
+    This predicate accepts one mapped Alt letter and rejects Control, Shift, or mixed modifier input.
+    The code comparison is case independent because the parser normalizes ASCII letter key codes.
+    */
+    pub fn is_alt(self, letter: u8) -> bool {
+        self.control & 3 != 0
+            && self.control & !3 == 0
+            && self.code == u16::from(letter.to_ascii_uppercase())
+    }
+
+    /*
+    This predicate permits unmodified text and Shift text while rejecting Control and Alt text.
+    Prompts, Hex editing, navigation letters, and character menus use the same input boundary.
+    */
+    pub fn accepts_text(self) -> bool {
+        self.control & 15 == 0 && !self.character.is_control()
+    }
+}
+
+/*
+This bounded delay keeps macro playback responsive to physical Escape input.
+Other physical keys enter the pending queue for delivery after the macro event.
+*/
 fn wait_delay(delay_ms: u32, mut cancelled: impl FnMut() -> io::Result<bool>) -> io::Result<bool> {
     let start = Instant::now();
     let delay = Duration::from_millis(u64::from(delay_ms));
@@ -101,6 +157,10 @@ fn wait_delay(delay_ms: u32, mut cancelled: impl FnMut() -> io::Result<bool>) ->
     }
 }
 
+/*
+This formatter emits terminal-safe text within a fixed cell count.
+Known one-cell characters remain visible, while controls and unknown-width Unicode use safe replacements.
+*/
 fn visible(text: &str, width: usize) -> String {
     let mut output = String::new();
     let mut cells = 0;
@@ -125,10 +185,18 @@ fn visible(text: &str, width: usize) -> String {
     output
 }
 
+/*
+This public wrapper escapes complete display text without a width limit.
+Operational native paths stay outside this display-only conversion.
+*/
 pub fn safe_text(text: &str) -> String {
     visible(text, usize::MAX)
 }
 
+/*
+This query reads current terminal dimensions and rejects unusable zero-sized results.
+Rendering and resize detection use the same validated values.
+*/
 fn screen_size() -> io::Result<(usize, usize)> {
     let mut size = WindowSize::default();
     if unsafe { ioctl(1, TIOCGWINSZ, &mut size) } != 0 {
@@ -140,6 +208,10 @@ fn screen_size() -> io::Result<(usize, usize)> {
     Ok((usize::from(size.columns), usize::from(size.rows)))
 }
 
+/*
+This decoder converts xterm modifier parameters into the established Windows-compatible modifier bits.
+The conversion keeps Alt separate from both supported Control bits.
+*/
 fn modifier_state(value: u16) -> u32 {
     let bits = value.saturating_sub(1);
     (u32::from(bits & 1 != 0) * 16)
@@ -147,6 +219,10 @@ fn modifier_state(value: u16) -> u32 {
         | (u32::from(bits & 4 != 0) * 8)
 }
 
+/*
+This converter maps printable ASCII letters and digits to stable application key codes.
+Other characters keep their character value but do not receive a command code.
+*/
 fn key_code(byte: u8) -> u16 {
     if byte.is_ascii_alphabetic() {
         u16::from(byte.to_ascii_uppercase())
@@ -157,6 +233,10 @@ fn key_code(byte: u8) -> u16 {
     }
 }
 
+/*
+This converter turns one raw ASCII control byte into its letter code and Control state.
+The character remains the original control value so text paths cannot insert it.
+*/
 fn control_key(byte: u8) -> Key {
     Key {
         code: u16::from(b'A' + byte - 1),
@@ -165,6 +245,26 @@ fn control_key(byte: u8) -> Key {
     }
 }
 
+/*
+This converter creates one raw Escape-prefixed Alt key from its following byte.
+ASCII letters retain a command code, while non-ASCII bytes become safe replacement text.
+*/
+fn alt_key(byte: u8) -> Key {
+    Key {
+        code: key_code(byte),
+        character: if byte.is_ascii() {
+            char::from(byte)
+        } else {
+            '\u{fffd}'
+        },
+        control: 2,
+    }
+}
+
+/*
+This parser converts one complete CSI or SS3 body into an application key.
+The physical filter consumes recognized function-key sequences without dispatching their actions.
+*/
 fn csi_key(sequence: &[u8]) -> Option<Key> {
     let final_byte = *sequence.last()?;
     let body = std::str::from_utf8(&sequence[..sequence.len() - 1]).ok()?;
@@ -219,6 +319,18 @@ fn csi_key(sequence: &[u8]) -> Option<Key> {
     })
 }
 
+/*
+This physical-input filter removes parsed function keys after the terminal sequence is complete.
+Stored macro scan keys do not use this filter and keep legacy compatibility.
+*/
+fn physical_sequence_key(sequence: &[u8]) -> Option<Key> {
+    csi_key(sequence).filter(|key| !(112..=123).contains(&key.code))
+}
+
+/*
+This converter maps a legacy scan code or character keycode into one application Key.
+Macro playback uses this path so stored function-key records keep their historical actions.
+*/
 fn scan_key(scan: u16, keycode: u32, control: u32) -> Option<Key> {
     let code = match scan {
         0x3b..=0x44 => 112 + scan - 0x3b,
@@ -270,13 +382,25 @@ fn scan_key(scan: u16, keycode: u32, control: u32) -> Option<Key> {
     })
 }
 
+/*
+This implementation manages the terminal lifecycle, input boundaries, drawing, prompts, and macro playback.
+Each method preserves the original terminal state or returns an operating-system error.
+*/
 impl Console {
+    /*
+    This constructor captures the terminal, selects raw input, and enters the alternate screen.
+    A partial initialization restores the terminal before it returns the original error.
+    */
     pub fn new() -> io::Result<Self> {
         if redirected() {
             return Err(io::Error::other(
                 "HView-Linux needs an interactive terminal.",
             ));
         }
+        /*
+        This section reads the current Linux terminal state and derives the required raw flags.
+        The saved record remains unchanged for Drop and failed-initialization recovery.
+        */
         let mut old_termios = unsafe { std::mem::zeroed() };
         if unsafe { tcgetattr(STDIN, &mut old_termios) } != 0 {
             return Err(io::Error::last_os_error());
@@ -291,6 +415,10 @@ impl Console {
         if unsafe { tcsetattr(STDIN, TCSAFLUSH, &raw) } != 0 {
             return Err(io::Error::last_os_error());
         }
+        /*
+        This section validates dimensions and publishes the alternate-screen control sequence.
+        Console state becomes available only after the terminal output flush succeeds.
+        */
         let initialized = (|| {
             let (width, height) = screen_size()?;
             let mut output = io::stdout().lock();
@@ -304,6 +432,10 @@ impl Console {
                 pending_keys: RefCell::new(VecDeque::new()),
             })
         })();
+        /*
+        If screen initialization fails, this section restores the cursor, screen, and terminal settings.
+        The caller then receives the initialization error with no retained Console owner.
+        */
         if initialized.is_err() {
             let mut output = io::stdout().lock();
             let _ = output.write_all(b"\x1b[?25h\x1b[?1049l");
@@ -315,6 +447,10 @@ impl Console {
         initialized
     }
 
+    /*
+    This accessor refreshes cached dimensions when the operating-system query succeeds.
+    A failed refresh retains the last dimensions from a valid query.
+    */
     pub fn dimensions(&self) -> (usize, usize) {
         if let Ok((width, height)) = screen_size() {
             self.width.set(width);
@@ -323,6 +459,10 @@ impl Console {
         (self.width.get(), self.height.get())
     }
 
+    /*
+    This check updates cached dimensions and reports whether a new terminal size exists.
+    Input polling uses the result to request a redraw without creating a key action.
+    */
     fn resized(&self) -> bool {
         let Ok((width, height)) = screen_size() else {
             return false;
@@ -333,6 +473,9 @@ impl Console {
         changed
     }
 
+    /*
+    These accessors select one refreshed dimension for layout calculations.
+    */
     pub fn width(&self) -> usize {
         self.dimensions().0
     }
@@ -341,6 +484,10 @@ impl Console {
         self.dimensions().1
     }
 
+    /*
+    This renderer clears each visible row and writes one clipped frame to standard output.
+    It builds the complete control sequence before one locked write and flush.
+    */
     pub fn draw(&self, lines: &[String]) -> io::Result<()> {
         let (width, height) = self.dimensions();
         let mut frame = String::with_capacity(width.saturating_mul(height).saturating_add(64));
@@ -355,7 +502,15 @@ impl Console {
         output.flush()
     }
 
+    /*
+    This input controller delivers a macro event, one pending physical key, or a new terminal key.
+    Resize events return an empty key so the viewer can redraw without an action.
+    */
     pub fn key(&self) -> io::Result<Key> {
+        /*
+        Macro playback uses the legacy scan conversion before physical input parsing.
+        Thus, stored function-key records keep their contextual actions after physical function keys retire.
+        */
         if let Some(playback) = self.playback.borrow_mut().as_mut()
             && let Some(event) = playback.next_event()
         {
@@ -376,6 +531,10 @@ impl Console {
                 .ok_or_else(|| io::Error::other("The macro key is not valid."));
             }
         }
+        /*
+        Physical keys collected during a macro delay run before new terminal polling.
+        The final loop converts a terminal resize into a neutral key for the active view.
+        */
         if let Some(key) = self.pending_keys.borrow_mut().pop_front() {
             return Ok(key);
         }
@@ -393,6 +552,10 @@ impl Console {
         }
     }
 
+    /*
+    This bounded poll reads one byte and retries an interrupted Linux system call.
+    Timeout, EOF, and operating-system errors remain distinct results for the input parser.
+    */
     fn read_byte(&self, timeout_ms: c_int) -> io::Result<Option<u8>> {
         let mut input = PollFd {
             fd: STDIN,
@@ -429,6 +592,10 @@ impl Console {
         }
     }
 
+    /*
+    This parser handles one physical control, ASCII, or UTF-8 key from standard input.
+    Escape starts the separate Alt and terminal-sequence path.
+    */
     fn read_key_timeout(&self, timeout_ms: c_int) -> io::Result<Option<Key>> {
         let Some(first) = self.read_byte(timeout_ms)? else {
             return Ok(None);
@@ -460,6 +627,10 @@ impl Console {
         if (1..=26).contains(&first) {
             return Ok(Some(control_key(first)));
         }
+        /*
+        This section reads the remaining bytes for one UTF-8 character with a short input deadline.
+        Invalid input becomes one replacement character without creating a command code.
+        */
         let mut bytes = vec![first];
         let length = match first {
             0xc2..=0xdf => 2,
@@ -483,6 +654,10 @@ impl Console {
         }))
     }
 
+    /*
+    This parser distinguishes plain Escape, Alt-prefixed characters, and CSI or SS3 terminal keys.
+    Physical function keys are consumed here, while macro scan keys bypass this physical boundary.
+    */
     fn read_escape(&self) -> io::Result<Option<Key>> {
         let Some(next) = self.read_byte(30)? else {
             return Ok(Some(Key {
@@ -492,17 +667,12 @@ impl Console {
             }));
         };
         if next != b'[' && next != b'O' {
-            let character = if next.is_ascii() {
-                char::from(next)
-            } else {
-                '\u{fffd}'
-            };
-            return Ok(Some(Key {
-                code: key_code(next),
-                character,
-                control: 2,
-            }));
+            return Ok(Some(alt_key(next)));
         }
+        /*
+        This bounded sequence reader stops after one final terminal byte.
+        It suppresses retired physical function keys after parsing all their bytes.
+        */
         let mut sequence = Vec::with_capacity(8);
         while sequence.len() < 24 {
             let Some(byte) = self.read_byte(30)? else {
@@ -510,7 +680,7 @@ impl Console {
             };
             sequence.push(byte);
             if (0x40..=0x7e).contains(&byte) {
-                if let Some(key) = csi_key(&sequence) {
+                if let Some(key) = physical_sequence_key(&sequence) {
                     return Ok(Some(key));
                 }
                 break;
@@ -519,6 +689,10 @@ impl Console {
         Ok(None)
     }
 
+    /*
+    This poll lets physical Escape cancel macro delay without losing other physical keys.
+    The fixed key count bounds work before the next macro event.
+    */
     fn macro_cancelled(&self) -> io::Result<bool> {
         let mut cancelled = false;
         for _ in 0..64 {
@@ -534,16 +708,26 @@ impl Console {
         Ok(cancelled)
     }
 
+    /*
+    This setter transfers parsed macro playback into the Console input owner.
+    */
     pub fn start_macro(&self, playback: crate::macros::Playback) {
         *self.playback.borrow_mut() = Some(playback);
     }
 
+    /*
+    This notification applies the stored stop-on-notice policy to active playback.
+    */
     pub fn macro_notice(&self) {
         if let Some(playback) = self.playback.borrow_mut().as_mut() {
             playback.notice();
         }
     }
 
+    /*
+    This modal draws one centered notice and returns the first meaningful key.
+    The caller decides which key values close or continue its operation.
+    */
     pub fn modal(&self, base: &[String], text: &str) -> io::Result<Key> {
         loop {
             let (width, height) = self.dimensions();
@@ -562,10 +746,17 @@ impl Console {
         }
     }
 
+    /*
+    This wrapper starts an empty text prompt through the shared seeded prompt path.
+    */
     pub fn prompt(&self, base: &[String], label: &str) -> io::Result<Option<String>> {
         self.prompt_seed(base, label, "")
     }
 
+    /*
+    This prompt edits one bounded UTF-8 string until Escape cancels or Enter accepts it.
+    Only unmodified or Shift text can enter the field, so Alt shortcuts never become prompt text.
+    */
     pub fn prompt_seed(
         &self,
         base: &[String],
@@ -594,7 +785,7 @@ impl Console {
                     value.pop();
                     replace = false;
                 }
-                _ if !key.character.is_control() && value.len() < 1023 => {
+                _ if key.accepts_text() && value.len() < 1023 => {
                     if replace {
                         value.clear();
                         replace = false;
@@ -607,6 +798,10 @@ impl Console {
     }
 }
 
+/*
+This destructor restores the cursor, primary screen, and captured Linux terminal settings.
+It attempts every cleanup action because Drop cannot return an error.
+*/
 impl Drop for Console {
     fn drop(&mut self) {
         let mut output = io::stdout().lock();
@@ -618,10 +813,17 @@ impl Drop for Console {
     }
 }
 
+/*
+These unit tests verify the Linux ABI, key conversion, safe display text, and bounded macro delay.
+The key tests keep physical and legacy macro modifier behavior explicit.
+*/
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /*
+    This test protects the exact C record layouts used by direct libc calls.
+    */
     #[test]
     fn native_layouts_match_x86_64_linux() {
         assert_eq!(std::mem::size_of::<Termios>(), 60);
@@ -633,6 +835,9 @@ mod tests {
         assert_eq!(std::mem::size_of::<PollFd>(), 8);
     }
 
+    /*
+    This test covers terminal modifiers, macro scan conversion, Alt commands, and text acceptance.
+    */
     #[test]
     fn terminal_sequences_map_to_application_keys() {
         assert_eq!(csi_key(b"18~").unwrap().code, 118);
@@ -643,6 +848,68 @@ mod tests {
         assert_eq!(csi_key(b"1;2R").unwrap().code, 114);
         assert_eq!(csi_key(b"1;2R").unwrap().control, 16);
         assert_eq!(csi_key(b"1;3A").unwrap().control, 2);
+        assert_eq!(physical_sequence_key(b"13~"), None);
+        assert_eq!(physical_sequence_key(b"1;2R"), None);
+        assert_eq!(physical_sequence_key(b"1;3A").unwrap().code, 38);
+        let raw_alt_h = alt_key(b'h');
+        assert_eq!(
+            (raw_alt_h.code, raw_alt_h.character),
+            (u16::from(b'H'), 'h')
+        );
+        for alt in [1, 2] {
+            assert_eq!(alt & 12, 0);
+            assert!(
+                Key {
+                    code: u16::from(b'H'),
+                    character: 'h',
+                    control: alt,
+                }
+                .is_alt(b'H')
+            );
+        }
+        for control in [4, 8, 12] {
+            assert_ne!(control & 12, 0);
+        }
+        assert!(
+            Key {
+                code: u16::from(b'H'),
+                character: 'h',
+                control: 2,
+            }
+            .is_alt(b'H')
+        );
+        assert!(
+            !Key {
+                code: u16::from(b'H'),
+                character: 'h',
+                control: 10,
+            }
+            .is_alt(b'H')
+        );
+        assert!(
+            !Key {
+                code: u16::from(b'H'),
+                character: 'H',
+                control: 18,
+            }
+            .is_alt(b'H')
+        );
+        assert!(
+            Key {
+                code: u16::from(b'A'),
+                character: 'A',
+                control: 16,
+            }
+            .accepts_text()
+        );
+        assert!(
+            !Key {
+                code: u16::from(b'A'),
+                character: 'a',
+                control: 2,
+            }
+            .accepts_text()
+        );
         assert_eq!(scan_key(0xe04b, 0, 0).unwrap().code, 37);
         assert!(csi_key(b"3~").is_none());
         assert_eq!(key_code(b'p'), u16::from(b'P'));
@@ -671,6 +938,9 @@ mod tests {
         }
     }
 
+    /*
+    This test requires safe terminal text and deterministic clipping.
+    */
     #[test]
     fn visible_text_blocks_terminal_control_characters() {
         assert_eq!(visible("safe\u{1b}[31m\nname", 20), "safe�[31m�name");
@@ -679,6 +949,9 @@ mod tests {
         assert_eq!(visible("☺Ç", 2), "☺Ç");
     }
 
+    /*
+    This test verifies complete, canceled, and zero-length macro delays.
+    */
     #[test]
     fn macro_delay_timing_and_cancellation() {
         let start = Instant::now();

@@ -17,9 +17,9 @@ from terminal_probe import run_session
 # These key sequences select quit, file switching, and the file picker.
 # Tests send the exact terminal bytes used by the application.
 CTRL_Q = b"\x11"
-CTRL_F11 = b"\x1b[23;5~"
-CTRL_F12 = b"\x1b[24;5~"
-F9 = b"\x1b[20~"
+ALT_N = b"\x1bn"
+ALT_O = b"\x1bo"
+ALT_P = b"\x1bp"
 DOWN = b"\x1b[B"
 
 
@@ -139,7 +139,7 @@ def main() -> None:
         sibling_config = copied.with_name("hview-linux.ini")
         sibling_config.write_bytes(native_config("Text"))
         output = run_session(copied, [str(data_file)], [CTRL_Q], environment)
-        require(output, b"2Unwrap", "The sibling configuration did not have precedence.")
+        require(output, b"W Unwrap", "The sibling configuration did not have precedence.")
 
         explicit_config = root / "explicit.ini"
         explicit_config.write_bytes(native_config("Hex"))
@@ -154,7 +154,7 @@ def main() -> None:
         sibling_config.unlink()
         environment["HVIEW_PORTABLE"] = "1"
         output = run_session(copied, [str(data_file)], [CTRL_Q], environment)
-        require(output, b"2Unwrap", "Portable mode did not skip XDG configuration.")
+        require(output, b"W Unwrap", "Portable mode did not skip XDG configuration.")
         environment.pop("HVIEW_PORTABLE")
 
         invalid_config = root / "invalid.ini"
@@ -182,7 +182,7 @@ def main() -> None:
         output = run_session(
             binary,
             ["--recursive", str(recursive / "*.bin")],
-            [CTRL_F12, CTRL_Q],
+            [ALT_N, CTRL_Q],
         )
         require(output, b"b.bin", "Recursive file expansion did not include the child file.")
 
@@ -198,13 +198,13 @@ def main() -> None:
         output = run_session(
             binary,
             ["--session", str(session), str(first)],
-            [F9, DOWN, DOWN, b"\r", CTRL_Q],
+            [ALT_O, DOWN, DOWN, b"\r", CTRL_Q],
         )
         require(output, b"b-picked.bin", "The file picker did not open the selected file.")
         if not session.is_file():
             raise AssertionError("The explicit session file was not published.")
 
-        output = run_session(binary, ["--session", str(session)], [CTRL_F11, CTRL_Q])
+        output = run_session(binary, ["--session", str(session)], [ALT_P, CTRL_Q])
         require(output, b"a-first.bin", "Previous-file selection did not open the first file.")
         output = run_session(binary, ["--session", str(session)], [CTRL_Q])
         require(output, b"a-first.bin", "The active file did not survive restart.")
@@ -215,7 +215,7 @@ def main() -> None:
         run_session(
             binary,
             ["--config", str(view_config), "--session", str(view_session), str(first)],
-            [b"\x1b[C", F9, DOWN, DOWN, b"\r", CTRL_F11, CTRL_Q],
+            [b"\x1b[C", ALT_O, DOWN, DOWN, b"\r", ALT_P, CTRL_Q],
         )
         view_payload = view_session.read_bytes()[32:]
         active = int.from_bytes(view_payload[:4], "little")
@@ -314,7 +314,7 @@ def main() -> None:
                 str(data_file),
                 str(utf16_file),
             ],
-            [b"m", b"t\r", CTRL_F12, CTRL_Q],
+            [b"m", b"t\r", ALT_N, CTRL_Q],
         )
         if not utf16_session.is_file():
             raise AssertionError("Explicit Hex mode did not initialize the UTF-16 session file.")

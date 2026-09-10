@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check macros and Linux key aliases through a pseudoterminal."""
 
+# These imports provide stored macro fixtures, timing, disposable files, and terminal sessions.
 from pathlib import Path
 import sys
 import tempfile
@@ -9,18 +10,22 @@ import time
 from terminal_probe import run_session
 
 
+# These values separate current physical Alt controls from legacy macro key identifiers.
+# The legacy values prove format compatibility after physical function keys retire.
 CTRL_Q = b"\x11"
 ENTER = b"\r"
 ESCAPE = b"\x1b"
-F3 = b"\x1b[13~"
-F9 = b"\x1b[20~"
+ALT_E = b"\x1be"
+ALT_S = b"\x1bs"
 RIGHT = 0xFF4D
-F7 = 0xFF41
-SHIFT_F7 = 0xFF5A
-CTRL_F7 = 0xFF64
-ALT_F7 = 0xFF6E
+LEGACY_F7 = 0xFF41
+LEGACY_SHIFT_F7 = 0xFF5A
+LEGACY_CTRL_F7 = 0xFF64
+LEGACY_ALT_F7 = 0xFF6E
 
 
+# This builder writes the fixed legacy macro header and its bounded event records.
+# Parameters select delay, repeat, notice, and historical signature behavior.
 def macro_file(
     events: list[tuple[int, int]],
     *,
@@ -42,17 +47,20 @@ def macro_file(
     return bytes(data)
 
 
+# This assertion requires one exact byte sequence in captured terminal output.
 def require(output: bytes, text: bytes, reason: str) -> None:
     """Require terminal output text."""
     if text not in output:
         raise AssertionError(reason)
 
 
+# This formatter creates the exact selected-offset header used by movement checks.
 def header(offset: int) -> bytes:
     """Make the selected-offset header text."""
     return f"{offset:08X}\N{BOX DRAWINGS LIGHT VERTICAL}HView-Linux".encode()
 
 
+# This entry point checks current macros, legacy macros, modifiers, delays, and key aliases.
 def main() -> None:
     """Run the macro and alias checks."""
     if len(sys.argv) != 2:
@@ -66,6 +74,7 @@ def main() -> None:
         data_file = root / "data.bin"
         data_file.write_bytes(bytes(range(64)))
 
+        # This section verifies current and historical signatures with stored movement and Quit actions.
         current = root / "current.mac"
         current.write_bytes(macro_file([(0, RIGHT), (0, RIGHT), (2, ord("Q"))]))
         output = run_session(
@@ -97,6 +106,7 @@ def main() -> None:
             "The legacy option and signature did not move to byte 3.",
         )
 
+        # This section verifies repeat cancellation and contextual legacy F7 modifier actions.
         repeat_file = root / "repeat.mac"
         repeat_file.write_bytes(macro_file([(0, RIGHT)], delay_ms=5, repeat=True))
         repeat_data = root / "repeat.bin"
@@ -116,11 +126,11 @@ def main() -> None:
         modifier_file.write_bytes(
             macro_file(
                 [
-                    (2, CTRL_F7),
+                    (2, LEGACY_CTRL_F7),
                     (0, ord("x")),
-                    (4, SHIFT_F7),
+                    (4, LEGACY_SHIFT_F7),
                     (0, ord("x")),
-                    (1, ALT_F7),
+                    (1, LEGACY_ALT_F7),
                 ]
             )
         )
@@ -129,18 +139,19 @@ def main() -> None:
             ["--macro", str(modifier_file), str(data_file)],
             [ESCAPE, CTRL_Q],
         )
-        repeat_notice = b"Press F7 to enter a search pattern first."
+        repeat_notice = b"Press Alt+F to enter a search pattern first."
         if output.count(repeat_notice) != 2:
-            raise AssertionError("The Ctrl and Shift macro modifiers did not run F7 repeat.")
+            raise AssertionError("The Ctrl and Shift macro modifiers did not run legacy F7 repeat.")
         require(
             output,
             b"ASCII: _",
-            "The Alt macro modifier did not run the F7 search prompt.",
+            "The Alt macro modifier did not run the legacy F7 search prompt.",
         )
 
+        # This section applies stop-on-notice and maximum-delay cancellation without losing queued input.
         notice_file = root / "notice.mac"
         notice_file.write_bytes(
-            macro_file([(0, F7), (0, 0)], repeat=True, stop_on_notice=True)
+            macro_file([(0, LEGACY_F7), (0, 0)], repeat=True, stop_on_notice=True)
         )
         output = run_session(
             binary,
@@ -178,6 +189,7 @@ def main() -> None:
             "The mode prompt did not use the queued H and Enter keys.",
         )
 
+        # This section checks retained terminal aliases in normal Text, Hex, and Code views.
         # Linux terminals send the same carriage-return byte for Ctrl+M and Enter.
         output = run_session(
             binary,
@@ -219,12 +231,14 @@ def main() -> None:
         )
         require(output, b"a32", "The O alias did not select 32-bit Code mode.")
 
+        # This section proves that normal aliases and modified macro letters cannot become edit input.
+        # The legacy F3 and F9 records still use their historical contextual actions.
         edit_file = root / "edit.bin"
         edit_file.write_bytes(b"\0")
         run_session(
             binary,
             ["--mode=hex", str(edit_file)],
-            [F3, b"mohjkl", b"a", F9, CTRL_Q],
+            [ALT_E, b"mohjkl", b"a", ALT_S, CTRL_Q],
         )
         if edit_file.read_bytes() != b"\xA0":
             raise AssertionError("Normal-mode aliases changed the hexadecimal edit workflow.")

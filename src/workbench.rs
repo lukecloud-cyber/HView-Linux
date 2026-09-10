@@ -1,3 +1,7 @@
+/*
+This module provides Help and the buffered analysis tools that run from the main editor loop.
+Each tool uses the active Editor bytes, including accepted edits that are not saved.
+*/
 use crate::{
     console::Console,
     editor::{ByteOrder, Editor, Mode, RawModel},
@@ -5,6 +9,10 @@ use crate::{
 };
 use std::{fs, io};
 
+/*
+This helper moves a buffered view to one selected result.
+Code mode aligns its viewport with the selected instruction position.
+*/
 pub fn jump(view: &mut Editor, offset: usize, rows: usize) {
     view.goto(offset as u64, rows);
     if view.mode == Mode::Code {
@@ -12,10 +20,18 @@ pub fn jump(view: &mut Editor, offset: usize, rows: usize) {
     }
 }
 
+/*
+This browser renders one bounded result list and returns the selected file offset.
+It keeps selection and horizontal scroll state while terminal dimensions change.
+*/
 fn browse(console: &Console, title: &str, items: &[(usize, String)]) -> io::Result<Option<usize>> {
     let mut selected = 0usize;
     let mut column = 0usize;
     loop {
+        /*
+        This section builds one page around the selected result.
+        Empty results receive a clear row before the common navigation footer.
+        */
         let (_width, height) = console.dimensions();
         let page = height.saturating_sub(4).max(1);
         let mut lines = vec![String::new(); height];
@@ -42,6 +58,10 @@ fn browse(console: &Console, title: &str, items: &[(usize, String)]) -> io::Resu
                 " Up/Down Select  PgUp/PgDn Page  Left/Right Scroll  Enter Goto  Esc Back".into();
         }
         console.draw(&lines)?;
+        /*
+        This section applies selection, paging, and horizontal scrolling keys.
+        Enter returns a real item offset, while Escape cancels the browser.
+        */
         match console.key()?.code {
             27 => return Ok(None),
             13 => return Ok(items.get(selected).map(|item| item.0)),
@@ -60,16 +80,22 @@ fn browse(console: &Console, title: &str, items: &[(usize, String)]) -> io::Resu
     }
 }
 
+/*
+This screen lists every current viewer and tool shortcut.
+Escape, Enter, Alt+H, and legacy macro F1 records return to the active view.
+*/
 pub fn help(console: &Console) -> io::Result<()> {
     let help = [
         " Editor controls",
-        " F3 Edit/Undo  Shift+F3 Redo  Ctrl+Z/Y Undo/Redo  F9 Save  Esc Cancel",
+        " Alt+E Edit  Ctrl+Z/Y Undo/Redo  Alt+S Save  Esc Cancel",
         " Ctrl+S Save As: save the buffer to a new file",
-        " M or Enter Mode  O Code size  Ctrl+Q Quit",
+        " Alt+M, M, or Enter Mode  O Code size  Ctrl+Q Quit",
         " H/J/K/L Move  Ctrl+T Analysis tools",
-        " F4 Mode  F5 Goto  F7 Search  F9 Files  F10 Quit",
+        " Alt+H Help  Alt+W Wrap  Alt+L Line notice  Alt+A Assemble",
+        " Alt+G Goto  Alt+M Mode",
+        " Alt+F Search  Alt+R/B Next/Previous  Alt+O Files",
+        " Alt+P/N Previous/Next file",
         " Hex search accepts wildcards: 48 8B ?? A? ?F",
-        " Shift+F7 Next match  Ctrl+F7 Previous match",
         " Code: Enter Follow direct relative branch/call  Backspace Return",
         " Ctrl+T Analysis tools:",
         "   A  Convert a file offset, RVA, or VA",
@@ -84,9 +110,12 @@ pub fn help(console: &Console) -> io::Result<()> {
         " Tools use the current editor buffer, including unsaved edits.",
         " AUTO uses PE metadata. A raw model uses its runtime base.",
         " Range offsets and lengths use hexadecimal numbers.",
-        " Press Esc or Enter to return.",
     ];
     loop {
+        /*
+        This section fits as many Help lines as the current terminal height permits.
+        A later resize redraws the same complete list from its first line.
+        */
         let (_width, height) = console.dimensions();
         let mut lines = vec![String::new(); height];
         for (slot, text) in lines
@@ -97,19 +126,30 @@ pub fn help(console: &Console) -> io::Result<()> {
         {
             *slot = text.into();
         }
+        if let Some(footer) = lines.last_mut() {
+            *footer = " Press Alt+H, Esc, or Enter to return.".into();
+        }
         console.draw(&lines)?;
-        if matches!(console.key()?.code, 27 | 13 | 112) {
+        let key = console.key()?;
+        if matches!(key.code, 27 | 13 | 112) || key.is_alt(b'H') {
             return Ok(());
         }
     }
 }
 
+/*
+This parser accepts one complete hexadecimal usize value for bounded tool ranges.
+*/
 fn number(text: &str) -> Result<usize, String> {
     let text = text.trim();
     usize::from_str_radix(text, 16)
         .map_err(|_| "Enter a hexadecimal offset and length within the address range.".into())
 }
 
+/*
+This parser reads one address-kind letter and one complete hexadecimal u64 value.
+It returns the common address record used by the current raw and PE converters.
+*/
 fn address_input(text: &str) -> Result<(format::AddressKind, u64), String> {
     let (kind, digits) = text
         .split_once(' ')
@@ -129,7 +169,15 @@ fn address_input(text: &str) -> Result<(format::AddressKind, u64), String> {
     Ok((kind, value))
 }
 
+/*
+This parser selects AUTO or one complete x86 raw-memory model.
+It validates the architecture, width, byte order, and hexadecimal runtime base.
+*/
 fn raw_model_input(text: &str) -> Result<Option<RawModel>, String> {
+    /*
+    This section recognizes the exact AUTO value before it splits a manual model.
+    The strict field checks reject missing, extra, or partially valid model text.
+    */
     const ERROR: &str = "Enter AUTO or X86 16|32|64 LE|BE HEXBASE.";
     if text == "AUTO" {
         return Ok(None);
@@ -142,6 +190,10 @@ fn raw_model_input(text: &str) -> Result<Option<RawModel>, String> {
     {
         return Err(ERROR.into());
     }
+    /*
+    This section converts validated fields into bounded numeric and enum values.
+    It constructs the model only after all fields pass their complete checks.
+    */
     let bits = match fields[1] {
         "16" => 16,
         "32" => 32,
@@ -162,7 +214,15 @@ fn raw_model_input(text: &str) -> Result<Option<RawModel>, String> {
     }))
 }
 
+/*
+This prompt applies one validated raw model to the active Editor.
+The result tells the main loop whether address-dependent return history must clear.
+*/
 fn set_raw_model(console: &Console, view: &mut Editor, base: &[String]) -> io::Result<bool> {
+    /*
+    This section collects one model choice and reports parser errors without changing the Editor.
+    A canceled prompt leaves the model unchanged and requests no branch-return history invalidation.
+    */
     let Some(input) = console.prompt(base, "Raw model: AUTO or X86 16|32|64 LE|BE HEXBASE")? else {
         return Ok(false);
     };
@@ -173,6 +233,10 @@ fn set_raw_model(console: &Console, view: &mut Editor, base: &[String]) -> io::R
             return Ok(false);
         }
     };
+    /*
+    This section applies the accepted model through Editor validation.
+    The return value requests history invalidation only when the runtime address model changes.
+    */
     let before = view.raw_model;
     if let Err(error) = view.set_raw_model(model) {
         console.modal(base, &error)?;
@@ -185,6 +249,10 @@ fn set_raw_model(console: &Console, view: &mut Editor, base: &[String]) -> io::R
     })
 }
 
+/*
+This tool converts one file, RVA, or virtual address through the current Editor model.
+Mapped file bytes enter the common result browser and can move the active view.
+*/
 fn convert_address(console: &Console, view: &mut Editor, base: &[String]) -> io::Result<()> {
     let raw = view.raw_model.is_some();
     let Some(input) = console.prompt(
@@ -206,6 +274,10 @@ fn convert_address(console: &Console, view: &mut Editor, base: &[String]) -> io:
             return Ok(());
         }
     };
+    /*
+    This section formats every available address kind for one result row.
+    A mapped file offset can become the next active cursor position.
+    */
     let file = address
         .file_offset
         .map(|value| format!("{value:08X}"))
@@ -246,6 +318,10 @@ fn convert_address(console: &Console, view: &mut Editor, base: &[String]) -> io:
     Ok(())
 }
 
+/*
+This edit tool parses one bounded range and applies Fill or XOR through Editor history.
+It calculates the destination viewport before the single replacement transaction.
+*/
 fn change_range(
     console: &Console,
     view: &mut Editor,
@@ -253,7 +329,7 @@ fn change_range(
     xor: bool,
 ) -> io::Result<()> {
     if !view.editing {
-        console.modal(base, "Press F3 to enter edit mode first.")?;
+        console.modal(base, "Press Alt+E to enter edit mode first.")?;
         return Ok(());
     }
     let Some(range) =
@@ -274,6 +350,10 @@ fn change_range(
             return Ok(());
         }
     };
+    /*
+    This section parses the repeating mask and copies only the selected range.
+    The final Editor transaction preserves Undo, Redo, and dirty-state rules.
+    */
     let Some(mask) = console.prompt(
         base,
         if xor {
@@ -318,7 +398,15 @@ fn change_range(
     Ok(())
 }
 
+/*
+This dispatcher draws the buffered analysis menu and runs one selected tool.
+Modified letters do not select a tool or leak into any later character command.
+*/
 pub fn tools(console: &Console, view: &mut Editor, base: &[String]) -> io::Result<bool> {
+    /*
+    This loop redraws the menu after a resize and returns one meaningful key.
+    Each action uses the active Editor only after this input boundary accepts it.
+    */
     let key = loop {
         let (_width, height) = console.dimensions();
         let mut lines = vec![String::new(); height];
@@ -343,16 +431,36 @@ pub fn tools(console: &Console, view: &mut Editor, base: &[String]) -> io::Resul
             break key;
         }
     };
+    if !key.accepts_text() {
+        return Ok(false);
+    }
+
+    /*
+    This dispatch runs one address, model, inspection, comparison, or range-edit action.
+    Strings, PE structures, and comparisons keep their 10,000-row limit.
+    Entropy and integer results keep their separate natural bounds.
+    */
     let mut clear_return_history = false;
     let items = match key.character.to_ascii_uppercase() {
+        /*
+        The address tool converts one value and can move the active cursor through its result browser.
+        */
         'A' => {
             convert_address(console, view, base)?;
             None
         }
+        /*
+        The raw-model tool changes address interpretation without changing source bytes.
+        Its result tells the caller whether to clear branch-return history.
+        */
         'R' => {
             clear_return_history = set_raw_model(console, view, base)?;
             None
         }
+        /*
+        The string tool scans the current buffer with a four-character minimum.
+        It truncates stored display results before it enters the shared browser.
+        */
         'S' => {
             // ponytail: Bound result storage. Add streamed results when larger lists are needed.
             let mut items = inspect::strings(&view.data, 4, 10001);
@@ -364,6 +472,10 @@ pub fn tools(console: &Console, view: &mut Editor, base: &[String]) -> io::Resul
             };
             Some((title, items))
         }
+        /*
+        The PE tool parses bounded format structures from the current buffer.
+        Parser errors become modal notices, and valid rows use the common display limit.
+        */
         'P' => match format::structures(&view.data, 10001) {
             Ok(mut items) => {
                 let title = if items.len() > 10000 {
@@ -379,6 +491,10 @@ pub fn tools(console: &Console, view: &mut Editor, base: &[String]) -> io::Resul
                 None
             }
         },
+        /*
+        The entropy tool selects blocks of at least 4,096 bytes.
+        Large buffers increase the block size so the result remains naturally bounded.
+        */
         'E' => {
             let block = 4096usize.max(view.data.len().div_ceil(4096));
             Some((
@@ -386,6 +502,10 @@ pub fn tools(console: &Console, view: &mut Editor, base: &[String]) -> io::Resul
                 inspect::entropy_map(&view.data, block),
             ))
         }
+        /*
+        The comparison tool reads one selected file and reports changed ranges from buffer to file.
+        It keeps current unsaved bytes as the left comparison input.
+        */
         'D' => {
             let Some(path) = console.prompt(base, "Compare file")? else {
                 return Ok(false);
@@ -407,6 +527,10 @@ pub fn tools(console: &Console, view: &mut Editor, base: &[String]) -> io::Resul
                 }
             }
         }
+        /*
+        The integer tool reads bounded values at the cursor with the selected byte order.
+        All returned rows point back to the current cursor position.
+        */
         'I' => {
             let rows = inspect::integers(
                 &view.data,
@@ -418,6 +542,10 @@ pub fn tools(console: &Console, view: &mut Editor, base: &[String]) -> io::Resul
             .collect();
             Some(("Integers at cursor", rows))
         }
+        /*
+        Fill and XOR share the same range-edit helper and one Editor history transaction.
+        The selected letter decides whether the repeating mask replaces or transforms bytes.
+        */
         'X' | 'F' => {
             change_range(
                 console,
@@ -429,6 +557,10 @@ pub fn tools(console: &Console, view: &mut Editor, base: &[String]) -> io::Resul
         }
         _ => None,
     };
+    /*
+    List-producing actions enter the shared browser after their bounded analysis completes.
+    The selected result updates the cursor before control returns to the main loop.
+    */
     if let Some((title, items)) = items
         && let Some(offset) = browse(console, title, &items)?
     {
@@ -437,10 +569,17 @@ pub fn tools(console: &Console, view: &mut Editor, base: &[String]) -> io::Resul
     Ok(clear_return_history)
 }
 
+/*
+These unit tests protect strict tool-number, address, and raw-model parsing.
+They use complete accepted and rejected input tables without terminal state.
+*/
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /*
+    This test rejects partial and signed range values.
+    */
     #[test]
     fn range_numbers_require_complete_input() {
         assert_eq!(number("10").unwrap(), 16);
@@ -449,6 +588,9 @@ mod tests {
         assert!(number("-1").is_err());
     }
 
+    /*
+    This test checks every address kind and malformed grammar group.
+    */
     #[test]
     fn address_input_requires_one_complete_hexadecimal_value() {
         use format::AddressKind::{File, Rva, Va};
@@ -469,6 +611,9 @@ mod tests {
         }
     }
 
+    /*
+    This test checks AUTO, one complete model, and each invalid model field.
+    */
     #[test]
     fn raw_model_input_requires_the_complete_strict_grammar() {
         let model = raw_model_input("X86 32 BE 123456789ABCDEF0")

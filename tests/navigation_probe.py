@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check direct Code navigation through a Linux pseudoterminal."""
 
+# These imports provide PE fixtures, session checksums, disposable files, and terminal sessions.
 from pathlib import Path
 import sys
 import tempfile
@@ -10,18 +11,20 @@ from file_workflow_probe import checksum
 from terminal_probe import run_session
 
 
+# These byte sequences select mapped edit, Goto, mode, save, and navigation controls.
 BACKSPACE = b"\x7f"
 CTRL_Q = b"\x11"
 DOWN = b"\x1b[B"
 ENTER = b"\r"
 ESCAPE = b"\x1b"
-F3 = b"\x1b[13~"
-F4 = b"\x1b[14~"
-F5 = b"\x1b[15~"
-F9 = b"\x1b[20~"
+ALT_E = b"\x1be"
+ALT_G = b"\x1bg"
+ALT_M = b"\x1bm"
+ALT_S = b"\x1bs"
 UP = b"\x1b[A"
 
 
+# These formatters create exact raw and PE headers for ordered cursor checks.
 def header(offset: int) -> bytes:
     """Return the selected-offset header."""
     return f"{offset:08X}\N{BOX DRAWINGS LIGHT VERTICAL}HView-Linux".encode()
@@ -32,6 +35,7 @@ def pe_header(address: int) -> bytes:
     return f".{address:08X}-Linux".encode()
 
 
+# These assertions require terminal values and their state-transition order.
 def require(output: bytes, *texts: bytes) -> None:
     """Require each output value."""
     for value in texts:
@@ -49,6 +53,7 @@ def require_order(output: bytes, *texts: bytes) -> None:
         position += len(value)
 
 
+# This selector isolates output after one final frame marker.
 def after_last(output: bytes, text: bytes) -> bytes:
     """Return output after the final value."""
     position = output.rfind(text)
@@ -57,6 +62,7 @@ def after_last(output: bytes, text: bytes) -> bytes:
     return output[position:]
 
 
+# This check follows each supported direct branch type and returns to its source.
 def check_direct_branches(binary: Path, root: Path) -> None:
     """Check direct branch types and directions."""
     data = bytearray(b"\x90" * 0x80)
@@ -84,6 +90,7 @@ def check_direct_branches(binary: Path, root: Path) -> None:
         require_order(output, header(source), header(target), header(source))
 
 
+# This helper updates one SAV viewport and recalculates its required checksum.
 def patch_saved_view(path: Path, offset: int, top: int) -> None:
     """Set one native saved view and update its checksum."""
     saved = bytearray(path.read_bytes())
@@ -98,6 +105,7 @@ def patch_saved_view(path: Path, offset: int, top: int) -> None:
     path.write_bytes(saved)
 
 
+# This check fills nested return history and restores saved cursor and viewport values.
 def check_nested_returns(binary: Path, root: Path) -> None:
     """Check nested returns and restored view position."""
     data = bytearray(b"\x90" * 0x80)
@@ -131,6 +139,7 @@ def check_nested_returns(binary: Path, root: Path) -> None:
     require(after_last(output, header(0x20)), b" 00000000: C3")
 
 
+# This check rejects self-target loops and clears step history after a successful Goto.
 def check_self_and_history_resets(binary: Path, root: Path) -> None:
     """Check no-op targets and history resets."""
     self_path = root / "self.bin"
@@ -158,12 +167,13 @@ def check_self_and_history_resets(binary: Path, root: Path) -> None:
     output = run_session(
         binary,
         ["--mode=code", str(step_path)],
-        [DOWN, F5, b"20", ENTER, UP, CTRL_Q],
+        [DOWN, ALT_G, b"20", ENTER, UP, CTRL_Q],
     )
     if output.count(header(0x20)) < 2 or header(0) in after_last(output, header(0x20)):
-        raise AssertionError("A successful F5 jump kept stale instruction-step history.")
+        raise AssertionError("A successful Alt+G jump kept stale instruction-step history.")
 
 
+# This check changes modes through plain and Alt controls around edited Code bytes.
 def check_modes_and_changed_buffer(binary: Path, root: Path) -> None:
     """Check mode keys, assembly access, and changed bytes."""
     mode_path = root / "modes.bin"
@@ -180,13 +190,13 @@ def check_modes_and_changed_buffer(binary: Path, root: Path) -> None:
             b"h\r",
             b"m",
             b"c\r",
-            F4,
+            ALT_M,
             b"h\r",
-            F4,
+            ALT_M,
             b"c\r",
             ENTER,
             BACKSPACE,
-            F3,
+            ALT_E,
             ENTER,
             ESCAPE,
             ESCAPE,
@@ -194,7 +204,7 @@ def check_modes_and_changed_buffer(binary: Path, root: Path) -> None:
         ],
     )
     if output.count(b"Mode: T Text, H Hex, C Code") < 6:
-        raise AssertionError("Text, Hex, M, or F4 did not keep mode selection available.")
+        raise AssertionError("Text, Hex, M, or Alt+M did not keep mode selection available.")
     require_order(output, header(0), header(8), header(0))
     require(output, b"Assembler")
 
@@ -203,13 +213,14 @@ def check_modes_and_changed_buffer(binary: Path, root: Path) -> None:
     output = run_session(
         binary,
         ["--mode=hex", "--offset=1", str(changed)],
-        [F3, b"02", F9, ENTER, b"c\r", F5, b"0", ENTER, ENTER, BACKSPACE, CTRL_Q],
+        [ALT_E, b"02", ALT_S, ENTER, b"c\r", ALT_G, b"0", ENTER, ENTER, BACKSPACE, CTRL_Q],
     )
     require_order(output, header(0), header(4), header(0))
     if not changed.read_bytes().startswith(b"\xEB\x02"):
         raise AssertionError("The changed direct target bytes were not saved.")
 
 
+# This check rejects unsupported branch targets and preserves the current raw position.
 def check_raw_refusals(binary: Path, root: Path) -> None:
     """Check invalid, indirect, far, and outside sources."""
     cases = [
@@ -241,12 +252,14 @@ def check_raw_refusals(binary: Path, root: Path) -> None:
     require(output, b"db 0F", b"Invalid or incomplete x86 instruction", header(0))
 
 
+# This helper encodes one relative 32-bit call for controlled PE navigation.
 def branch32(source: int, target: int) -> bytes:
     """Encode one direct near call displacement."""
     displacement = (target - source - 5) & 0xFFFFFFFF
     return b"\xE8" + displacement.to_bytes(4, "little")
 
 
+# This check follows mapped PE branches and rejects targets without file bytes.
 def check_pe_navigation(binary: Path, root: Path) -> None:
     """Check mapped PE navigation and mapping refusals."""
     source_data, base = pe_fixture(False)
@@ -338,6 +351,7 @@ def check_pe_navigation(binary: Path, root: Path) -> None:
     require(output, b"outside the PE image", pe_header(base + 0x1000))
 
 
+# This helper writes one deterministic disassembly syntax and width configuration.
 def syntax_config(path: Path, syntax: str, bits: int = 16) -> None:
     """Write one native Code configuration."""
     path.write_text(
@@ -345,6 +359,7 @@ def syntax_config(path: Path, syntax: str, bits: int = 16) -> None:
     )
 
 
+# This check preserves branch navigation across syntax selection and Real16 decoding.
 def check_syntax_and_real16(binary: Path, root: Path) -> None:
     """Check Intel, AT&T, and Real16 targets."""
     call = root / "syntax-call.bin"
@@ -399,6 +414,7 @@ def check_syntax_and_real16(binary: Path, root: Path) -> None:
             require_order(real, header(start), header(0), header(start))
 
 
+# This entry point runs every navigation group against disposable source and session files.
 def main() -> None:
     """Run the direct navigation checks."""
     if len(sys.argv) != 2:

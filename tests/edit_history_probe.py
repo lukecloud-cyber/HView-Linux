@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check grouped edit undo and redo through a Linux pseudoterminal."""
 
+# These imports provide disposable files, stored macro fixtures, and terminal sessions.
 from pathlib import Path
 import sys
 import tempfile
@@ -9,6 +10,8 @@ from macro_probe import macro_file
 from terminal_probe import run_session
 
 
+# These byte sequences cover mapped edit, assembly, save, history, and movement controls.
+# Legacy macro records remain separate from these physical terminal sequences.
 CTRL_Q = b"\x11"
 CTRL_S = b"\x13"
 CTRL_T = b"\x14"
@@ -16,14 +19,13 @@ CTRL_Y = b"\x19"
 CTRL_Z = b"\x1a"
 ENTER = b"\r"
 ESCAPE = b"\x1b"
-F2 = b"\x1b[12~"
-F3 = b"\x1b[13~"
-F9 = b"\x1b[20~"
+ALT_A = b"\x1ba"
+ALT_E = b"\x1be"
+ALT_S = b"\x1bs"
 RIGHT = b"\x1b[C"
-SHIFT_F3_CSI = b"\x1b[13;2~"
-SHIFT_F3_SS3 = b"\x1bO1;2R"
 
 
+# This assertion requires each expected byte sequence in captured terminal output.
 def require(output: bytes, *values: bytes) -> None:
     """Require each terminal value."""
     for value in values:
@@ -31,6 +33,7 @@ def require(output: bytes, *values: bytes) -> None:
             raise AssertionError(f"The terminal output lacks: {value!r}")
 
 
+# This assertion requires state frames in their expected history order.
 def require_order(output: bytes, *values: bytes) -> None:
     """Require terminal values in order."""
     position = 0
@@ -41,6 +44,7 @@ def require_order(output: bytes, *values: bytes) -> None:
         position += len(value)
 
 
+# These formatters create exact header and Hex-row fragments for state checks.
 def header(offset: int) -> bytes:
     """Return the selected file offset header."""
     return f"{offset:08X}\N{BOX DRAWINGS LIGHT VERTICAL}HView-Linux".encode()
@@ -51,11 +55,14 @@ def hex_row(values: str) -> bytes:
     return f"00000000:  {values}".encode()
 
 
+# This action builder drives one Fill or XOR range transaction through Tools.
 def range_edit(tool: bytes, span: str, pattern: str) -> list[bytes]:
     """Return actions for one range edit."""
     return [CTRL_T, tool, span.encode(), ENTER, pattern.encode(), ENTER]
 
 
+# This check combines nibble grouping, resize, Undo, Redo, and explicit cancellation.
+# Ordered frames prove cursor and byte restoration after each state change.
 def check_hex_groups_and_resize(binary: Path, root: Path) -> None:
     """Check grouped nibbles, cursor state, and resize events."""
     path = root / "groups.bin"
@@ -64,19 +71,19 @@ def check_hex_groups_and_resize(binary: Path, root: Path) -> None:
         binary,
         ["--mode=hex", str(path)],
         [
-            F3,
+            ALT_E,
             b"A",
             (60, 24, b"EDITMODE"),
             b"B",
-            F3,
-            SHIFT_F3_CSI,
-            F3,
+            CTRL_Z,
+            CTRL_Y,
+            CTRL_Z,
             b"C",
             CTRL_Z,
             CTRL_Y,
             b"D",
-            F3,
-            F3,
+            CTRL_Z,
+            CTRL_Z,
             (80, 24, b"EDITMODE"),
             ESCAPE,
             CTRL_Q,
@@ -107,6 +114,7 @@ def check_hex_groups_and_resize(binary: Path, root: Path) -> None:
         raise AssertionError("Edit cancellation did not restore the complete baseline.")
 
 
+# This check separates no-op, failed, canceled, and changed operations around Redo history.
 def check_redo_retention_and_change(binary: Path, root: Path) -> None:
     """Check failed, canceled, no-op, and changed operations."""
     path = root / "redo.bin"
@@ -116,9 +124,9 @@ def check_redo_retention_and_change(binary: Path, root: Path) -> None:
         binary,
         ["--mode=hex", str(path)],
         [
-            F3,
+            ALT_E,
             b"AA",
-            F3,
+            CTRL_Z,
             *range_edit(b"f", "3 2", "11"),
             ENTER,
             CTRL_T,
@@ -126,7 +134,7 @@ def check_redo_retention_and_change(binary: Path, root: Path) -> None:
             ESCAPE,
             *range_edit(b"f", "0 1", "10"),
             CTRL_Y,
-            F3,
+            CTRL_Z,
             b"BB",
             CTRL_Y,
             ENTER,
@@ -144,6 +152,7 @@ def check_redo_retention_and_change(binary: Path, root: Path) -> None:
         raise AssertionError("The redo retention workflow changed the file.")
 
 
+# This check combines Fill and XOR records before complete edit cancellation.
 def check_range_records_and_cancel(binary: Path, root: Path) -> None:
     """Check Fill, XOR, and complete edit cancellation."""
     path = root / "ranges.bin"
@@ -153,17 +162,17 @@ def check_range_records_and_cancel(binary: Path, root: Path) -> None:
         binary,
         ["--mode=hex", str(path)],
         [
-            F3,
+            ALT_E,
             *range_edit(b"f", "0 4", "11"),
-            F3,
-            SHIFT_F3_SS3,
+            CTRL_Z,
+            CTRL_Y,
             *range_edit(b"x", "0 4", "FF"),
-            F3,
+            CTRL_Z,
             CTRL_Y,
             ESCAPE,
             (20, 3, b"\x1b[3;1H"),
-            F3,
-            F3,
+            ALT_E,
+            CTRL_Z,
             (80, 24, b"The undo history is empty."),
             ENTER,
             ESCAPE,
@@ -185,6 +194,7 @@ def check_range_records_and_cancel(binary: Path, root: Path) -> None:
         raise AssertionError("Edit cancellation did not restore range edits.")
 
 
+# This check restores EOF growth through history and verifies both save baselines.
 def check_growth_and_save_resets(binary: Path, root: Path) -> None:
     """Check EOF length restoration and successful save resets."""
     path = root / "growth.bin"
@@ -192,7 +202,19 @@ def check_growth_and_save_resets(binary: Path, root: Path) -> None:
     output = run_session(
         binary,
         ["--mode=hex", str(path)],
-        [RIGHT, F3, b"AB", CTRL_Z, CTRL_Y, F9, F3, F3, ENTER, ESCAPE, CTRL_Q],
+        [
+            RIGHT,
+            ALT_E,
+            b"AB",
+            CTRL_Z,
+            CTRL_Y,
+            ALT_S,
+            ALT_E,
+            CTRL_Z,
+            ENTER,
+            ESCAPE,
+            CTRL_Q,
+        ],
     )
     require_order(output, header(2), header(1), header(2))
     require(output, b"The undo history is empty.")
@@ -206,13 +228,13 @@ def check_growth_and_save_resets(binary: Path, root: Path) -> None:
         binary,
         ["--mode=hex", str(source)],
         [
-            F3,
+            ALT_E,
             b"CD",
             CTRL_S,
             str(copy).encode(),
             ENTER,
-            F3,
-            F3,
+            ALT_E,
+            CTRL_Z,
             ENTER,
             ESCAPE,
             CTRL_Q,
@@ -223,6 +245,7 @@ def check_growth_and_save_resets(binary: Path, root: Path) -> None:
         raise AssertionError("Save As reset history or wrote incorrect bytes.")
 
 
+# This check changes targets externally and requires failed saves to retain both histories.
 def check_failed_save(binary: Path, root: Path) -> None:
     """Check that failed replacement and Save As keep history."""
     path = root / "failed.bin"
@@ -231,12 +254,12 @@ def check_failed_save(binary: Path, root: Path) -> None:
         binary,
         ["--mode=hex", str(path)],
         [
-            F3,
+            ALT_E,
             b"AA",
             lambda: path.write_bytes(b"\xEE"),
-            F9,
+            ALT_S,
             ENTER,
-            F3,
+            CTRL_Z,
             CTRL_Y,
             ESCAPE,
             CTRL_Q,
@@ -255,7 +278,7 @@ def check_failed_save(binary: Path, root: Path) -> None:
         binary,
         ["--mode=hex", str(source)],
         [
-            F3,
+            ALT_E,
             b"AA",
             CTRL_S,
             str(existing).encode(),
@@ -273,6 +296,7 @@ def check_failed_save(binary: Path, root: Path) -> None:
         raise AssertionError("The failed Save As changed a file.")
 
 
+# This check groups one assembly replacement and rejects a canceled replacement from history.
 def check_assembly_record(binary: Path, root: Path) -> None:
     """Check assembly EOF growth and canceled-preview history."""
     config = root / "code.ini"
@@ -285,19 +309,19 @@ def check_assembly_record(binary: Path, root: Path) -> None:
         ["--config", str(config), str(path)],
         [
             RIGHT,
-            F3,
-            F2,
+            ALT_E,
+            ALT_A,
             b"ret",
             ENTER,
             ENTER,
             ESCAPE,
-            F3,
-            F2,
+            CTRL_Z,
+            ALT_A,
             b"nop",
             ENTER,
             ESCAPE,
             CTRL_Y,
-            F9,
+            ALT_S,
             CTRL_Q,
         ],
     )
@@ -313,6 +337,7 @@ def check_assembly_record(binary: Path, root: Path) -> None:
         raise AssertionError("Assembly redo used canceled preview bytes.")
 
 
+# This check uses a stored legacy F3 record and rejects a Control macro letter as Hex input.
 def check_control_macro(binary: Path, root: Path) -> None:
     """Check that a Ctrl macro character is not a hex digit."""
     path = root / "macro.bin"
@@ -334,6 +359,7 @@ def check_control_macro(binary: Path, root: Path) -> None:
         raise AssertionError("A Ctrl macro character changed a hexadecimal edit byte.")
 
 
+# This entry point runs every edit-history group in one disposable directory.
 def main() -> None:
     """Run the edit history checks."""
     if len(sys.argv) != 2:

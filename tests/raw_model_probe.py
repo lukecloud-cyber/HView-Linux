@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check the transient raw address model through a Linux pseudoterminal."""
 
+# These imports provide PE fixtures, disposable raw files, and terminal sessions.
 from pathlib import Path
 import sys
 import tempfile
@@ -9,19 +10,21 @@ from analysis_probe import pe_fixture
 from terminal_probe import run_session
 
 
+# These byte sequences select mapped file, assembler, edit, Goto, and retained tool controls.
 BACKSPACE = b"\x7f"
-CTRL_F11 = b"\x1b[23;5~"
-CTRL_F12 = b"\x1b[24;5~"
+ALT_N = b"\x1bn"
+ALT_P = b"\x1bp"
 CTRL_Q = b"\x11"
 CTRL_S = b"\x13"
 CTRL_T = b"\x14"
 ENTER = b"\r"
 ESCAPE = b"\x1b"
-F2 = b"\x1b[12~"
-F3 = b"\x1b[13~"
-F5 = b"\x1b[15~"
+ALT_A = b"\x1ba"
+ALT_E = b"\x1be"
+ALT_G = b"\x1bg"
 
 
+# These assertions require terminal values and their state-transition order.
 def require(output: bytes, *values: bytes) -> None:
     """Require each terminal value."""
     for value in values:
@@ -39,6 +42,7 @@ def require_order(output: bytes, *values: bytes) -> None:
         position += len(value)
 
 
+# This selector returns the final complete header for one named source.
 def last_header(output: bytes, name: str) -> bytes:
     """Return the final header for one file."""
     position = output.rfind(name.encode())
@@ -51,6 +55,7 @@ def last_header(output: bytes, name: str) -> bytes:
     return output[start:end]
 
 
+# This formatter builds one raw runtime header at the requested address width.
 def raw_header(address: int) -> bytes:
     """Return one raw Code address header."""
     digits = f"{address:08X}"
@@ -58,6 +63,7 @@ def raw_header(address: int) -> bytes:
     return f".{digits}{suffix}".encode()
 
 
+# These action builders open raw-model and address prompts with controlled input.
 def raw_model(value: str | None) -> list[bytes]:
     """Return actions that open the raw model prompt."""
     actions = [CTRL_T, b"r"]
@@ -71,11 +77,13 @@ def address(value: str) -> list[bytes]:
     return [CTRL_T, b"a", value.encode(), ENTER]
 
 
+# This action builder submits one invalid model and dismisses its notice.
 def dismissing_raw_model(value: str) -> list[bytes]:
     """Return actions that submit and dismiss an invalid raw model."""
     return [*raw_model(value), ENTER]
 
 
+# This check maps raw addresses and inspects integers with the selected byte order.
 def check_addresses_and_byte_order(binary: Path, root: Path) -> None:
     """Check raw address conversion and selected integer byte order."""
     path = root / "address.bin"
@@ -85,7 +93,7 @@ def check_addresses_and_byte_order(binary: Path, root: Path) -> None:
         ["--mode=code", str(path)],
         [
             *raw_model("X86 32 LE 10000000"),
-            F5,
+            ALT_G,
             b"8",
             ENTER,
             *address("F 8"),
@@ -125,6 +133,7 @@ def check_addresses_and_byte_order(binary: Path, root: Path) -> None:
         raise AssertionError("The big-endian raw model showed little-endian integer rows.")
 
 
+# This check decodes and assembles through one selected 32-bit raw model.
 def check_decode_and_assembly(binary: Path, root: Path) -> None:
     """Check raw decoding and Intel assembly addresses."""
     config = root / "att.ini"
@@ -137,8 +146,8 @@ def check_decode_and_assembly(binary: Path, root: Path) -> None:
         ["--config", str(config), str(path)],
         [
             *raw_model("X86 32 LE 1000"),
-            F3,
-            F2,
+            ALT_E,
+            ALT_A,
             b"call 1008",
             ENTER,
             ESCAPE,
@@ -159,6 +168,7 @@ def check_decode_and_assembly(binary: Path, root: Path) -> None:
         raise AssertionError("A canceled raw assembly edit changed the file.")
 
 
+# This check rejects invalid model changes and handles valid high-base file growth atomically.
 def check_atomic_failures_and_growth(binary: Path, root: Path) -> None:
     """Check strict input, address bounds, and checked buffer growth."""
     path = root / "atomic.bin"
@@ -194,7 +204,7 @@ def check_atomic_failures_and_growth(binary: Path, root: Path) -> None:
         ["--mode=hex", str(empty)],
         [
             *raw_model("X86 64 BE FFFFFFFFFFFFFFFF"),
-            F3,
+            ALT_E,
             b"AA",
             b"B",
             ENTER,
@@ -207,8 +217,10 @@ def check_atomic_failures_and_growth(binary: Path, root: Path) -> None:
         raise AssertionError("A canceled boundary edit changed the empty file.")
 
 
+# This check clears address history only when model width or base changes.
 def check_history_and_width_cycle(binary: Path, root: Path) -> None:
     """Check raw history rules and width cycling."""
+    # This section creates one relative call and verifies history across accepted and rejected model changes.
     path = root / "history.bin"
     data = bytearray(b"\x90" * 16)
     data[0:5] = b"\xE8\x03\x00\x00\x00"
@@ -227,7 +239,7 @@ def check_history_and_width_cycle(binary: Path, root: Path) -> None:
             *raw_model("X86 64 BE 1000"),
             BACKSPACE,
             ENTER,
-            F5,
+            ALT_G,
             b"0",
             ENTER,
             ENTER,
@@ -248,6 +260,7 @@ def check_history_and_width_cycle(binary: Path, root: Path) -> None:
     if output.count(b"The branch return history is empty.") < 2:
         raise AssertionError("A raw base or width change kept branch-return history.")
 
+    # This section cycles the configured width while the runtime base and byte order remain stable.
     output = run_session(
         binary,
         ["--mode=code", str(path)],
@@ -269,6 +282,7 @@ def check_history_and_width_cycle(binary: Path, root: Path) -> None:
     if b"16-bit BE:" not in integers or b"16-bit LE:" in integers:
         raise AssertionError("Raw width cycling changed the selected byte order.")
 
+    # This section rejects a narrowing overflow and proves that prior branch-return positions remain available.
     output = run_session(
         binary,
         ["--mode=code", str(path)],
@@ -303,6 +317,7 @@ def check_history_and_width_cycle(binary: Path, root: Path) -> None:
         raise AssertionError("A rejected raw width change lost branch-return history.")
 
 
+# This check clears transient raw state across file switches and application restart.
 def check_transient_lifetime(binary: Path, root: Path) -> None:
     """Check raw state across rebuilds, files, and restarts."""
     source = root / "source.bin"
@@ -316,7 +331,7 @@ def check_transient_lifetime(binary: Path, root: Path) -> None:
             b"m",
             b"h",
             ENTER,
-            F3,
+            ALT_E,
             b"FF",
             ESCAPE,
             CTRL_S,
@@ -342,15 +357,17 @@ def check_transient_lifetime(binary: Path, root: Path) -> None:
     output = run_session(
         binary,
         ["--mode=code", str(first), str(second)],
-        [*raw_model("X86 32 LE 1000"), CTRL_F12, CTRL_F11, CTRL_Q],
+        [*raw_model("X86 32 LE 1000"), ALT_N, ALT_P, CTRL_Q],
     )
     if b"RAW" in last_header(output, first.name):
         raise AssertionError("A raw model survived a file switch.")
     require(output, second.name.encode())
 
 
+# This check restores AUTO PE mapping and preserves supported SAV view fields.
 def check_auto_pe_and_session(binary: Path, root: Path) -> None:
     """Check AUTO restoration for PE, configuration, and sessions."""
+    # This section overrides a PE model, then restores the mapped PE address and width through AUTO.
     pe_path = root / "pe.bin"
     pe_data, base = pe_fixture(False)
     pe_path.write_bytes(pe_data)
@@ -371,6 +388,7 @@ def check_auto_pe_and_session(binary: Path, root: Path) -> None:
     if b"RAW" in final or b"PE" not in final or b"a32" not in final:
         raise AssertionError("AUTO did not restore PE mapping and width.")
 
+    # This section restores the configured Code width when AUTO removes an explicit raw model.
     config = root / "width.ini"
     config.write_bytes(b"[HView-Linux 1]\nStartMode=Code\nDefaultCodeSize=64\n")
     raw = root / "raw.bin"
@@ -384,6 +402,7 @@ def check_auto_pe_and_session(binary: Path, root: Path) -> None:
     if b"RAW" in final or b"a64" not in final:
         raise AssertionError("AUTO did not restore the configured code width.")
 
+    # This section keeps Real16 in the SAV record while explicit raw models remain transient.
     session = root / "real16.sav"
     output = run_session(
         binary,
@@ -414,6 +433,7 @@ def check_auto_pe_and_session(binary: Path, root: Path) -> None:
         raise AssertionError("The session stored the transient raw model instead of Real16.")
 
 
+# This entry point runs every raw-model group in one disposable directory.
 def main() -> None:
     """Run the raw model checks."""
     if len(sys.argv) != 2:
