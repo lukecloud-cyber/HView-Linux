@@ -1,3 +1,7 @@
+/*
+These modules provide terminal I/O, file handling, editing, analysis, persistence, and bounded source access.
+The main lifecycle connects their established interfaces without adding shared global state.
+*/
 mod assembler;
 mod checksum;
 mod cli;
@@ -11,28 +15,94 @@ mod inspect;
 mod macros;
 mod native;
 mod operations;
+mod paged;
 mod save;
 mod workbench;
 
+/*
+These imports provide the application state types and standard Linux path interfaces.
+Native path values remain separate from text used for terminal display.
+*/
 use console::Console;
 use editor::{Editor, Key, Mode};
 use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
+/*
+These constants define the visible key bars and bounded navigation history.
+Each view selects the key bar that matches its available operations.
+*/
 const NORMAL_KEYS: &str = " 1Help   2PutBlk 3Edit   4Mode   5Goto   6DatRef 7Search 8Header 9Files 10Quit  11Hem   12Names ";
 const TEXT_KEYS: &str = " 1Help   2Unwrap 3       4Mode   5Goto   6LnFeed 7Search 8Table  9Files 10Quit  11Hem   12      ";
 const EDIT_KEYS: &str = " 1Help   2       3Undo   4Byte   5Word   6Dword  7Crypt  8Xor    9Update10Trunc 11      12      ";
+const PAGED_KEYS: &str = " F1 Help  F5 Goto  F9 Files  F10 Quit  Ctrl+F11 Prev  Ctrl+F12 Next ";
 const RETURN_HISTORY_LIMIT: usize = 256;
 const X86_MAX_INSTRUCTION_BYTES: usize = 15;
 
+/*
+This helper writes visible text into a fixed terminal row.
+The zip operation clips text at the available row width.
+*/
 fn put(line: &mut [char], column: usize, text: &str) {
     for (slot, ch) in line.iter_mut().skip(column).zip(text.chars()) {
         *slot = ch;
     }
 }
 
+/*
+This formatter converts native pathname bytes into display text only.
+Valid UTF-8 remains readable, terminal controls use Unicode escapes, and invalid bytes use hexadecimal escapes.
+Callers retain the original PathBuf for every file operation.
+*/
+fn display_path(path: &std::ffi::OsStr) -> String {
+    /*
+    The loop copies each valid UTF-8 segment and escapes controls.
+    An invalid segment becomes hexadecimal byte escapes before parsing continues.
+    */
+    let mut output = String::new();
+    let mut bytes = path.as_bytes();
+    loop {
+        match std::str::from_utf8(bytes) {
+            Ok(text) => {
+                for character in text.chars() {
+                    if character.is_control() {
+                        output.push_str(&format!("\\u{{{:X}}}", character as u32));
+                    } else {
+                        output.push(character);
+                    }
+                }
+                break;
+            }
+            Err(error) => {
+                let (valid, rest) = bytes.split_at(error.valid_up_to());
+                for character in std::str::from_utf8(valid).unwrap().chars() {
+                    if character.is_control() {
+                        output.push_str(&format!("\\u{{{:X}}}", character as u32));
+                    } else {
+                        output.push(character);
+                    }
+                }
+                let count = error.error_len().unwrap_or(rest.len());
+                for byte in &rest[..count] {
+                    output.push_str(&format!("\\x{byte:02X}"));
+                }
+                bytes = &rest[count..];
+                if bytes.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+    output
+}
+
+/*
+This renderer converts one buffered Editor state into a complete terminal frame.
+The header shows file state and position before the body and active key bar.
+*/
 fn frame(
     view: &Editor,
     file: &Path,
@@ -42,6 +112,10 @@ fn frame(
     metadata: &Result<format::Metadata, String>,
     decoder: &mut Option<decoder::Decoder>,
 ) -> Vec<String> {
+    /*
+    The first section builds a fixed-width header from the current file and editor state.
+    Code mode adds its address model after the common header exists.
+    */
     let (width, height) = console.dimensions();
     let body_rows = height.saturating_sub(2);
     let mut lines = vec![String::new(); height];
@@ -50,7 +124,7 @@ fn frame(
     put(
         &mut header,
         5,
-        &file.file_name().unwrap_or_default().to_string_lossy(),
+        &display_path(file.file_name().unwrap_or_default()),
     );
     put(
         &mut header,
@@ -106,6 +180,11 @@ fn frame(
         }
         lines[0] = code_header.into_iter().collect();
     }
+
+    /*
+    The body uses decoded rows for Code mode and Editor rows for other modes.
+    The left bar gives stable visual markers without changing the row data.
+    */
     let body = if view.mode == Mode::Code {
         code_rows(view, body_rows, metadata, decoder)
     } else {
@@ -140,6 +219,11 @@ fn frame(
         );
         lines[0] = header.into_iter().collect();
     }
+
+    /*
+    The final section selects the key bar from mode and edit state.
+    Padding fills the remaining terminal width with the established background character.
+    */
     let text_keys = if view.wrap {
         TEXT_KEYS.to_owned()
     } else {
@@ -164,6 +248,10 @@ fn frame(
     lines
 }
 
+/*
+This helper converts a file offset into the current format address.
+It preserves the stored format error when metadata is unavailable.
+*/
 fn code_address(
     metadata: &Result<format::Metadata, String>,
     offset: u64,
@@ -174,6 +262,10 @@ fn code_address(
     }
 }
 
+/*
+This cache returns a decoder for the requested width, syntax, and Real16 state.
+It replaces the cached decoder only when one requested property changes.
+*/
 fn decoder_for(
     decoder: &mut Option<decoder::Decoder>,
     bits: u32,
@@ -188,12 +280,20 @@ fn decoder_for(
     Ok(decoder.as_ref().unwrap())
 }
 
+/*
+PreviewRows carries formatted instructions and the consumed source range.
+The first instruction size supports replacement-length decisions.
+*/
 struct PreviewRows {
     rows: Vec<String>,
     end: usize,
     first_size: Option<usize>,
 }
 
+/*
+AssemblyPreview separates summary text from original and proposed instruction columns.
+The confirmation view consumes this record without changing editor bytes.
+*/
 #[derive(Debug)]
 struct AssemblyPreview {
     summary: Vec<String>,
@@ -201,6 +301,10 @@ struct AssemblyPreview {
     proposed: Vec<String>,
 }
 
+/*
+This helper formats bytes for the assembly summary.
+An empty slice identifies the file end explicitly.
+*/
 fn spaced_hex(bytes: &[u8]) -> String {
     if bytes.is_empty() {
         return "<end of file>".into();
@@ -212,6 +316,10 @@ fn spaced_hex(bytes: &[u8]) -> String {
         .join(" ")
 }
 
+/*
+This decoder builds bounded preview rows from one file range.
+Optional byte fallback keeps invalid source bytes visible during comparison.
+*/
 fn preview_rows(
     data: &[u8],
     file_start: usize,
@@ -220,6 +328,10 @@ fn preview_rows(
     decoder: &decoder::Decoder,
     byte_fallback: bool,
 ) -> PreviewRows {
+    /*
+    Each loop maps one file offset, decodes one instruction, and advances by its size.
+    An address or decode error becomes the final explanatory row.
+    */
     let mut rows = Vec::new();
     let mut relative = 0usize;
     let mut first_size = None;
@@ -268,12 +380,20 @@ fn preview_rows(
     }
 }
 
+/*
+This builder validates an assembly replacement and prepares its comparison record.
+It does not change Editor data before the user accepts the later confirmation.
+*/
 fn assembly_preview(
     view: &Editor,
     metadata: &format::Metadata,
     decoder: &mut Option<decoder::Decoder>,
     replacement: &[u8],
 ) -> Result<AssemblyPreview, String> {
+    /*
+    The first section checks the target range and selects a compatible decoder.
+    These checks prevent an invalid replacement from reaching preview allocation.
+    */
     if replacement.is_empty() {
         return Err("The assembler produced no replacement bytes.".into());
     }
@@ -304,6 +424,11 @@ fn assembly_preview(
         decoder,
         view.invalid_code_bytes,
     );
+
+    /*
+    The next section combines replacement bytes with enough original tail bytes for decoding.
+    Decoder verification requires one complete replacement instruction.
+    */
     if start == view.data.len() {
         original
             .rows
@@ -335,6 +460,10 @@ fn assembly_preview(
         view.invalid_code_bytes,
     );
 
+    /*
+    The final section summarizes byte changes, overlap, and file growth.
+    The confirmation screen uses this text with both instruction columns.
+    */
     let original_size = original.first_size;
     let overwritten = original_stop.saturating_sub(start);
     let shown_original_size = original_size.unwrap_or(0).max(overwritten);
@@ -380,6 +509,10 @@ fn assembly_preview(
     })
 }
 
+/*
+This helper clips one preview field to its terminal column.
+An ellipsis identifies removed text when the column has enough space.
+*/
 fn clipped(text: &str, width: usize) -> String {
     if text.chars().count() <= width {
         return text.into();
@@ -390,6 +523,10 @@ fn clipped(text: &str, width: usize) -> String {
     format!("{}...", text.chars().take(width - 3).collect::<String>())
 }
 
+/*
+This helper places original and proposed preview text in equal terminal columns.
+The center separator remains visible for every nonempty layout.
+*/
 fn preview_columns(width: usize, left: &str, right: &str) -> String {
     if width == 0 {
         return String::new();
@@ -406,6 +543,10 @@ fn preview_columns(width: usize, left: &str, right: &str) -> String {
     line.into_iter().collect()
 }
 
+/*
+This helper wraps summary text at word boundaries for the confirmation screen.
+It always returns at least one row.
+*/
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut rows = Vec::new();
@@ -425,8 +566,16 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
+/*
+This modal shows assembly effects and waits for apply or cancel.
+Resize events rebuild the layout before the next decision.
+*/
 fn confirm_assembly(console: &Console, preview: &AssemblyPreview) -> io::Result<bool> {
     loop {
+        /*
+        This section calculates the required layout and builds either instructions or a resize notice.
+        No editor state changes while the modal is open.
+        */
         let (width, height) = console.dimensions();
         let layout_width = width.max(60);
         let summary: Vec<_> = preview
@@ -481,6 +630,11 @@ fn confirm_assembly(console: &Console, preview: &AssemblyPreview) -> io::Result<
             }
             lines[height - 1] = "Enter Apply  Esc Cancel".into();
         }
+
+        /*
+        The input section redraws after resize and returns only an explicit user decision.
+        Enter cannot apply a preview that does not fit.
+        */
         console.draw(&lines)?;
         let key = console.key()?;
         let resized = console.dimensions() != (width, height);
@@ -493,12 +647,20 @@ fn confirm_assembly(console: &Console, preview: &AssemblyPreview) -> io::Result<
     }
 }
 
+/*
+This helper decodes one instruction at a buffered file offset.
+Configured invalid-byte and packed-byte rules determine the returned display instruction.
+*/
 fn decode_at(
     view: &Editor,
     offset: u64,
     metadata: &Result<format::Metadata, String>,
     decoder: &mut Option<decoder::Decoder>,
 ) -> Result<(u64, decoder::Instruction), String> {
+    /*
+    Address conversion and decoder selection happen before byte fallback.
+    The fallback produces one data-byte instruction only when configuration permits it.
+    */
     let (address, _) = code_address(metadata, offset)?;
     let decoded = decoder_for(
         decoder,
@@ -522,6 +684,11 @@ fn decode_at(
         }
         Err(error) => return Err(error),
     };
+
+    /*
+    Packed NOP and INT3 runs become one visible instruction with their combined length.
+    The caller advances by the resulting instruction size.
+    */
     if instruction.size == 1
         && let Some(&byte) = view.data.get(offset as usize)
         && ((byte == 0x90 && view.pack_nops) || (byte == 0xCC && view.pack_int3))
@@ -537,6 +704,10 @@ fn decode_at(
     Ok((address, instruction))
 }
 
+/*
+This helper resolves a direct branch or call target from the selected instruction.
+It converts the runtime target back to a checked file offset.
+*/
 fn direct_target_offset(
     view: &Editor,
     metadata: &Result<format::Metadata, String>,
@@ -562,6 +733,10 @@ fn direct_target_offset(
     metadata.navigation_offset(&view.data, target)
 }
 
+/*
+This helper appends one Code navigation return position.
+It removes the oldest position when the bounded history is full.
+*/
 fn remember_return(history: &mut VecDeque<(u64, u64)>, position: (u64, u64)) {
     if history.len() >= RETURN_HISTORY_LIMIT {
         history.pop_front();
@@ -569,6 +744,10 @@ fn remember_return(history: &mut VecDeque<(u64, u64)>, position: (u64, u64)) {
     history.push_back(position);
 }
 
+/*
+This helper validates the newest return position against current buffered bytes.
+It removes the position only after validation succeeds.
+*/
 fn take_return(
     history: &mut VecDeque<(u64, u64)>,
     data: &[u8],
@@ -584,6 +763,10 @@ fn take_return(
     Ok(history.pop_back())
 }
 
+/*
+This helper decodes the selected instruction as the default assembly input.
+Intel syntax remains the required assembly syntax for this edit path.
+*/
 fn assembly_seed(
     view: &Editor,
     metadata: &Result<format::Metadata, String>,
@@ -598,6 +781,10 @@ fn assembly_seed(
     .map(|instruction| instruction.text)
 }
 
+/*
+This helper cycles raw or standard Code widths through their supported sequence.
+Standard Code mode includes Real16 after the 64-bit state.
+*/
 fn cycle_code_mode(view: &mut Editor) -> Result<(), String> {
     if let Some(mut model) = view.raw_model {
         model.bits = match model.bits {
@@ -623,6 +810,10 @@ fn cycle_code_mode(view: &mut Editor) -> Result<(), String> {
     Ok(())
 }
 
+/*
+This renderer decodes buffered Code rows until the screen or file ends.
+The first decode error becomes a visible row and stops further decoding.
+*/
 fn code_rows(
     view: &Editor,
     rows: usize,
@@ -657,12 +848,20 @@ fn code_rows(
     result
 }
 
+/*
+This picker lists native directory entries and returns the selected PathBuf.
+Display escaping never changes the path used for directory navigation or opening.
+*/
 fn select_file(console: &Console, mut folder: PathBuf) -> io::Result<Option<PathBuf>> {
     if folder.as_os_str().is_empty() {
         folder = std::env::current_dir()?;
     }
     let mut selected = 0usize;
     loop {
+        /*
+        Each frame reads and sorts current entries, then adds the parent directory.
+        Directories sort before files while the original native paths remain stored.
+        */
         let mut entries: Vec<_> = fs::read_dir(&folder)?
             .filter_map(Result::ok)
             .map(|entry| entry.path())
@@ -680,10 +879,15 @@ fn select_file(console: &Console, mut folder: PathBuf) -> io::Result<Option<Path
             entries.insert(0, parent.to_owned());
         }
         selected = selected.min(entries.len().saturating_sub(1));
+
+        /*
+        The display section escapes path text and shows only entries that fit.
+        The selection marker identifies the PathBuf used by the input section.
+        */
         let (width, height) = console.dimensions();
         let mut lines = vec![String::new(); height];
         if let Some(line) = lines.get_mut(2) {
-            *line = format!("  {}", folder.display());
+            *line = format!("  {}", display_path(folder.as_os_str()));
         }
         for (i, path) in entries
             .iter()
@@ -699,7 +903,7 @@ fn select_file(console: &Console, mut folder: PathBuf) -> io::Result<Option<Path
                     } else {
                         ' '
                     },
-                    path.file_name().unwrap_or_default().to_string_lossy(),
+                    display_path(path.file_name().unwrap_or_default()),
                     if path.is_dir() { "/" } else { "" }
                 );
             }
@@ -711,6 +915,11 @@ fn select_file(console: &Console, mut folder: PathBuf) -> io::Result<Option<Path
             );
         }
         console.draw(&lines)?;
+
+        /*
+        Input changes the selection, enters a directory, returns a file, or cancels.
+        Unsupported function keys show the existing capability notice.
+        */
         match console.key()?.code {
             27 | 121 => return Ok(None),
             38 => selected = selected.saturating_sub(1),
@@ -733,6 +942,10 @@ fn select_file(console: &Console, mut folder: PathBuf) -> io::Result<Option<Path
     }
 }
 
+/*
+This parser converts complete hexadecimal pairs into search bytes.
+It rejects empty, odd-length, and non-ASCII input before conversion.
+*/
 fn hex_pattern(text: &str) -> Result<Vec<u8>, String> {
     let value: String = text.chars().filter(|c| !c.is_ascii_whitespace()).collect();
     if !value.is_ascii() || value.is_empty() || !value.len().is_multiple_of(2) {
@@ -750,6 +963,10 @@ fn hex_pattern(text: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
+/*
+This wrapper creates a buffered Editor from bytes and configured view rules.
+It keeps view construction in the configuration module.
+*/
 fn new_view(
     data: Vec<u8>,
     mode: Mode,
@@ -759,6 +976,10 @@ fn new_view(
     config.new_view(data, mode, offset)
 }
 
+/*
+This selector resolves startup mode from CLI options before configuration defaults.
+An offset mode can supply the mode when no explicit mode exists.
+*/
 fn startup_mode(options: &cli::Options, config: &config::Config) -> Mode {
     let selected = options
         .mode
@@ -775,6 +996,10 @@ fn startup_mode(options: &cli::Options, config: &config::Config) -> Mode {
     }
 }
 
+/*
+This converter accepts only absolute saved paths on Linux.
+It reports Windows and unsafe relative syntax without selecting another file.
+*/
 fn restored_path(text: &str) -> Result<PathBuf, String> {
     let path = Path::new(text);
     if path.is_absolute() {
@@ -792,6 +1017,623 @@ fn restored_path(text: &str) -> Result<PathBuf, String> {
     ))
 }
 
+/*
+The paged view keeps only display state while PagedFile owns source bytes.
+All positions remain u64 values for files that exceed the process address space.
+The metadata fields can enter the existing content-free session record after close.
+*/
+#[derive(Clone, Debug)]
+struct PagedView {
+    offset: u64,
+    top: u64,
+    code_bits: u32,
+    real_mode: bool,
+    wrap: bool,
+    tab: bool,
+    line_feed: config::LineFeed,
+    text_column: usize,
+    local_offset: bool,
+}
+
+/*
+RuntimeView keeps bounded restoration state for one native path.
+The application updates this state after every close, even when SAV publication is unavailable.
+The record never owns file contents or converts its associated native path.
+*/
+#[derive(Clone, Debug)]
+struct RuntimeView {
+    mode: Mode,
+    offset: u64,
+    top: u64,
+    code_bits: u32,
+    real_mode: bool,
+    wrap: bool,
+    tab: bool,
+    line_feed: config::LineFeed,
+    text_column: usize,
+    local_offset: bool,
+}
+
+/*
+These conversions move view metadata between session, Editor, and runtime records.
+No conversion owns source bytes or changes the associated native path.
+*/
+impl RuntimeView {
+    /*
+    This conversion imports existing session fields into native runtime state.
+    The associated native path remains in the parallel path list.
+    */
+    fn from_saved(saved: &config::SavedFile) -> Self {
+        Self {
+            mode: match saved.mode {
+                2 => Mode::Hex,
+                3 => Mode::Code,
+                _ => Mode::Text,
+            },
+            offset: saved.offset,
+            top: saved.top,
+            code_bits: saved.code_bits,
+            real_mode: saved.real_mode,
+            wrap: saved.wrap,
+            tab: saved.tab,
+            line_feed: saved.line_feed,
+            text_column: saved.text_column,
+            local_offset: saved.local_offset,
+        }
+    }
+
+    /*
+    This conversion captures the buffered editor fields after a close or file switch.
+    Later opens restore these fields without retaining the complete Editor or its bytes.
+    */
+    fn from_editor(view: &Editor, local_offset: bool) -> Result<Self, String> {
+        let line_feed = match view.delimiter {
+            b"\r\n" => config::LineFeed::CrLf,
+            b"\r" => config::LineFeed::Cr,
+            b"\n" => config::LineFeed::Lf,
+            _ => return Err("The saved line-feed mode is not reconstructed.".into()),
+        };
+        Ok(Self {
+            mode: view.mode,
+            offset: view.offset,
+            top: view.top,
+            code_bits: view.code_bits,
+            real_mode: view.real_mode,
+            wrap: view.wrap,
+            tab: view.expand_tabs,
+            line_feed,
+            text_column: view.text_column,
+            local_offset,
+        })
+    }
+
+    /*
+    This conversion adds legacy path text only at the SAV publication boundary.
+    All view fields remain independent from the path representation result.
+    */
+    fn session_view(&self, path: String) -> config::SessionView {
+        config::SessionView {
+            path,
+            mode: self.mode,
+            offset: self.offset,
+            top: self.top,
+            code_bits: self.code_bits,
+            real_mode: self.real_mode,
+            wrap: self.wrap,
+            tab: self.tab,
+            line_feed: self.line_feed,
+            text_column: self.text_column,
+            local_offset: self.local_offset,
+        }
+    }
+}
+
+/*
+The closed paged result separates the native path from legacy session text.
+The outer lifecycle validates path representation before it mutates SAV state.
+*/
+struct PagedClosed {
+    path: PathBuf,
+    view: PagedView,
+}
+
+/*
+ClosedView returns either complete buffered editor state or bounded paged state.
+The outer lifecycle handles both results through one action path.
+*/
+enum ClosedView {
+    Buffered(PathBuf, Editor),
+    Paged(PagedClosed),
+}
+
+/*
+This conversion makes paged display state available to the shared runtime record.
+The native path stays in PagedClosed until the lifecycle updates its path list.
+*/
+impl PagedClosed {
+    /*
+    This conversion copies paged display fields into the shared runtime record.
+    The caller stores the record beside its unchanged native path.
+    */
+    fn runtime_view(&self) -> RuntimeView {
+        RuntimeView {
+            mode: Mode::Hex,
+            offset: self.view.offset,
+            top: self.view.top,
+            code_bits: self.view.code_bits,
+            real_mode: self.view.real_mode,
+            wrap: self.view.wrap,
+            tab: self.view.tab,
+            line_feed: self.view.line_feed,
+            text_column: self.view.text_column,
+            local_offset: self.view.local_offset,
+        }
+    }
+}
+
+/*
+This opener handles the established missing-file prompt before storage selection.
+A created file receives a fresh read-only descriptor through the common selector.
+*/
+fn open_source(console: &Console, path: &Path) -> io::Result<Option<paged::OpenedSource>> {
+    match paged::open_source(path) {
+        Ok(source) => Ok(Some(source)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let key = console.modal(&[], "File not found. Press 'C' for create")?;
+            if !key.character.eq_ignore_ascii_case(&'c') {
+                return Ok(None);
+            }
+            OpenOptions::new().write(true).create_new(true).open(path)?;
+            paged::open_source(path).map(Some)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/*
+This formatter receives one bounded row slice and its full source address.
+The hexadecimal groups and CP437 text match the buffered Hex view.
+*/
+fn paged_hex_line(data: &[u8], address: u64, delimiter: char) -> String {
+    let mut line = format!(" {address:08X}:  ");
+    for index in 0..16 {
+        if index > 0 {
+            line.push(if index % 4 == 0 { delimiter } else { ' ' });
+        }
+        if let Some(byte) = data.get(index) {
+            line.push_str(&format!("{byte:02X}"));
+        } else {
+            line.push_str("  ");
+        }
+    }
+    line.push_str("  ");
+    line.extend(data.iter().take(16).map(|byte| editor::cp437(*byte)));
+    line
+}
+
+/*
+This reader requests only visible rows and splits large terminals into 64 KiB windows.
+Each returned row contains actual bytes or an EOF-clipped final row.
+The result adds empty display rows only after the valid source range ends.
+*/
+fn paged_hex_rows(
+    source: &paged::PagedFile,
+    top: u64,
+    rows: usize,
+    delimiter: char,
+) -> io::Result<Vec<String>> {
+    let mut lines = Vec::with_capacity(rows);
+    let mut address = top;
+    while lines.len() < rows && address < source.len() {
+        let row_count = rows - lines.len();
+        let request = row_count.saturating_mul(16).min(paged::MAX_READ_BYTES);
+        let window = source.read_window(address, request)?;
+        if window.bytes.is_empty() {
+            break;
+        }
+        address = window.start;
+        for bytes in window.bytes.chunks(16) {
+            lines.push(paged_hex_line(bytes, address, delimiter));
+            address = address.saturating_add(bytes.len() as u64);
+        }
+    }
+    if source.len() == 0 && rows != 0 {
+        lines.push(paged_hex_line(&[], 0, delimiter));
+    }
+    lines.resize(rows, String::new());
+    Ok(lines)
+}
+
+/*
+This frame validates and displays the paged view without a file-sized Editor.
+The address fields use a minimum width and preserve every high address digit.
+The footer lists only controls that the paged view implements.
+*/
+fn paged_frame(
+    view: &PagedView,
+    file: &Path,
+    source: &paged::PagedFile,
+    console: &Console,
+    delimiter: char,
+) -> io::Result<Vec<String>> {
+    /*
+    The header shows escaped native filename text, read-only state, mode, and full selected offset.
+    Fixed-width writes clip fields to the current terminal width.
+    */
+    let (width, height) = console.dimensions();
+    let body_rows = height.saturating_sub(2);
+    let mut lines = vec![String::new(); height];
+    let mut header = vec![' '; width];
+    header[0] = '▲';
+    put(
+        &mut header,
+        5,
+        &display_path(file.file_name().unwrap_or_default()),
+    );
+    put(&mut header, width.saturating_sub(58), "↓FRO PAGED HEX");
+    let status = format!(
+        "{:08X}│HView-Linux {}",
+        view.offset,
+        env!("CARGO_PKG_VERSION")
+    );
+    put(
+        &mut header,
+        width.saturating_sub(status.chars().count()),
+        &status,
+    );
+    lines[0] = header.into_iter().collect();
+
+    /*
+    The body requests all visible source rows through one or more bounded windows.
+    Bar characters identify screen positions and the empty-source state.
+    */
+    let body = paged_hex_rows(source, view.top, body_rows, delimiter)?;
+    for (index, line) in body.into_iter().enumerate() {
+        let bar = if index == 0 {
+            '↑'
+        } else if index == height.saturating_sub(4) {
+            '↓'
+        } else if index == height.saturating_sub(3) {
+            '▼'
+        } else if source.len() == 0 {
+            '░'
+        } else {
+            '▓'
+        };
+        if let Some(row) = lines.get_mut(index + 1) {
+            *row = format!("{bar}{line}");
+        }
+    }
+
+    /*
+    The footer lists only implemented paged commands and fills unused width.
+    The complete frame returns only after every section is available.
+    */
+    if let Some(footer) = lines.last_mut() {
+        *footer = format!(
+            "{PAGED_KEYS}{}",
+            "▒".repeat(width.saturating_sub(PAGED_KEYS.chars().count()))
+        );
+    }
+    Ok(lines)
+}
+
+/*
+This positioning helper centers a requested byte and clamps the final visible page.
+Empty files keep both positions at zero.
+*/
+fn paged_goto(view: &mut PagedView, requested: u64, len: u64, rows: usize) {
+    view.offset = if len == 0 { 0 } else { requested.min(len - 1) };
+    let rows = rows.max(1) as u64;
+    view.top = view.offset.saturating_sub(rows.saturating_mul(8)) / 16 * 16;
+    let file_rows = len.div_ceil(16);
+    let final_top = file_rows.saturating_sub(rows).saturating_mul(16);
+    view.top = view.top.min(final_top);
+}
+
+/*
+This restoration keeps a valid saved viewport and clamps stale positions after file changes.
+If the saved selected byte is outside the page, normal Goto positioning makes it visible.
+*/
+fn restore_paged_position(view: &mut PagedView, len: u64, rows: usize) {
+    if len == 0 {
+        view.offset = 0;
+        view.top = 0;
+        return;
+    }
+    view.offset = view.offset.min(len - 1);
+    view.top = view.top.min(len - 1);
+    let page = (rows.max(1) as u64).saturating_mul(16);
+    if view.offset < view.top || view.offset >= view.top.saturating_add(page) {
+        paged_goto(view, view.offset, len, rows);
+    }
+}
+
+/*
+This navigation keeps the selected byte inside the visible bounded Hex page.
+Checked and saturating movement clamps every operation at the source boundaries.
+*/
+fn paged_navigate(view: &mut PagedView, key: Key, len: u64, rows: usize) {
+    /*
+    The first section moves the selected byte with checked or saturating arithmetic.
+    Page movement preserves the selected hexadecimal column when possible.
+    */
+    let final_byte = len.saturating_sub(1);
+    let page = (rows.max(1) as u64).saturating_mul(16);
+    match key {
+        Key::Left => view.offset = view.offset.saturating_sub(1),
+        Key::Right => view.offset = view.offset.saturating_add(1).min(final_byte),
+        Key::Up => {
+            if view.offset >= 16 {
+                view.offset -= 16;
+            }
+        }
+        Key::Down => {
+            if view.offset.saturating_add(16) < len {
+                view.offset += 16;
+            }
+        }
+        Key::Home => view.offset = view.offset / 16 * 16,
+        Key::End => view.offset = (view.offset / 16 * 16 + 15).min(final_byte),
+        Key::PageUp => {
+            view.top = view.top.saturating_sub(page);
+            view.offset = view.top.saturating_add(view.offset % 16).min(final_byte);
+        }
+        Key::PageDown => {
+            let column = view.offset % 16;
+            let next = view.top.saturating_add(page).saturating_add(column);
+            if next < len {
+                view.top = view.top.saturating_add(page);
+                view.offset = next;
+            } else {
+                view.offset = (final_byte / 16 * 16 + column).min(final_byte);
+            }
+        }
+        Key::FileStart => {
+            view.offset = 0;
+            view.top = 0;
+        }
+        Key::FileEnd => view.offset = final_byte,
+    }
+
+    /*
+    The second section handles an empty source and keeps the selected byte inside the viewport.
+    Viewport correction aligns the top to a complete hexadecimal row.
+    */
+    if len == 0 {
+        view.offset = 0;
+        view.top = 0;
+        return;
+    }
+    if view.offset < view.top {
+        view.top = view.offset / 16 * 16;
+    }
+    if view.offset >= view.top.saturating_add(page) {
+        view.top = (view.offset / 16 + 1)
+            .saturating_sub(rows.max(1) as u64)
+            .saturating_mul(16);
+    }
+}
+
+/*
+This view retains the owned source during all frames and key actions.
+Unsupported modes and address conversions produce notices before Hex display starts.
+Each loop validates the source before it publishes the next frame.
+*/
+fn open_paged_editor(
+    console: &Console,
+    path: PathBuf,
+    source: paged::PagedFile,
+    options: &cli::Options,
+    config: &config::Config,
+    saved: Option<&RuntimeView>,
+) -> io::Result<(EditorAction, PagedClosed)> {
+    /*
+    The first section reports requested Text or Code mode before selecting Hex.
+    The notice makes the current large-file limit visible to the user.
+    */
+    let requested_mode = saved
+        .map(|state| state.mode)
+        .unwrap_or_else(|| startup_mode(options, config));
+    if requested_mode != Mode::Hex {
+        console.modal(
+            &[],
+            "The large-file view supports Hex mode only. HView-Linux will open Hex mode.",
+        )?;
+    }
+
+    /*
+    New views resolve File and End offsets from the captured source length.
+    Unsupported format offsets report their limit and start at file offset zero.
+    */
+    let mut initial = 0;
+    if saved.is_none()
+        && let Some(offset) = &options.offset
+    {
+        initial = match offset.target {
+            cli::OffsetTarget::File(value) => value,
+            cli::OffsetTarget::End => source.len().saturating_sub(1),
+            cli::OffsetTarget::Virtual(_) | cli::OffsetTarget::EntryPoint => {
+                console.modal(
+                    &[],
+                    "Virtual and entry-point offsets are unavailable for large files. HView-Linux will use file offset zero.",
+                )?;
+                0
+            }
+        };
+        if initial >= source.len() && source.len() != 0 {
+            console.modal(&[], "Jump out of file")?;
+            initial = 0;
+        }
+    }
+
+    /*
+    Configuration supplies initial display fields without creating an Editor or copying source bytes.
+    A saved runtime record then replaces those fields for a reopened view.
+    */
+    let line_feed = match config.line_feed {
+        config::LineFeed::Auto => config::LineFeed::CrLf,
+        value => value,
+    };
+    let mut view = PagedView {
+        offset: initial,
+        top: 0,
+        code_bits: config.default_code_size,
+        real_mode: false,
+        wrap: config.wrap.resolve(true),
+        tab: config.tab.resolve(false),
+        line_feed,
+        text_column: 0,
+        local_offset: config.show_offset_local,
+    };
+    if let Some(state) = saved {
+        if !state.local_offset {
+            return Err(io::Error::other(
+                "Saved global offset display is not reconstructed.",
+            ));
+        }
+        view.offset = state.offset;
+        view.top = state.top;
+        view.code_bits = state.code_bits;
+        view.real_mode = state.real_mode;
+        view.wrap = state.wrap;
+        view.tab = state.tab;
+        view.line_feed = state.line_feed;
+        view.text_column = state.text_column;
+        view.local_offset = state.local_offset;
+    }
+
+    /*
+    Position restoration keeps a valid saved viewport.
+    A new view centers its requested byte and clamps the final page.
+    */
+    let rows = console.height().saturating_sub(2);
+    if saved.is_some() {
+        restore_paged_position(&mut view, source.len(), rows);
+    } else {
+        paged_goto(&mut view, initial, source.len(), rows);
+    }
+
+    loop {
+        /*
+        Each frame validates descriptor and pathname identity before reading visible windows.
+        The console publishes only complete rows from the validated source.
+        */
+        source.validate()?;
+        let lines = paged_frame(
+            &view,
+            &path,
+            &source,
+            console,
+            editor::cp437(config.hex_delimiter),
+        )?;
+        console.draw(&lines)?;
+        let key = console.key()?;
+        let ctrl = key.control & 12 != 0;
+
+        /*
+        Quit and file-switch commands return the native path and current display state.
+        The outer lifecycle stores that bounded state before opening another source.
+        */
+        if (ctrl && key.code == 81) || matches!(key.code, 27 | 121) {
+            return Ok((EditorAction::Quit, PagedClosed { path, view }));
+        }
+        if ctrl && key.code == 123 {
+            return Ok((EditorAction::Next, PagedClosed { path, view }));
+        }
+        if ctrl && key.code == 122 {
+            return Ok((EditorAction::Previous, PagedClosed { path, view }));
+        }
+        if ctrl && matches!(key.code, 83 | 84) {
+            console.modal(
+                &lines,
+                "This operation is unavailable for the bounded Hex view.",
+            )?;
+            continue;
+        }
+
+        /*
+        The navigation map accepts terminal keys and lowercase movement alternatives.
+        The bounded helper applies all movement without reading more source data.
+        */
+        let navigation = match key.code {
+            37 => Some(Key::Left),
+            39 => Some(Key::Right),
+            38 => Some(Key::Up),
+            40 => Some(Key::Down),
+            36 => Some(if ctrl { Key::FileStart } else { Key::Home }),
+            35 => Some(if ctrl { Key::FileEnd } else { Key::End }),
+            33 => Some(Key::PageUp),
+            34 => Some(Key::PageDown),
+            _ if !ctrl => match key.character.to_ascii_lowercase() {
+                'h' => Some(Key::Left),
+                'l' => Some(Key::Right),
+                'k' => Some(Key::Up),
+                'j' => Some(Key::Down),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(key) = navigation {
+            paged_navigate(
+                &mut view,
+                key,
+                source.len(),
+                console.height().saturating_sub(2),
+            );
+            continue;
+        }
+
+        /*
+        Remaining function keys show help, request Goto, open the picker, or report a limit.
+        An unsupported operation leaves the paged source and display state unchanged.
+        */
+        match key.code {
+            112 => {
+                console.modal(
+                    &lines,
+                    "Paged files support Hex navigation, Goto, file selection, switching, and quit.",
+                )?;
+            }
+            116 => {
+                if let Some(value) = console.prompt(&lines, "Goto file offset")? {
+                    match cli::parse_number(value.as_bytes()) {
+                        Ok((offset, _)) if offset < source.len() => {
+                            paged_goto(
+                                &mut view,
+                                offset,
+                                source.len(),
+                                console.height().saturating_sub(2),
+                            );
+                        }
+                        _ => {
+                            console.modal(&lines, "Jump out of file")?;
+                        }
+                    }
+                }
+            }
+            120 => {
+                if let Some(next) =
+                    select_file(console, path.parent().unwrap_or(Path::new(".")).to_owned())?
+                {
+                    return Ok((EditorAction::Pick(next), PagedClosed { path, view }));
+                }
+            }
+            113..=119 => {
+                console.modal(
+                    &lines,
+                    "This operation is unavailable for the bounded Hex view.",
+                )?;
+            }
+            _ => {}
+        }
+    }
+}
+
+/*
+EditorAction tells the outer lifecycle whether to quit, switch, or open a picked native path.
+The active view returns its state separately from this control result.
+*/
 enum EditorAction {
     Quit,
     Next,
@@ -799,35 +1641,29 @@ enum EditorAction {
     Pick(PathBuf),
 }
 
+/*
+This function runs the established buffered Editor from bytes selected by the source lifecycle.
+It returns the current native path and Editor state after quit or file selection.
+*/
 fn open_editor(
     console: &Console,
     mut path: PathBuf,
+    data: Vec<u8>,
     options: &cli::Options,
     config: &config::Config,
-    saved_view: Option<&config::SavedFile>,
-    save_state_enabled: bool,
+    saved_view: Option<&RuntimeView>,
+    session_publish: &mut bool,
 ) -> io::Result<(EditorAction, Option<(PathBuf, Editor)>)> {
-    let data = match fs::read(&path) {
-        Ok(data) => data,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let key = console.modal(&[], "File not found. Press 'C' for create")?;
-            if !key.character.eq_ignore_ascii_case(&'c') {
-                return Ok((EditorAction::Quit, None));
-            }
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)?;
-            Vec::new()
-        }
-        Err(error) => return Err(error),
-    };
+    /*
+    The lifecycle supplies bytes from the descriptor that selected buffered storage.
+    This view preserves all established small-file behavior after that bounded open.
+    */
+    /*
+    Startup mode and offset use CLI choices before format conversion and configuration defaults.
+    Invalid format offsets produce a notice and select file offset zero.
+    */
     let mode = saved_view
-        .map(|state| match state.mode {
-            2 => Mode::Hex,
-            3 => Mode::Code,
-            _ => Mode::Text,
-        })
+        .map(|state| state.mode)
         .unwrap_or_else(|| startup_mode(options, config));
     let requested = options
         .offset
@@ -850,6 +1686,11 @@ fn open_editor(
         console.modal(&[], "Jump out of file")?;
         initial = 0;
     }
+
+    /*
+    The Editor owns buffered bytes and a saved comparison copy.
+    A runtime record restores only view metadata and validates its local-offset capability.
+    */
     let mut saved = data.clone();
     let mut view = new_view(data, mode, initial, config).map_err(io::Error::other)?;
     if mode == Mode::Hex {
@@ -864,11 +1705,7 @@ fn open_editor(
                 "Saved global offset display is not reconstructed.",
             ));
         }
-        view.mode = match state.mode {
-            2 => Mode::Hex,
-            3 => Mode::Code,
-            _ => Mode::Text,
-        };
+        view.mode = state.mode;
         view.offset = state.offset.min(view.data.len() as u64);
         view.top = state.top.min(view.data.len() as u64);
         view.code_bits = state.code_bits;
@@ -882,6 +1719,12 @@ fn open_editor(
             _ => b"\r\n",
         };
     }
+
+    /*
+    These values hold current navigation, search, and save state.
+    Return history is bounded, while step history follows the current Code traversal.
+    Save flags track disk state independently from view navigation.
+    */
     let mut step_history = Vec::new();
     let mut return_history = VecDeque::new();
     let mut search: Option<operations::Pattern> = None;
@@ -889,6 +1732,10 @@ fn open_editor(
     let mut writable = false;
     let mut decoder = None;
     loop {
+        /*
+        Each iteration derives current metadata, draws one frame, and reads one key.
+        Leaving a hexadecimal group finalizes its pending edit before another command.
+        */
         let metadata = view.metadata();
         let lines = frame(
             &view,
@@ -906,6 +1753,11 @@ fn open_editor(
             view.end_hex_group();
         }
         let ctrl = key.control & 12 != 0;
+
+        /*
+        Global commands quit, save under a new native path, or enter the workbench.
+        Save As updates session publication only after the native save succeeds.
+        */
         if ctrl && key.code == 81 && !view.editing {
             return Ok((EditorAction::Quit, Some((path, view))));
         }
@@ -913,9 +1765,6 @@ fn open_editor(
             if let Some(name) = console.prompt(&lines, "Save As (new file)")? {
                 let destination = PathBuf::from(name.trim().trim_matches('"'));
                 let result = std::path::absolute(&destination).and_then(|destination| {
-                    if save_state_enabled {
-                        config::SavedState::saved_path(&destination).map_err(io::Error::other)?;
-                    }
                     save::save_as(&destination, &view.data)?;
                     Ok(destination)
                 });
@@ -925,6 +1774,12 @@ fn open_editor(
                         saved.clone_from(&view.data);
                         view.saved();
                         updated = true;
+                        if *session_publish
+                            && let Err(error) = config::SavedState::saved_path(&path)
+                        {
+                            disable_session(console, &error)?;
+                            *session_publish = false;
+                        }
                     }
                     Err(error) => {
                         let message = if error.kind() == io::ErrorKind::AlreadyExists {
@@ -949,6 +1804,11 @@ fn open_editor(
             workbench::help(console)?;
             continue;
         }
+
+        /*
+        Repeat search and file-switch commands run before ordinary navigation.
+        File switches return the complete active Editor for bounded runtime-state conversion.
+        */
         if key.code == 118 && !view.editing && (ctrl || key.control & 16 != 0) {
             let start = if ctrl {
                 (view.offset as usize).checked_sub(1)
@@ -981,6 +1841,11 @@ fn open_editor(
                 return Ok((EditorAction::Previous, Some((path, view))));
             }
         }
+
+        /*
+        The navigation map sends Code movement through decoded instruction boundaries.
+        Text and Hex movement use the established Editor navigation rules.
+        */
         let navigation = match key.code {
             37 => Some(Key::Left),
             39 => Some(Key::Right),
@@ -1000,6 +1865,10 @@ fn open_editor(
             _ => None,
         };
         if let Some(key) = navigation {
+            /*
+            Code movement advances through decoded instruction sizes and stores its reverse steps.
+            Other modes delegate viewport correction to the Editor.
+            */
             if view.mode == Mode::Code {
                 let count = if matches!(key, Key::PageDown | Key::PageUp) {
                     console.height().saturating_sub(2)
@@ -1052,6 +1921,11 @@ fn open_editor(
             }
             continue;
         }
+
+        /*
+        Active Hex editing consumes a hexadecimal digit before function-key dispatch.
+        The remaining dispatch handles edit, search, mode, save, and analysis commands.
+        */
         if hex_digit {
             if let Err(error) = view.hex_digit(key.character) {
                 console.modal(&lines, &error)?;
@@ -1059,6 +1933,10 @@ fn open_editor(
             continue;
         }
         match key.code {
+            /*
+            Enter follows one direct Code target and stores the current return position.
+            Backspace restores the newest valid return position.
+            */
             13 if !view.editing && view.mode == Mode::Code => {
                 match direct_target_offset(&view, &metadata, &mut decoder) {
                     Ok(target) => {
@@ -1089,6 +1967,10 @@ fn open_editor(
                     }
                 }
             }
+            /*
+            Code editing prepares assembly bytes, validates their range, and builds a preview.
+            Confirmed bytes enter one Editor replacement transaction.
+            */
             13 | 113 if view.editing && view.mode == Mode::Code => loop {
                 let metadata = view.metadata();
                 let lines = frame(
@@ -1133,6 +2015,10 @@ fn open_editor(
                     }
                 }
             },
+            /*
+            These edit-state commands cancel, quit, undo, redo, or toggle editing.
+            History failures produce notices and preserve current bytes.
+            */
             27 if view.editing => view.cancel_edit(),
             27 | 121 if !view.editing => break,
             code if view.editing
@@ -1170,6 +2056,10 @@ fn open_editor(
                     writable = true;
                 }
             }
+            /*
+            F9 publishes buffered edits through the guarded replacement path.
+            A successful save resets the saved comparison bytes and dirty state.
+            */
             120 if view.editing => match save::replace(&path, &saved, &view.data) {
                 Ok(_) => {
                     saved.clone_from(&view.data);
@@ -1180,6 +2070,10 @@ fn open_editor(
                     console.modal(&lines, &error.to_string())?;
                 }
             },
+            /*
+            Mode selection rebuilds Text or Hex views and retains shared Code settings.
+            The Code-width command resets decoder and navigation caches after a change.
+            */
             code if !view.editing
                 && (code == 115 || code == 13 || key.character.eq_ignore_ascii_case(&'m')) =>
             {
@@ -1230,6 +2124,10 @@ fn open_editor(
                     }
                 }
             }
+            /*
+            Goto parses one bounded file position.
+            Search stores one valid pattern and moves to its first matching byte.
+            */
             116 if !view.editing => {
                 if let Some(value) = console.prompt(&lines, "Goto")? {
                     match cli::parse_number(value.as_bytes()) {
@@ -1285,6 +2183,10 @@ fn open_editor(
                     }
                 }
             }
+            /*
+            Remaining mode and picker commands update display settings or return another native path.
+            Other function keys report the existing reconstruction limit.
+            */
             113 if view.mode == Mode::Text => view.wrap = !view.wrap,
             117 if view.mode == Mode::Text => {
                 console.modal(&lines, "Alternate line-feed handling is not reconstructed.")?;
@@ -1305,7 +2207,25 @@ fn open_editor(
     Ok((EditorAction::Quit, Some((path, view))))
 }
 
+/*
+This notice disables only session publication for the current application run.
+The native file operation and the current in-memory editor state remain available.
+Existing SAV bytes stay unchanged because the final publisher checks this state.
+*/
+fn disable_session(console: &Console, error: &str) -> io::Result<()> {
+    console.modal(&[], &format!("Session disabled. {error}"))?;
+    Ok(())
+}
+
+/*
+This application lifecycle parses inputs, loads configuration and session state, then opens each selected source.
+It publishes session bytes only after all native view operations finish.
+*/
 fn run() -> io::Result<()> {
+    /*
+    The startup section handles the native self-test before normal UTF-8 CLI parsing.
+    Interactive operation then requires a terminal and creates the shared Console.
+    */
     let raw_args: Vec<_> = std::env::args_os().skip(1).collect();
     if raw_args == [std::ffi::OsString::from("--self-test")] {
         for (bits, text, bytes) in [
@@ -1341,6 +2261,11 @@ fn run() -> io::Result<()> {
         ));
     }
     let console = Console::new()?;
+
+    /*
+    Configuration discovery checks the explicit file, portable sibling, and XDG locations in order.
+    The selected settings define later view and session defaults.
+    */
     let executable = std::env::current_exe()?;
     let portable = std::env::var_os("HVIEW_PORTABLE").as_deref() == Some(std::ffi::OsStr::new("1"));
     let ini = options.ini_file.as_ref().map(PathBuf::from).or_else(|| {
@@ -1363,8 +2288,12 @@ fn run() -> io::Result<()> {
         .as_ref()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(&config.savefile));
-    let session_enabled = config.savefile_at_exit || options.save_file.is_some();
-    let saved_bytes = if session_enabled {
+    /*
+    Session input remains separate from the permission to publish changed session bytes.
+    A later path representation failure can disable publication without losing loaded state.
+    */
+    let session_requested = config.savefile_at_exit || options.save_file.is_some();
+    let saved_bytes = if session_requested {
         match fs::read(&save_path) {
             Ok(bytes) => Some(bytes),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -1374,11 +2303,16 @@ fn run() -> io::Result<()> {
         None
     };
     let mut saved_state =
-        if options.file_masks.is_empty() && session_enabled && saved_bytes.is_some() {
+        if options.file_masks.is_empty() && session_requested && saved_bytes.is_some() {
             Some(config::parse_saved(saved_bytes.as_deref().unwrap()).map_err(io::Error::other)?)
         } else {
             None
         };
+
+    /*
+    Macro parsing and path selection occur before any source opens.
+    Restored paths must identify existing Linux files without Windows or relative reinterpretation.
+    */
     let mut playback = options
         .macro_file
         .as_ref()
@@ -1398,7 +2332,7 @@ fn run() -> io::Result<()> {
                 if !path.is_file() {
                     return Err(io::Error::other(format!(
                         "The saved file does not exist on Linux: {}",
-                        path.display()
+                        display_path(path.as_os_str())
                     )));
                 }
                 Ok(path)
@@ -1416,7 +2350,10 @@ fn run() -> io::Result<()> {
         let (width, height) = console.dimensions();
         let mut lines = vec![String::new(); height];
         if let Some(line) = lines.first_mut() {
-            *line = format!("     {}", std::env::current_dir()?.display());
+            *line = format!(
+                "     {}",
+                display_path(std::env::current_dir()?.as_os_str())
+            );
         }
         let keys = " 1       2       3       4       5       6       7       8       9      10      11      12      ";
         if let Some(footer) = lines.last_mut() {
@@ -1428,50 +2365,152 @@ fn run() -> io::Result<()> {
         console.modal(&lines, "Couldn't open file")?;
         return Ok(());
     }
+    /*
+    Runtime records restore each visited file without keeping inactive file contents.
+    Existing SAV records initialize the same bounded metadata before the first open.
+    */
+    let mut runtime_views = if let Some(state) = &saved_state {
+        state
+            .files
+            .iter()
+            .map(RuntimeView::from_saved)
+            .map(Some)
+            .collect()
+    } else {
+        vec![None; paths.len()]
+    };
+    /*
+    Validate new session capacity and paths before any SAV mutation.
+    A representation limit disables publication but does not block the native open.
+    */
+    let mut session_publish = session_requested;
+    if session_publish && paths.len() > 24 {
+        disable_session(&console, "A save state supports no more than 24 files.")?;
+        session_publish = false;
+    }
+    if session_publish && saved_state.is_none() {
+        for path in &paths {
+            if let Err(error) = config::SavedState::saved_path(path) {
+                disable_session(&console, &error)?;
+                session_publish = false;
+                break;
+            }
+        }
+    }
+
     let mut index = saved_state.as_ref().map_or(0, |state| state.active_index);
     if let Some(playback) = playback.take() {
         console.start_macro(playback);
     }
     loop {
-        let (action, view) = open_editor(
-            &console,
-            paths[index].clone(),
-            &options,
-            &config,
-            saved_state
-                .as_ref()
-                .and_then(|state| state.files.get(index)),
-            session_enabled,
-        )?;
-        if let Some((path, view)) = view {
-            paths[index] = path;
-            if let Some(state) = &mut saved_state {
-                let saved_path =
-                    config::SavedState::saved_path(&paths[index]).map_err(io::Error::other)?;
-                if index == state.files.len() {
-                    state
-                        .add_file(&saved_path, &view, &config)
-                        .map_err(io::Error::other)?;
-                } else if state.files[index].path != saved_path {
-                    state
-                        .update_path(index, &saved_path)
-                        .map_err(io::Error::other)?;
+        /*
+        One opened descriptor selects buffered or paged storage for the active path.
+        The selected view returns native path state and content-free session metadata.
+        */
+        let Some(source) = open_source(&console, &paths[index])? else {
+            break;
+        };
+        let saved_view = runtime_views.get(index).and_then(Option::as_ref);
+        let (action, closed) = match source {
+            paged::OpenedSource::Buffered(data) => {
+                let (action, view) = open_editor(
+                    &console,
+                    paths[index].clone(),
+                    data,
+                    &options,
+                    &config,
+                    saved_view,
+                    &mut session_publish,
+                )?;
+                (
+                    action,
+                    view.map(|(path, view)| ClosedView::Buffered(path, view)),
+                )
+            }
+            paged::OpenedSource::Paged(source) => {
+                let (action, closed) = open_paged_editor(
+                    &console,
+                    paths[index].clone(),
+                    source,
+                    &options,
+                    &config,
+                    saved_view,
+                )?;
+                (action, Some(ClosedView::Paged(closed)))
+            }
+        };
+
+        /*
+        Session conversion occurs after the native view closes.
+        A failed conversion keeps the path and editor result but disables SAV publication.
+        Successful conversion updates only defined fields in the current session record.
+        */
+        if let Some(closed) = closed {
+            let path = match &closed {
+                ClosedView::Buffered(path, _) => path,
+                ClosedView::Paged(closed) => &closed.path,
+            };
+            paths[index] = path.clone();
+            let local_offset = runtime_views
+                .get(index)
+                .and_then(Option::as_ref)
+                .map_or(config.show_offset_local, |view| view.local_offset);
+            let runtime_view = match &closed {
+                ClosedView::Buffered(_, view) => {
+                    RuntimeView::from_editor(view, local_offset).map_err(io::Error::other)?
                 }
-                state.update_view(index, &view).map_err(io::Error::other)?;
-            } else if session_enabled {
-                saved_state = Some(
-                    config::SavedState::new_files(
-                        &paths,
-                        index,
-                        &view,
-                        &config,
-                        startup_mode(&options, &config),
-                        options.offset.as_ref(),
-                    )
-                    .map_err(io::Error::other)?,
-                );
+                ClosedView::Paged(closed) => closed.runtime_view(),
+            };
+            runtime_views[index] = Some(runtime_view.clone());
+
+            let saved_path = if session_publish {
+                match config::SavedState::saved_path(path) {
+                    Ok(path) => Some(path),
+                    Err(error) => {
+                        disable_session(&console, &error)?;
+                        session_publish = false;
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(saved_path) = saved_path {
+                let session_view = runtime_view.session_view(saved_path.clone());
+
+                if let Some(state) = &mut saved_state {
+                    if index == state.files.len() {
+                        state
+                            .add_session_view(&session_view, &config)
+                            .map_err(io::Error::other)?;
+                    } else if state.files[index].path != saved_path {
+                        state
+                            .update_path(index, &saved_path)
+                            .map_err(io::Error::other)?;
+                    }
+                    state
+                        .update_session_view(index, &session_view)
+                        .map_err(io::Error::other)?;
+                } else {
+                    saved_state = Some(
+                        config::SavedState::new_session_files(
+                            &paths,
+                            index,
+                            &session_view,
+                            &config,
+                            startup_mode(&options, &config),
+                            options.offset.as_ref(),
+                        )
+                        .map_err(io::Error::other)?,
+                    );
+                }
             }
         }
+
+        /*
+        The action changes only the selected native path index.
+        Picker representation limits can disable sessions but cannot block file selection.
+        */
         match action {
             EditorAction::Quit => break,
             EditorAction::Next => index = (index + 1) % paths.len(),
@@ -1485,20 +2524,27 @@ fn run() -> io::Result<()> {
                             .is_some_and(|target| p.canonicalize().ok().as_ref() == Some(target))
                 }) {
                     index = found;
-                } else if session_enabled && paths.len() >= 24 {
-                    console.modal(&[], "A save state supports no more than 24 files.")?;
                 } else {
-                    if session_enabled && let Err(error) = config::SavedState::saved_path(&path) {
-                        console.modal(&[], &error)?;
-                        continue;
+                    if session_publish && paths.len() >= 24 {
+                        disable_session(&console, "A save state supports no more than 24 files.")?;
+                        session_publish = false;
+                    }
+                    if session_publish && let Err(error) = config::SavedState::saved_path(&path) {
+                        disable_session(&console, &error)?;
+                        session_publish = false;
                     }
                     paths.push(path);
+                    runtime_views.push(None);
                     index = paths.len() - 1;
                 }
             }
         }
     }
-    if session_enabled && let Some(state) = saved_state {
+    /*
+    Publish SAV bytes only when all current paths have a supported representation.
+    Disabled publication leaves the original bytes unchanged on disk.
+    */
+    if session_publish && let Some(state) = saved_state {
         let bytes = config::encode_saved(&state.payload).map_err(io::Error::other)?;
         if let Some(before) = saved_bytes {
             save::replace(&save_path, &before, &bytes)?;
@@ -1509,6 +2555,10 @@ fn run() -> io::Result<()> {
     Ok(())
 }
 
+/*
+The process entry point reports one terminal-safe error and returns a failure status.
+Successful application exits return without additional output.
+*/
 fn main() {
     if let Err(error) = run() {
         eprintln!("{}", console::safe_text(&error.to_string()));
@@ -1518,8 +2568,107 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    /*
+    These unit tests cover bounded navigation, visible-window reads, and display-only path escaping.
+    Lifecycle terminal tests cover source switching and session publication.
+    */
     use super::*;
 
+    /*
+    This test moves a paged cursor across low and high u64 boundaries.
+    Every key keeps the cursor inside the source and visible page.
+    A valid saved top remains unchanged when the selected byte is visible.
+    */
+    #[test]
+    fn paged_navigation_preserves_u64_positions_and_bounds() {
+        let len = u64::from(u32::MAX) + 0x2000;
+        let mut view = PagedView {
+            offset: 0,
+            top: 0,
+            code_bits: 64,
+            real_mode: false,
+            wrap: false,
+            tab: false,
+            line_feed: config::LineFeed::Lf,
+            text_column: 0,
+            local_offset: true,
+        };
+        paged_goto(&mut view, len - 0x101, len, 20);
+        assert!(view.offset > u64::from(u32::MAX));
+        assert!(view.offset >= view.top && view.offset < view.top + 20 * 16);
+        paged_navigate(&mut view, Key::FileEnd, len, 20);
+        assert_eq!(view.offset, len - 1);
+        paged_navigate(&mut view, Key::Right, len, 20);
+        assert_eq!(view.offset, len - 1);
+        paged_navigate(&mut view, Key::FileStart, len, 20);
+        assert_eq!((view.offset, view.top), (0, 0));
+        paged_navigate(&mut view, Key::Left, len, 20);
+        paged_navigate(&mut view, Key::Up, len, 20);
+        assert_eq!(view.offset, 0);
+        view.offset = 5;
+        paged_navigate(&mut view, Key::Up, len, 20);
+        assert_eq!(view.offset, 5);
+
+        view.offset = 0x205;
+        view.top = 0x200;
+        let saved_top = view.top;
+        let rows = 20;
+        restore_paged_position(&mut view, len, rows);
+        assert_eq!(view.top, saved_top);
+    }
+
+    /*
+    This sparse source makes a terminal-sized request cross the 64 KiB window boundary.
+    The second bounded read must supply the first row after that boundary.
+    */
+    #[test]
+    fn paged_rows_continue_after_one_read_window() {
+        use std::os::unix::fs::FileExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "hview-paged-rows-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(paged::BUFFERED_FILE_LIMIT + 1).unwrap();
+        file.write_all_at(b"NEXT", paged::MAX_READ_BYTES as u64)
+            .unwrap();
+        file.sync_all().unwrap();
+        let source = match paged::open_source(&path).unwrap() {
+            paged::OpenedSource::Paged(source) => source,
+            paged::OpenedSource::Buffered(_) => panic!("The sparse source must be paged."),
+        };
+        let rows = paged_hex_rows(&source, 0, 4097, '-').unwrap();
+        assert_eq!(rows.len(), 4097);
+        assert!(rows[4096].contains("4E 45 58 54"));
+        drop(source);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /*
+    This test checks display-only escaping for invalid bytes and terminal controls.
+    The native OsString remains available to file operations without text conversion.
+    */
+    #[test]
+    fn native_path_display_escapes_invalid_and_control_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = std::ffi::OsString::from_vec(b"native-\xff-\x1b.bin".to_vec());
+        assert_eq!(display_path(&path), "native-\\xFF-\\u{1B}.bin");
+    }
+
+    /*
+    This manual benchmark measures buffered Code-frame preparation for raw and PE inputs.
+    Warmup and batch medians reduce timing noise without affecting normal tests.
+    */
     #[test]
     #[ignore = "Run the redraw preparation benchmark manually."]
     fn d01_redraw_preparation_benchmark() {
@@ -1528,6 +2677,10 @@ mod tests {
         const BATCHES: usize = 10;
         const PREPARATIONS_PER_BATCH: usize = 5;
 
+        /*
+        This helper warms the decoder cache and records one preparation time per batch.
+        It prints median and percentile evidence for manual review.
+        */
         fn measure(label: &str, view: &Editor) {
             let mut decoder = None;
             for _ in 0..WARMUPS {
@@ -1586,6 +2739,10 @@ mod tests {
         measure("capstone-pe-entry", &pe_view);
     }
 
+    /*
+    This test checks decoder reuse and replacement across width, syntax, and Real16 changes.
+    Unsupported widths must return an error.
+    */
     #[test]
     fn decoder_for_reuses_and_replaces_decoder() {
         let mut decoder = None;
@@ -1621,8 +2778,16 @@ mod tests {
         );
     }
 
+    /*
+    This test checks assembly preview byte ranges, shorter replacements, overlap, and file growth.
+    Preview generation must never change Editor bytes.
+    */
     #[test]
     fn assembly_preview_covers_exact_overwritten_bytes_and_growth() {
+        /*
+        This helper creates one preview with metadata from the supplied Editor.
+        Tests inspect the returned record without applying it.
+        */
         fn preview(view: &Editor, replacement: &[u8]) -> AssemblyPreview {
             let metadata = view.metadata().unwrap();
             assembly_preview(view, &metadata, &mut None, replacement).unwrap()
@@ -1688,6 +2853,10 @@ mod tests {
         );
     }
 
+    /*
+    This test checks strict effective decoding for Real16, raw widths, and display syntax.
+    Invalid replacement bytes remain unapplied.
+    */
     #[test]
     fn assembly_preview_uses_strict_effective_decoding_and_syntax() {
         for syntax in [decoder::Syntax::Intel, decoder::Syntax::Att] {
@@ -1748,6 +2917,10 @@ mod tests {
         );
     }
 
+    /*
+    This test checks summary wrapping and equal preview-column clipping.
+    Both results must fit their requested terminal widths.
+    */
     #[test]
     fn assembly_preview_wraps_summary_and_marks_truncated_columns() {
         let text = format!("Replacement bytes (15): {}", spaced_hex(&[0x90; 15]));
@@ -1761,6 +2934,10 @@ mod tests {
         assert_eq!(columns.matches("...").count(), 2);
     }
 
+    /*
+    This test resolves direct targets from current raw and ELF bytes.
+    Indirect, truncated, and invalid instructions must not produce a target.
+    */
     #[test]
     fn direct_navigation_uses_current_raw_and_elf_bytes() {
         for syntax in [decoder::Syntax::Intel, decoder::Syntax::Att] {
@@ -1815,6 +2992,10 @@ mod tests {
         assert!(!view.decode_real_mode());
     }
 
+    /*
+    This test fills the bounded return history and validates last-in-first-out removal.
+    An invalid current buffer must preserve the stored position.
+    */
     #[test]
     fn return_history_is_bounded_and_preserves_positions() {
         let mut history = VecDeque::new();
@@ -1839,6 +3020,10 @@ mod tests {
         assert_eq!(history, before);
     }
 
+    /*
+    This test checks valid and invalid hexadecimal search input.
+    Complete byte pairs become their exact binary values.
+    */
     #[test]
     fn search_input_and_native_layout() {
         assert_eq!(hex_pattern("21 22").unwrap(), [0x21, 0x22]);
@@ -1846,6 +3031,10 @@ mod tests {
         assert!(hex_pattern("xx").is_err());
     }
 
+    /*
+    This test keeps Intel assembly input independent from AT&T disassembly output.
+    The active raw address model supplies the effective decoder width.
+    */
     #[test]
     fn assembly_seed_stays_intel_with_att_display() {
         let mut view = Editor::new(vec![0x48, 0x89, 0xd8], Mode::Code, 0);
@@ -1863,6 +3052,10 @@ mod tests {
         assert!(!seed.contains('%'));
     }
 
+    /*
+    This test cycles raw widths without changing the underlying Real16 setting.
+    An invalid high raw base preserves the previous model.
+    */
     #[test]
     fn raw_width_cycle_is_separate_from_the_underlying_real16_mode() {
         let mut view = Editor::new(vec![0x90], Mode::Code, 0);
@@ -1895,6 +3088,10 @@ mod tests {
         assert_eq!(view.raw_model, before);
     }
 
+    /*
+    This test permits invalid-byte display only when configuration enables fallback.
+    The fallback consumes exactly one byte.
+    */
     #[test]
     fn invalid_byte_fallback_is_explicit() {
         let metadata = format::Metadata::parse(&[0x0f]);
@@ -1906,6 +3103,10 @@ mod tests {
         assert_eq!((instruction.size, instruction.text.as_str()), (1, "db 0F"));
     }
 
+    /*
+    This test bounds packed NOP and INT3 runs and checks their independent flags.
+    Disabled packing returns one decoded byte per instruction.
+    */
     #[test]
     fn code_packing_respects_limits_and_settings() {
         for byte in [0x90, 0xcc] {
@@ -1933,6 +3134,10 @@ mod tests {
         }
     }
 
+    /*
+    This test accepts absolute Linux paths and literal Linux backslashes.
+    Windows and relative saved path syntax must fail.
+    */
     #[test]
     fn restored_paths_reject_windows_syntax() {
         assert_eq!(
@@ -1949,6 +3154,10 @@ mod tests {
         assert!(restored_path("relative.bin").is_err());
     }
 
+    /*
+    This test writes and reads one absolute Linux path that contains a backslash.
+    Session conversion must preserve the literal path character.
+    */
     #[test]
     fn native_backslash_path_roundtrips_through_a_session() {
         let folder = std::env::temp_dir().join(format!(

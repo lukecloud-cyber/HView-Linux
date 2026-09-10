@@ -224,6 +224,8 @@ The entropy tool uses blocks of at least 4,096 bytes. The tool increases the blo
 
 ## Editing and saving
 
+These editing and saving instructions apply to buffered files through 64 MiB.
+
 Press `F3` to start editing. Hex mode replaces nibbles, and Code mode assembles one Intel instruction.
 
 Press `Esc` to restore the pre-edit buffer. The application keeps a full memory copy for this cancellation operation.
@@ -294,9 +296,13 @@ The application keeps terminal input that arrives during a macro delay. A macro 
 
 ## Memory and format limits
 
-The application reads each open file into memory. Editing keeps another complete buffer until you save or cancel the edits.
+The application reads regular files through 64 MiB into memory. Editing keeps another complete buffer until you save or cancel edits.
 
-Comparison also reads the other file into memory. Select file sizes that fit available memory with these copies.
+Larger regular files open in a read-only Hex view. The view reads visible data in windows of at most 64 KiB.
+
+Large-file Text, Code, format addresses, editing, saving, search, and analysis remain pending parity work.
+
+For buffered files, comparison also reads the other file into memory. Select file sizes that fit available memory with these copies.
 
 Text mode supports byte-oriented text. Text mode reports UTF-16 text and directs the user to Hex or Code mode.
 

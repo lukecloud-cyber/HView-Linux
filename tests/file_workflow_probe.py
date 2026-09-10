@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Check Linux arguments, configuration, files, macros, and sessions."""
 
+# These imports provide native path, process, payload, and disposable-file operations.
+# The terminal helper owns pseudoterminal execution and restoration checks.
 import os
 from pathlib import Path
 import shutil
@@ -12,6 +14,8 @@ import tempfile
 from terminal_probe import run_session
 
 
+# These key sequences select quit, file switching, and the file picker.
+# Tests send the exact terminal bytes used by the application.
 CTRL_Q = b"\x11"
 CTRL_F11 = b"\x1b[23;5~"
 CTRL_F12 = b"\x1b[24;5~"
@@ -19,11 +23,15 @@ F9 = b"\x1b[20~"
 DOWN = b"\x1b[B"
 
 
+# This helper returns the smallest native configuration for one startup mode.
+# Callers write the returned bytes to each precedence fixture.
 def native_config(mode: str) -> bytes:
     """Make a small native configuration file."""
     return f"[HView-Linux 1]\nStartMode={mode}\n".encode()
 
 
+# This helper builds one fixed legacy macro record from a key and modifiers.
+# The application later parses the returned bytes during startup.
 def macro_file(key: int, modifiers: int = 0) -> bytes:
     """Make one legacy macro event."""
     data = bytearray(69)
@@ -35,6 +43,8 @@ def macro_file(key: int, modifiers: int = 0) -> bytes:
     return bytes(data)
 
 
+# This helper duplicates the SAV checksum for controlled payload changes.
+# The updated checksum keeps the modified fixture valid for the preservation check.
 def checksum(data: bytes) -> int:
     """Calculate the saved payload checksum."""
     full = len(data) & ~3
@@ -49,12 +59,16 @@ def checksum(data: bytes) -> int:
     return value
 
 
+# This assertion helper searches captured terminal bytes for one required value.
+# A missing value reports the caller-supplied reason.
 def require(output: bytes, text: bytes, reason: str) -> None:
     """Require terminal output text."""
     if text not in output:
         raise AssertionError(reason)
 
 
+# This entry point runs each workflow in one disposable directory.
+# Every application process uses the shared terminal-restoration check.
 def main() -> None:
     """Run the file workflow checks."""
     if len(sys.argv) != 2:
@@ -63,6 +77,8 @@ def main() -> None:
     if not binary.is_file():
         raise SystemExit(f"The executable does not exist: {binary}")
 
+    # The first process checks terminal-free help and the current UTF-8 CLI boundary.
+    # Later native picker checks cover non-UTF-8 paths without changing CLI parsing.
     help_result = subprocess.run(
         [binary, "--help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
     )
@@ -78,6 +94,8 @@ def main() -> None:
         raise AssertionError("A non-UTF-8 argument did not produce a clear error.")
 
     with tempfile.TemporaryDirectory(prefix="hview-files-") as temporary:
+        # The first fixtures check explicit offsets, End, Unicode paths, and option boundaries.
+        # Each file contains small deterministic bytes for the buffered viewer.
         root = Path(temporary)
         data_file = root / "data.bin"
         data_file.write_bytes(bytes(range(32)))
@@ -103,6 +121,8 @@ def main() -> None:
         finally:
             os.chdir(old_directory)
 
+        # This section checks explicit, sibling, XDG, portable, and invalid configuration paths.
+        # The copied binary gives sibling discovery a controlled executable directory.
         copied = root / "bin" / "hview-linux"
         copied.parent.mkdir()
         shutil.copy2(binary, copied)
@@ -149,6 +169,8 @@ def main() -> None:
         )
         require(output, b"Illegal value", "An invalid syntax setting did not fail.")
 
+        # This section checks macro startup and recursive path expansion.
+        # The recursive view must reach a child file through normal file switching.
         macro = root / "quit.mac"
         macro.write_bytes(macro_file(ord("Q"), 2))
         run_session(binary, ["--macro", str(macro), str(data_file)], [])
@@ -164,6 +186,8 @@ def main() -> None:
         )
         require(output, b"b.bin", "Recursive file expansion did not include the child file.")
 
+        # This section opens a picker result and checks session restart and active-file selection.
+        # A second session stores and restores a moved buffered cursor.
         picker = root / "picker"
         picker.mkdir()
         first = picker / "a-first.bin"
@@ -199,6 +223,8 @@ def main() -> None:
         if (active, final_offset) != (0, 1):
             raise AssertionError("File switching did not restore the current view offset.")
 
+        # This section changes one unknown SAV payload byte and repairs its checksum.
+        # A normal session update must preserve the unknown byte.
         saved = bytearray(session.read_bytes())
         if saved[24:28] != b"\0\0\0\0":
             raise AssertionError("The native saved fixture is unexpectedly compressed.")
@@ -211,6 +237,8 @@ def main() -> None:
         if session.read_bytes()[32 + 100000] != 0x53:
             raise AssertionError("A session update changed an unknown payload byte.")
 
+        # This section checks Windows path rejection and native path persistence limits.
+        # An unrepresentable session path must leave native viewing available.
         windows_session = Path(__file__).parent / "fixtures" / "offset-10.sav"
         output = run_session(
             binary,
@@ -220,17 +248,21 @@ def main() -> None:
         )
         require(output, b"Windows syntax", "A Windows session path did not fail clearly.")
 
+        # A legacy session cannot represent this valid native path.
+        # The notice disables session publication while the native file view remains available.
         excluded_session = root / "unicode-state.sav"
         output = run_session(
             binary,
             ["--session", str(excluded_session), str(unicode_file)],
-            [CTRL_Q],
-            expected_code=1,
+            [b"\r", CTRL_Q],
         )
-        require(output, b"260 ASCII bytes", "A Unicode session path did not fail clearly.")
+        require(output, b"260 ASCII bytes", "A Unicode session path did not show its limit.")
+        require(output, b"HView-Linux", "A session path limit blocked the native file view.")
         if excluded_session.exists():
             raise AssertionError("An invalid session was published.")
 
+        # Linux treats a backslash as a literal pathname byte.
+        # Session restart must reopen the exact absolute file.
         backslash_file = root / "name\\part.bin"
         backslash_file.write_bytes(b"Backslash path")
         backslash_session = root / "backslash.sav"
@@ -242,6 +274,8 @@ def main() -> None:
         output = run_session(binary, ["--session", str(backslash_session)], [CTRL_Q])
         require(output, b"name\\part.bin", "A Linux backslash path did not survive restart.")
 
+        # This section changes the working directory after one relative input becomes an absolute session path.
+        # Restart must open the original file and never reinterpret the saved path.
         first_directory = root / "first-directory"
         second_directory = root / "second-directory"
         first_directory.mkdir()
@@ -265,6 +299,8 @@ def main() -> None:
         if b"SECOND DIRECTORY" in output:
             raise AssertionError("A session used the restart working directory.")
 
+        # This final section initializes an inactive UTF-16 file in explicit Hex mode.
+        # The stored mode and offset must remain available when the file becomes active.
         utf16_file = root / "utf16.bin"
         utf16_file.write_bytes("\N{ZERO WIDTH NO-BREAK SPACE}Text".encode("utf-16-le"))
         utf16_session = root / "utf16.sav"

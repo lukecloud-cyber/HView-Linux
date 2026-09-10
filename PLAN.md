@@ -18,14 +18,15 @@ HView-Linux is a powerful local hacker toolkit.
 Zero refusals means the product does not block a supported, valid, local operation only because the operation is risky.
 Invalid requests, unsupported requests, permission errors, and operating-system or I/O failures must return accurate errors.
 
-L01.1 and L01.2 are complete.
-The user authorized scoped application work on L02.1.
-Current application authorization covers L02.1 only.
-Keep L02.1 and all other application items `Pending` until their work starts.
+L01.1, L01.2, L02.1, and L02.2 are complete.
+The user authorized and completed scoped application work on L02.2.
+The completed L02.2 authorization does not cover another application item.
+Keep all other application items `Pending` and unauthorized until their work starts.
 Do not infer authorization for another backlog item.
 
-Plan L02.1 with Astra xhigh.
-Assign its bounded implementation to Sol xhigh under the recorded authorization.
+Publish accepted L02.2 only to `origin/rust-rewrite`.
+Then stop.
+L03.1 is the next item and remains unauthorized.
 
 Use Astra xhigh (`gpt-6-astra`, effort `xhigh`) for all planning and review.
 Use Sol xhigh subagents (`gpt-5.6-sol`, effort `xhigh`) for all other work.
@@ -37,10 +38,10 @@ Sol xhigh also runs all checks.
 | Project | Commit and branch | State |
 |---|---|---|
 | HView-Windows | `469f13d0959d5bed7fbf068a7c4a5858be16d0a8`, `master` | Clean local parity source |
-| HView-Linux | `1a3877a459aa7bea0f4e6f9d3249b1adb4554fdc`, `rust-rewrite` | Published L01.1 records; accepted D07 application source at `5e4ef68` |
+| HView-Linux | `86e9650293bde582e6acde32a99acc770499ada0`, `rust-rewrite` | Published baseline before L02.2; accepted D07 application baseline at `5e4ef68` |
 
 The D03 release and D04 through D07 extension remain accepted historical evidence.
-The remote `rust-rewrite` branch matched the L01.1 commit after publication.
+The L02.2 publication commit contains its completion record on `rust-rewrite`.
 The older D09-only plan no longer defines current scope or task order.
 The existing product name, package name, branch, and repository setup remain unchanged.
 

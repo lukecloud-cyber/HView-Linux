@@ -1,11 +1,22 @@
+/*
+These standard path types keep configuration discovery separate from serialized path text.
+Session publication converts native paths only at its checked persistence boundary.
+*/
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+/*
+These constants identify native and legacy files plus the optional Real16 extension.
+The parser preserves each established binary offset and signature.
+*/
 const SAVE_HEADER: &[u8; 16] = b"HViewSav\0\x04\0\0\0\0\x08\x20";
 const NATIVE_INI_HEADER: &str = "[HView-Linux 1]";
 const REAL16_EXTENSION: usize = 67544;
 const REAL16_SIGNATURE: &[u8; 4] = b"R16\x01";
-// These signatures permit imports from the frozen legacy INI and SAV formats.
+/*
+These signatures permit imports from the frozen legacy INI and SAV formats.
+They do not define pathname encoding or change native configuration parsing.
+*/
 const LEGACY_INI_HEADER: &[u8] = &[
     0x5b, 0x48, 0x69, 0x65, 0x77, 0x49, 0x6e, 0x69, 0x20, 0x35, 0x2e, 0x30, 0x33, 0x5d,
 ];
@@ -13,6 +24,10 @@ const LEGACY_SAVE_HEADER: &[u8; 16] = &[
     0x48, 0x69, 0x65, 0x77, 0x53, 0x61, 0x76, 0x65, 0, 4, 0, 0, 0, 0, 8, 0x20,
 ];
 
+/*
+AutoFlag stores explicit On or Off choices and a context-dependent Auto choice.
+Configuration consumers supply the value used for Auto.
+*/
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AutoFlag {
     Auto,
@@ -20,7 +35,15 @@ pub enum AutoFlag {
     Off,
 }
 
+/*
+This implementation resolves an AutoFlag without modifying configuration state.
+The caller supplies the context-specific automatic value.
+*/
 impl AutoFlag {
+    /*
+    This resolver returns the explicit flag value or its caller-supplied automatic value.
+    It does not change the stored configuration.
+    */
     pub fn resolve(self, auto: bool) -> bool {
         match self {
             Self::Auto => auto,
@@ -30,6 +53,10 @@ impl AutoFlag {
     }
 }
 
+/*
+LineFeed records automatic detection or one explicit byte delimiter.
+Editor creation resolves Auto before it stores a delimiter slice.
+*/
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LineFeed {
     Auto,
@@ -38,6 +65,10 @@ pub enum LineFeed {
     Lf,
 }
 
+/*
+Config stores all implemented native and legacy configuration settings.
+Later view and session builders copy only the fields that they own.
+*/
 #[derive(Debug)]
 pub struct Config {
     pub start_mode: String,
@@ -57,6 +88,10 @@ pub struct Config {
     pub savefile: String,
 }
 
+/*
+The default configuration matches the current Linux startup behavior.
+Intel syntax and local offsets remain active unless a valid file changes them.
+*/
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -79,6 +114,10 @@ impl Default for Config {
     }
 }
 
+/*
+TextOptions contains the resolved text classification and display settings for one byte buffer.
+Config::new_view applies these values to a new Editor.
+*/
 #[derive(Debug)]
 pub struct TextOptions {
     pub is_text: bool,
@@ -87,13 +126,25 @@ pub struct TextOptions {
     pub line_feed: LineFeed,
 }
 
+/*
+These methods convert configuration into buffered Editor settings.
+They keep text detection separate from general view construction.
+*/
 impl Config {
+    /*
+    This builder creates one buffered Editor and applies resolved configuration fields.
+    It rejects unsupported UTF-16 only when the requested mode needs Text display.
+    */
     pub fn new_view(
         &self,
         data: Vec<u8>,
         mode: crate::editor::Mode,
         offset: u64,
     ) -> Result<crate::editor::Editor, String> {
+        /*
+        Text inspection selects delimiter, wrap, and tab behavior before Editor creation.
+        Non-Text modes can continue with binary defaults when text inspection fails.
+        */
         use crate::editor::{Editor, Mode};
         let text = match self.text_options(&data) {
             Ok(text) => text,
@@ -105,6 +156,11 @@ impl Config {
                 line_feed: LineFeed::CrLf,
             },
         };
+
+        /*
+        The next section copies common display and decoder settings into the new Editor.
+        Format metadata can select a code width when automatic detection is enabled.
+        */
         let mut view = Editor::new(data, mode, offset);
         view.wrap = text.wrap;
         view.expand_tabs = text.tab;
@@ -128,6 +184,11 @@ impl Config {
         } else {
             self.default_code_size
         };
+
+        /*
+        Text mode aligns the selected byte with its resolved visible row.
+        Other modes keep the initial offset supplied by the caller.
+        */
         if mode == Mode::Text {
             view.offset = offset;
             view.goto(offset, 1);
@@ -136,6 +197,10 @@ impl Config {
         Ok(view)
     }
 
+    /*
+    This classifier inspects a bounded prefix for text bytes and UTF-16 patterns.
+    It resolves automatic line-feed, wrap, and tab choices for Editor creation.
+    */
     pub fn text_options(&self, data: &[u8]) -> Result<TextOptions, String> {
         let sample = &data[..data.len().min(1024)];
         let is_text = !data.is_empty() && sample.iter().all(|&byte| byte >= 8);
@@ -158,6 +223,10 @@ impl Config {
     }
 }
 
+/*
+This detector recognizes UTF-16 byte-order marks and common zero-byte patterns.
+It uses a bounded prefix and does not decode the complete text.
+*/
 fn utf16_text(data: &[u8]) -> bool {
     if data.starts_with(&[0xff, 0xfe]) || data.starts_with(&[0xfe, 0xff]) {
         return true;
@@ -191,6 +260,10 @@ fn utf16_text(data: &[u8]) -> bool {
         || (odd_zero * 4 >= pairs * 3 && even_text * 4 >= pairs * 3)
 }
 
+/*
+This detector returns the first line-feed style found in a bounded prefix.
+CRLF remains the fallback when the sample has no delimiter.
+*/
 pub fn detect_line_feed(data: &[u8]) -> LineFeed {
     for pair in data[..data.len().min(512)].windows(2) {
         if pair[0] == b'\r' {
@@ -207,11 +280,19 @@ pub fn detect_line_feed(data: &[u8]) -> LineFeed {
     LineFeed::CrLf
 }
 
+/*
+This loader reads one selected INI file and passes its bytes to the shared parser.
+The error identifies the file-read stage separately from parsing.
+*/
 pub fn load(path: &Path) -> Result<Config, String> {
     let data = std::fs::read(path).map_err(|error| format!("Cannot read the INI file: {error}"))?;
     parse(&data)
 }
 
+/*
+This discovery helper returns configuration candidates in precedence order.
+Portable mode stops after the executable sibling, while normal mode adds one XDG path.
+*/
 pub fn configuration_paths(
     executable: &Path,
     portable: bool,
@@ -230,7 +311,15 @@ pub fn configuration_paths(
     paths
 }
 
+/*
+This parser accepts the native UTF-8 format and the frozen legacy byte format.
+It validates each line before it changes the configuration result.
+*/
 pub fn parse(data: &[u8]) -> Result<Config, String> {
+    /*
+    The header prefix selects native or legacy decoding and line-ending rules.
+    Native input must contain valid UTF-8 and no null character.
+    */
     let native = data.starts_with(NATIVE_INI_HEADER.as_bytes());
     if !native
         && data
@@ -254,13 +343,20 @@ pub fn parse(data: &[u8]) -> Result<Config, String> {
     }
     let mut config = Config::default();
     let mut header = false;
-    // The original reader splits physical lines only at CRLF. An isolated LF ends the parsed text.
+    /*
+    Native input accepts LF with an optional CR.
+    The legacy reader splits physical lines only at CRLF and stops at isolated control delimiters.
+    */
     let physical_lines: Vec<&str> = if native {
         text.split('\n').collect()
     } else {
         text.split("\r\n").collect()
     };
     for (index, physical) in physical_lines.into_iter().enumerate() {
+        /*
+        Each iteration removes comments outside quotes and skips an empty physical line.
+        The local error helper adds the source format and line number.
+        */
         let line_no = index + 1;
         let physical = if native {
             physical.strip_suffix('\r').unwrap_or(physical)
@@ -285,6 +381,11 @@ pub fn parse(data: &[u8]) -> Result<Config, String> {
             let name = if native { "configuration" } else { "ini-file" };
             format!("{name} (line {line_no}): {reason}")
         };
+
+        /*
+        The first meaningful line must contain the selected format header.
+        Later lines continue through keyword and value validation.
+        */
         if !header {
             let valid = if native {
                 line == NATIVE_INI_HEADER
@@ -297,6 +398,11 @@ pub fn parse(data: &[u8]) -> Result<Config, String> {
             header = true;
             continue;
         }
+
+        /*
+        Keyword validation uses the frozen checksum table and one native extension.
+        Value helpers then parse numeric, word, flag, or Boolean forms consistently.
+        */
         let key_end = line
             .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
             .unwrap_or(line.len());
@@ -337,6 +443,11 @@ pub fn parse(data: &[u8]) -> Result<Config, String> {
                 AutoFlag::Auto => Err(error("Illegal value")),
             }
         };
+
+        /*
+        This dispatch applies one validated setting to the result.
+        Unsupported keywords and values stop parsing with their current line number.
+        */
         match key.as_str() {
             "STARTMODE" => {
                 config.start_mode = match word()?.as_str() {
@@ -436,6 +547,10 @@ pub fn parse(data: &[u8]) -> Result<Config, String> {
     Ok(config)
 }
 
+/*
+This numeric parser accepts signed decimal, octal, and hexadecimal configuration values.
+It rejects trailing text and preserves the legacy wrapping result for negative values.
+*/
 fn parse_number(text: &str) -> Result<u32, &'static str> {
     let (negative, text) = if let Some(tail) = text.strip_prefix('-') {
         (true, tail)
@@ -472,7 +587,15 @@ fn parse_number(text: &str) -> Result<u32, &'static str> {
     })
 }
 
+/*
+This decoder validates one SAV wrapper and returns its uncompressed legacy payload.
+The bounded output size prevents an untrusted header from causing excessive allocation.
+*/
 pub fn decode_saved(data: &[u8]) -> Result<Vec<u8>, String> {
+    /*
+    The first section validates signatures and reads the fixed wrapper fields.
+    Native SAV wrappers later require exact length and checksum matches.
+    */
     let legacy = data.get(..16) == Some(LEGACY_SAVE_HEADER);
     if data.get(..16) != Some(SAVE_HEADER) && !legacy {
         return Err("The save file has an invalid signature.".into());
@@ -487,6 +610,11 @@ pub fn decode_saved(data: &[u8]) -> Result<Vec<u8>, String> {
     if size > 16 * 1024 * 1024 {
         return Err("The save payload exceeds the supported size limit.".into());
     }
+
+    /*
+    An uncompressed wrapper returns its exact payload after native integrity checks.
+    Legacy input retains its established missing-checksum behavior.
+    */
     if compressed_size == 0 {
         let output = data
             .get(32..32 + size)
@@ -504,6 +632,11 @@ pub fn decode_saved(data: &[u8]) -> Result<Vec<u8>, String> {
     if compressed_size != data.len() - 32 {
         return Err("The save payload length is invalid.".into());
     }
+
+    /*
+    Compressed input uses the BLZ bit reader to append literals or prior-byte matches.
+    Every distance and length must remain inside the declared output.
+    */
     let mut reader = Bits {
         data: &data[32..],
         pos: 0,
@@ -540,12 +673,21 @@ pub fn decode_saved(data: &[u8]) -> Result<Vec<u8>, String> {
             output.push(output[output.len() - distance]);
         }
     }
+
+    /*
+    The final checksum validates the complete reconstructed payload before publication.
+    A successful result owns exactly the declared byte count.
+    */
     if crate::checksum::checksum(&output) != field(28) as u32 {
         return Err("The save payload checksum is invalid.".into());
     }
     Ok(output)
 }
 
+/*
+SavedFile contains parsed view metadata for one legacy session slot.
+The payload remains in SavedState so updates can preserve unknown bytes.
+*/
 #[derive(Debug)]
 pub struct SavedFile {
     pub path: String,
@@ -561,6 +703,93 @@ pub struct SavedFile {
     pub local_offset: bool,
 }
 
+/*
+SessionView carries file-view state without any file contents.
+Buffered and paged views convert into this record before SAV mutation.
+The path remains a checked legacy string only inside the persistence boundary.
+*/
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SessionView {
+    pub(crate) path: String,
+    pub(crate) mode: crate::editor::Mode,
+    pub(crate) offset: u64,
+    pub(crate) top: u64,
+    pub(crate) code_bits: u32,
+    pub(crate) real_mode: bool,
+    pub(crate) wrap: bool,
+    pub(crate) tab: bool,
+    pub(crate) line_feed: LineFeed,
+    pub(crate) text_column: usize,
+    pub(crate) local_offset: bool,
+}
+
+/*
+These constructors create content-free view records from active or inactive sources.
+The records become SAV fields only through SavedState methods.
+*/
+impl SessionView {
+    /*
+    This conversion copies the existing buffered view fields into bounded session state.
+    It resolves the editor delimiter before the SAV writer changes any payload bytes.
+    */
+    pub(crate) fn from_editor(
+        path: String,
+        view: &crate::editor::Editor,
+        local_offset: bool,
+    ) -> Result<Self, String> {
+        let line_feed = match view.delimiter {
+            b"\r\n" => LineFeed::CrLf,
+            b"\r" => LineFeed::Cr,
+            b"\n" => LineFeed::Lf,
+            _ => return Err("The saved line-feed mode is not reconstructed.".into()),
+        };
+        Ok(Self {
+            path,
+            mode: view.mode,
+            offset: view.offset,
+            top: view.top,
+            code_bits: view.code_bits,
+            real_mode: view.real_mode,
+            wrap: view.wrap,
+            tab: view.expand_tabs,
+            line_feed,
+            text_column: view.text_column,
+            local_offset,
+        })
+    }
+
+    /*
+    This constructor gives an unopened file the same configured initial view fields.
+    A later open validates and clamps the recorded u64 position against the current source.
+    */
+    fn initial(path: String, config: &Config, mode: crate::editor::Mode, offset: u64) -> Self {
+        Self {
+            path,
+            mode,
+            offset,
+            top: match mode {
+                crate::editor::Mode::Hex => offset / 16 * 16,
+                crate::editor::Mode::Code => offset,
+                crate::editor::Mode::Text => 0,
+            },
+            code_bits: config.default_code_size,
+            real_mode: false,
+            wrap: config.wrap.resolve(true),
+            tab: config.tab.resolve(false),
+            line_feed: match config.line_feed {
+                LineFeed::Cr | LineFeed::Lf | LineFeed::CrLf => config.line_feed,
+                LineFeed::Auto => LineFeed::CrLf,
+            },
+            text_column: 0,
+            local_offset: config.show_offset_local,
+        }
+    }
+}
+
+/*
+SavedState owns parsed file records and the original mutable legacy payload.
+Writers update defined fields in place so unknown payload bytes remain available.
+*/
 #[derive(Debug)]
 pub struct SavedState {
     pub active_index: usize,
@@ -568,7 +797,18 @@ pub struct SavedState {
     pub payload: Vec<u8>,
 }
 
+/*
+These methods construct and update defined legacy session fields.
+They preserve unknown payload data and reject unsupported paths before mutation.
+*/
 impl SavedState {
+    /*
+    Both storage forms use one bounded session-record path.
+    The active buffered wrapper preserves its existing Editor-facing API.
+    Inactive small files keep their prior content-based initialization.
+    Inactive large files use captured length without a complete-file read.
+    */
+    #[cfg(test)]
     pub fn new_files(
         paths: &[std::path::PathBuf],
         active_index: usize,
@@ -581,33 +821,92 @@ impl SavedState {
             return Err("A save state supports 1 to 24 files and a valid active index.".into());
         }
         let active_path = Self::saved_path(&paths[active_index])?;
-        let mut state = Self::new_single(&active_path, view, config)?;
-        state.files.clear();
+        let current = SessionView::from_editor(active_path, view, config.show_offset_local)?;
+        Self::new_session_files(
+            paths,
+            active_index,
+            &current,
+            config,
+            startup_mode,
+            startup_offset,
+        )
+    }
+
+    /*
+    This constructor creates one SAV record per native path without retaining file contents.
+    The selected view supplies its current u64 state.
+    Each inactive source selects buffered or paged initialization from one opened descriptor.
+    */
+    pub(crate) fn new_session_files(
+        paths: &[std::path::PathBuf],
+        active_index: usize,
+        current: &SessionView,
+        config: &Config,
+        startup_mode: crate::editor::Mode,
+        startup_offset: Option<&crate::cli::Offset>,
+    ) -> Result<Self, String> {
+        if paths.is_empty() || paths.len() > 24 || active_index >= paths.len() {
+            return Err("A save state supports 1 to 24 files and a valid active index.".into());
+        }
+        let active_path = Self::saved_path(&paths[active_index])?;
+        if current.path != active_path {
+            return Err("The saved view path does not match the selected file.".into());
+        }
+
+        /*
+        This section converts each native path before any SAV payload exists.
+        Inactive files receive bounded initial state from their selected storage form.
+        */
+        let mut views = Vec::with_capacity(paths.len());
         for (index, path) in paths.iter().enumerate() {
             let text_path = Self::saved_path(path)?;
             if index == active_index {
-                state.add_file(&text_path, view, config)?;
+                views.push(current.clone());
             } else {
-                let data = std::fs::read(path)
-                    .map_err(|error| format!("Cannot read {}: {error}", path.display()))?;
-                let initial_offset = session_offset(&data, startup_offset);
-                let mut initial = config.new_view(data, startup_mode, initial_offset)?;
-                initial.top = match startup_mode {
-                    crate::editor::Mode::Hex => initial_offset / 16 * 16,
-                    crate::editor::Mode::Code => initial_offset,
-                    crate::editor::Mode::Text => initial.top,
-                };
-                state.add_file(&text_path, &initial, config)?;
+                views.push(initial_session_view(
+                    path,
+                    text_path,
+                    config,
+                    startup_mode,
+                    startup_offset,
+                )?);
             }
         }
-        state.update_view(active_index, view)?;
+
+        /*
+        The final section creates each fixed session slot and selects the active record.
+        The shared writer applies the current u64 view metadata last.
+        */
+        let mut state = Self::new_session_single(&views[0], config)?;
+        for view in &views[1..] {
+            state.add_session_view_in_place(view, config)?;
+        }
+        state.write_session_view(active_index, current)?;
         Ok(state)
     }
 
+    /*
+    This wrapper converts a buffered Editor before it adds one SAV record.
+    Existing callers keep their current API and serialized fields.
+    */
+    #[cfg(test)]
     pub fn add_file(
         &mut self,
         path: &str,
         view: &crate::editor::Editor,
+        config: &Config,
+    ) -> Result<usize, String> {
+        let session = SessionView::from_editor(path.to_owned(), view, config.show_offset_local)?;
+        self.add_session_view_in_place(&session, config)
+    }
+
+    /*
+    This helper appends one content-free session record.
+    It builds the new record before it changes the retained SAV payload.
+    */
+    fn add_session_view_in_place(
+        &mut self,
+        view: &SessionView,
         config: &Config,
     ) -> Result<usize, String> {
         let index = self.files.len();
@@ -618,7 +917,7 @@ impl SavedState {
         if self.payload.len() < base + 2814 {
             return Err("The saved file record is truncated.".into());
         }
-        let record = Self::new_single(path, view, config)?;
+        let record = Self::new_session_single(view, config)?;
         set_real16(&mut self.payload, index, view.real_mode)?;
         self.payload[base..base + 2814].copy_from_slice(&record.payload[8..8 + 2814]);
         self.files.extend(record.files);
@@ -626,6 +925,22 @@ impl SavedState {
         Ok(index)
     }
 
+    /*
+    Paged callers add their small view record through this public crate boundary.
+    The caller validates path representation before it requests this mutation.
+    */
+    pub(crate) fn add_session_view(
+        &mut self,
+        view: &SessionView,
+        config: &Config,
+    ) -> Result<usize, String> {
+        self.add_session_view_in_place(view, config)
+    }
+
+    /*
+    This validator enforces the current legacy ASCII path field limit.
+    Later OEM support will replace this temporary non-ASCII limit.
+    */
     pub fn validate_path(path: &str) -> Result<(), String> {
         if !path.is_ascii() || path.len() >= 260 || path.as_bytes().contains(&0) {
             return Err("The saved path must contain fewer than 260 ASCII bytes.".into());
@@ -633,6 +948,10 @@ impl SavedState {
         Ok(())
     }
 
+    /*
+    This converter makes one native path absolute before legacy string validation.
+    A failed conversion returns without mutating session state.
+    */
     pub fn saved_path(path: &Path) -> Result<String, String> {
         let absolute = std::path::absolute(path)
             .map_err(|error| format!("Cannot make the saved path absolute: {error}"))?;
@@ -643,6 +962,10 @@ impl SavedState {
         Ok(text.into())
     }
 
+    /*
+    This updater validates a replacement path before changing its record bytes.
+    It clears the fixed field and copies only the new path bytes.
+    */
     pub fn update_path(&mut self, index: usize, path: &str) -> Result<(), String> {
         Self::validate_path(path)?;
         let file = self
@@ -660,25 +983,35 @@ impl SavedState {
         Ok(())
     }
 
-    pub fn update_view(
-        &mut self,
-        index: usize,
-        view: &crate::editor::Editor,
-    ) -> Result<(), String> {
+    /*
+    This shared writer changes only defined fields in one existing SAV record.
+    Unknown payload bytes remain unchanged.
+    The active index changes only after all supplied fields pass validation.
+    */
+    fn write_session_view(&mut self, index: usize, view: &SessionView) -> Result<(), String> {
+        Self::validate_path(&view.path)?;
+        if ![16, 32, 64].contains(&view.code_bits) {
+            return Err("The saved code width must be 16, 32, or 64 bits.".into());
+        }
+        if view.line_feed == LineFeed::Auto {
+            return Err("The saved line-feed mode is not reconstructed.".into());
+        }
         let file = self
             .files
             .get_mut(index)
             .ok_or("The saved file index is invalid.")?;
+        if file.path != view.path {
+            return Err("The saved view path does not match the selected file.".into());
+        }
         let base = 8 + index * 2814;
         if self.payload.len() < base + 2814 {
             return Err("The saved file record is truncated.".into());
         }
-        let line_feed = match view.delimiter {
-            b"\r\n" => LineFeed::CrLf,
-            b"\r" => LineFeed::Cr,
-            b"\n" => LineFeed::Lf,
-            _ => return Err("The saved line-feed mode is not reconstructed.".into()),
-        };
+
+        /*
+        The metadata section updates the in-memory record and matching fixed payload fields.
+        Real16 uses its separate bitmap while unknown record bytes remain unchanged.
+        */
         set_real16(&mut self.payload, index, view.real_mode)?;
         file.mode = match view.mode {
             crate::editor::Mode::Text => 1,
@@ -690,9 +1023,10 @@ impl SavedState {
         file.code_bits = view.code_bits;
         file.real_mode = view.real_mode;
         file.wrap = view.wrap;
-        file.tab = view.expand_tabs;
-        file.line_feed = line_feed;
+        file.tab = view.tab;
+        file.line_feed = view.line_feed;
         file.text_column = view.text_column;
+        file.local_offset = view.local_offset;
         self.active_index = index;
         put32(&mut self.payload, 0, index as u32);
         for (offset, value) in [(352, file.top), (376, file.offset)] {
@@ -702,14 +1036,16 @@ impl SavedState {
             (2772, file.mode),
             (
                 2776,
-                match line_feed {
+                match file.line_feed {
                     LineFeed::CrLf => 0,
                     LineFeed::Cr => 1,
-                    _ => 2,
+                    LineFeed::Lf => 2,
+                    LineFeed::Auto => unreachable!(),
                 },
             ),
             (2780, file.text_column as u32),
             (2784, file.code_bits),
+            (2792, if file.local_offset { u32::MAX } else { 0 }),
         ] {
             put32(&mut self.payload, base + offset, value);
         }
@@ -718,17 +1054,77 @@ impl SavedState {
         Ok(())
     }
 
+    /*
+    This wrapper preserves the existing buffered update interface.
+    It copies the stored path and offset-display setting before mutable payload access.
+    */
+    #[cfg(test)]
+    pub fn update_view(
+        &mut self,
+        index: usize,
+        view: &crate::editor::Editor,
+    ) -> Result<(), String> {
+        let file = self
+            .files
+            .get(index)
+            .ok_or("The saved file index is invalid.")?;
+        let session = SessionView::from_editor(file.path.clone(), view, file.local_offset)?;
+        self.write_session_view(index, &session)
+    }
+
+    /*
+    This entry point updates one paged session record without file bytes.
+    The shared writer preserves the same fields and unknown payload data.
+    */
+    pub(crate) fn update_session_view(
+        &mut self,
+        index: usize,
+        view: &SessionView,
+    ) -> Result<(), String> {
+        self.write_session_view(index, view)
+    }
+
+    /*
+    This buffered wrapper preserves all existing constructors and tests.
+    It converts the Editor before the shared content-free constructor runs.
+    */
+    #[cfg(test)]
     pub fn new_single(
         path: &str,
         view: &crate::editor::Editor,
         config: &Config,
     ) -> Result<Self, String> {
+        let session = SessionView::from_editor(path.to_owned(), view, config.show_offset_local)?;
+        Self::new_session_single(&session, config)
+    }
+
+    /*
+    This constructor applies a small view record to one empty SAV payload.
+    The following empty-payload helper retains the exact legacy layout.
+    */
+    fn new_session_single(view: &SessionView, config: &Config) -> Result<Self, String> {
+        let mut state = Self::empty_single(&view.path, config)?;
+        state.write_session_view(0, view)?;
+        Ok(state)
+    }
+
+    /*
+    This helper creates the established legacy payload and its unchanged default ranges.
+    It writes no view-specific fields until the shared session writer runs.
+    */
+    fn empty_single(path: &str, config: &Config) -> Result<Self, String> {
         Self::validate_path(path)?;
-        // The original allocates 67,578 state bytes and 36,208 empty history bytes.
+        /*
+        The original layout allocates 67,578 state bytes and 36,208 empty history bytes.
+        Initial fixed fields follow the frozen Windows payload offsets.
+        */
         let mut payload = vec![0; 105916];
         put32(&mut payload, 4, 1);
         payload[8..8 + path.len()].copy_from_slice(path.as_bytes());
-        // These ranges contain empty position lists and block selections.
+        /*
+        These ranges contain empty position lists and block selections.
+        The all-one value marks each unused entry in the legacy layout.
+        */
         for (start, end) in [(408, 1384), (2664, 2672), (2720, 2744), (2752, 2760)] {
             payload[8 + start..8 + end].fill(0xff);
         }
@@ -753,7 +1149,10 @@ impl SavedState {
         );
         payload[8 + 2811] = 0xff;
         put32(&mut payload, 67556, config.opcode_show_bytes as u32);
-        // These defaults come from 0x416A10 and the pristine data tables.
+        /*
+        These defaults come from address 0x416A10 and the pristine data tables.
+        The final parse verifies that the constructed payload remains readable.
+        */
         put32(&mut payload, 67564, 1);
         put32(&mut payload, 67572, 1);
         put32(&mut payload, 67578, 1);
@@ -761,12 +1160,52 @@ impl SavedState {
         put32(&mut payload, 67802 + 1862, u32::MAX);
         put32(&mut payload, 67802 + 1866, 4);
         put32(&mut payload, 67802 + 1870, 1);
-        let mut state = parse_saved(&encode_saved(&payload)?)?;
-        state.update_view(0, view)?;
-        Ok(state)
+        parse_saved(&encode_saved(&payload)?)
     }
 }
 
+/*
+This helper initializes one inactive file without retaining its contents.
+Small files keep content-based mode behavior.
+Large files keep only configured fields and a u64 startup position.
+*/
+fn initial_session_view(
+    path: &Path,
+    text_path: String,
+    config: &Config,
+    startup_mode: crate::editor::Mode,
+    startup_offset: Option<&crate::cli::Offset>,
+) -> Result<SessionView, String> {
+    /*
+    The common source selector classifies one opened descriptor before initialization.
+    Buffered files use their bytes, while paged files use only captured length.
+    */
+    match crate::paged::open_source(path)
+        .map_err(|error| format!("Cannot read {}: {error}", path.display()))?
+    {
+        crate::paged::OpenedSource::Buffered(data) => {
+            let initial_offset = session_offset(&data, startup_offset);
+            let mut initial = config.new_view(data, startup_mode, initial_offset)?;
+            initial.top = match startup_mode {
+                crate::editor::Mode::Hex => initial_offset / 16 * 16,
+                crate::editor::Mode::Code => initial_offset,
+                crate::editor::Mode::Text => initial.top,
+            };
+            SessionView::from_editor(text_path, &initial, config.show_offset_local)
+        }
+        crate::paged::OpenedSource::Paged(file) => Ok(SessionView::initial(
+            text_path,
+            config,
+            startup_mode,
+            session_offset_for_len(file.len(), startup_offset),
+        )),
+    }
+}
+
+/*
+This helper resolves startup offsets for one inactive buffered file.
+It permits format conversion because the complete small byte buffer is available.
+*/
 fn session_offset(data: &[u8], offset: Option<&crate::cli::Offset>) -> u64 {
     let requested = offset.and_then(|offset| {
         match offset.target {
@@ -782,10 +1221,31 @@ fn session_offset(data: &[u8], offset: Option<&crate::cli::Offset>) -> u64 {
         .unwrap_or(0)
 }
 
+/*
+Large inactive sources cannot parse virtual or entry-point offsets without later format integration.
+File and End offsets use the captured u64 length and the existing out-of-range fallback.
+*/
+fn session_offset_for_len(len: u64, offset: Option<&crate::cli::Offset>) -> u64 {
+    let requested = offset.and_then(|offset| match offset.target {
+        crate::cli::OffsetTarget::File(value) => Some(value),
+        crate::cli::OffsetTarget::End => Some(len.saturating_sub(1)),
+        crate::cli::OffsetTarget::Virtual(_) | crate::cli::OffsetTarget::EntryPoint => None,
+    });
+    requested.filter(|value| *value < len).unwrap_or(0)
+}
+
+/*
+This helper writes one little-endian 32-bit field at a verified legacy payload offset.
+Callers validate payload size before they use the helper.
+*/
 fn put32(payload: &mut [u8], offset: usize, value: u32) {
     payload[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+/*
+This reader returns the optional Real16 bitmap from its fixed extension.
+A nonzero unsupported high byte rejects a corrupt file map.
+*/
 fn real16_bitmap(payload: &[u8]) -> Result<u32, String> {
     let extension = payload
         .get(REAL16_EXTENSION..REAL16_EXTENSION + 8)
@@ -800,6 +1260,10 @@ fn real16_bitmap(payload: &[u8]) -> Result<u32, String> {
     Ok(bitmap)
 }
 
+/*
+This writer enables or disables one file bit in the Real16 extension.
+It creates the signature only when an empty extension first needs Real16.
+*/
 fn set_real16(payload: &mut [u8], index: usize, enabled: bool) -> Result<(), String> {
     let extension = payload
         .get_mut(REAL16_EXTENSION..REAL16_EXTENSION + 8)
@@ -825,7 +1289,15 @@ fn set_real16(payload: &mut [u8], index: usize, enabled: bool) -> Result<(), Str
     Ok(())
 }
 
+/*
+This parser converts a validated SAV wrapper into bounded file metadata records.
+It retains the complete payload for later field updates and unknown-byte preservation.
+*/
 pub fn parse_saved(data: &[u8]) -> Result<SavedState, String> {
+    /*
+    The first section validates payload size, active index, file count, and Real16 extension.
+    These values bound every following record slice.
+    */
     let payload = decode_saved(data)?;
     if payload.len() < 69708 {
         return Err("The save payload is too short for this HView version.".into());
@@ -840,6 +1312,10 @@ pub fn parse_saved(data: &[u8]) -> Result<SavedState, String> {
     let real16 = real16_bitmap(&payload)?;
     let mut files = Vec::with_capacity(count);
     for index in 0..count {
+        /*
+        Each iteration validates one fixed path, mode, width, line-feed, and architecture record.
+        Valid fields become content-free SavedFile metadata.
+        */
         let base = 8 + index * 2814;
         let raw_path = &payload[base..base + 260];
         let end = raw_path
@@ -891,6 +1367,10 @@ pub fn parse_saved(data: &[u8]) -> Result<SavedState, String> {
     })
 }
 
+/*
+This encoder wraps an unchanged legacy payload in the native SAV header.
+It stores an uncompressed body with exact length and checksum fields.
+*/
 pub fn encode_saved(payload: &[u8]) -> Result<Vec<u8>, String> {
     if payload.len() > 16 * 1024 * 1024 {
         return Err("The save payload exceeds the supported size limit.".into());
@@ -905,6 +1385,10 @@ pub fn encode_saved(payload: &[u8]) -> Result<Vec<u8>, String> {
     Ok(encoded)
 }
 
+/*
+Bits tracks byte position and remaining tag bits during BLZ decompression.
+Its methods reject truncated input and overflowing encoded numbers.
+*/
 struct Bits<'a> {
     data: &'a [u8],
     pos: usize,
@@ -912,7 +1396,15 @@ struct Bits<'a> {
     remaining: u8,
 }
 
+/*
+These methods consume BLZ bytes, control bits, and variable-length numbers in order.
+Each method advances only its owned reader state.
+*/
 impl Bits<'_> {
+    /*
+    This reader consumes one byte and advances the input position.
+    It returns a truncation error when no byte remains.
+    */
     fn byte(&mut self) -> Result<u8, String> {
         let byte = *self
             .data
@@ -921,6 +1413,11 @@ impl Bits<'_> {
         self.pos += 1;
         Ok(byte)
     }
+
+    /*
+    This reader reloads a 16-bit tag when necessary and returns its next high bit.
+    The shifted tag and remaining count preserve later bit order.
+    */
     fn bit(&mut self) -> Result<bool, String> {
         if self.remaining == 0 {
             self.tag = u16::from_le_bytes([self.byte()?, self.byte()?]);
@@ -931,6 +1428,11 @@ impl Bits<'_> {
         self.tag <<= 1;
         Ok(bit)
     }
+
+    /*
+    This reader decodes one variable-length BLZ number from paired control bits.
+    Checked multiplication rejects a value that exceeds the host range.
+    */
     fn number(&mut self) -> Result<usize, String> {
         let mut value = 1usize;
         loop {
@@ -947,8 +1449,16 @@ impl Bits<'_> {
 
 #[cfg(test)]
 mod tests {
+    /*
+    These tests cover configuration parsing, text detection, SAV layout, Real16, and bounded sessions.
+    Each fixture uses controlled bytes or disposable files.
+    */
     use super::*;
 
+    /*
+    This test checks legacy parsing, text classification, line feeds, and numeric forms.
+    Each assertion isolates one accepted default or rejected value.
+    */
     #[test]
     fn ini_and_text_detection() {
         let config = parse(b" ; comment\r\n [HViewIni 5.03]\r\n StartMode=Hex ; comment\r\nDefaultCodesize=020\r\nHexDelimiterChar=0x7C\r\nOpcodeShowBytes=3\r\n").unwrap();
@@ -1021,6 +1531,10 @@ mod tests {
         );
     }
 
+    /*
+    This test confirms Intel as the default syntax and AT&T as an explicit option.
+    It also keeps invalid-byte fallback unavailable in legacy configuration.
+    */
     #[test]
     fn disassembly_syntax_defaults_to_intel_and_accepts_att() {
         assert_eq!(
@@ -1034,6 +1548,10 @@ mod tests {
         assert!(parse(b"[HViewIni 5.03]\r\nInvalidCode=Byte").is_err());
     }
 
+    /*
+    This test checks native UTF-8 text, LF lines, native extensions, and invalid encodings.
+    Valid non-ASCII native configuration text remains unchanged.
+    */
     #[test]
     fn native_configuration_uses_utf8_and_lf() {
         let config = parse(
@@ -1052,6 +1570,10 @@ mod tests {
         assert!(parse(&invalid).unwrap_err().contains("valid UTF-8"));
     }
 
+    /*
+    This test checks explicit, portable, XDG, and HOME configuration discovery order.
+    Relative XDG paths fall back to the HOME location.
+    */
     #[test]
     fn configuration_paths_use_defined_precedence() {
         let executable = Path::new("/opt/hview-linux/bin/hview-linux");
@@ -1094,6 +1616,10 @@ mod tests {
         }
     }
 
+    /*
+    This test checks known SAV fixtures, wrapper integrity, and basic parsed file metadata.
+    Re-encoding must return the exact original payload.
+    */
     #[test]
     fn original_save_payloads() {
         let first = decode_saved(include_bytes!("../tests/fixtures/offset-10.sav")).unwrap();
@@ -1131,6 +1657,10 @@ mod tests {
         assert!(parse_saved(&encode_saved(&empty).unwrap()).is_err());
     }
 
+    /*
+    This test checks native output headers and frozen legacy import signatures.
+    Native integrity errors remain strict while legacy checksum behavior remains compatible.
+    */
     #[test]
     fn new_headers_and_legacy_imports() {
         assert_eq!(Config::default().savefile, "hview-linux.sav");
@@ -1168,7 +1698,10 @@ mod tests {
             "The save payload is truncated."
         );
 
-        // Legacy uncompressed imports retain their original checksum policy.
+        /*
+        Legacy uncompressed imports retain their original checksum policy.
+        The converted native wrapper then keeps the same payload.
+        */
         damaged[..16].copy_from_slice(LEGACY_SAVE_HEADER);
         assert_eq!(decode_saved(&damaged).unwrap(), damaged[32..]);
         let mut imported = encoded;
@@ -1176,6 +1709,10 @@ mod tests {
         assert_eq!(parse_saved(&imported).unwrap().payload, payload);
     }
 
+    /*
+    This test changes one saved view and checks that unrelated payload bytes remain identical.
+    It also checks multi-file construction and invalid indexes.
+    */
     #[test]
     fn saved_view_update_preserves_other_state() {
         use crate::editor::{Editor, Mode};
@@ -1219,6 +1756,10 @@ mod tests {
         assert!(SavedState::new_files(&[], 0, &view, &Config::default(), Mode::Hex, None).is_err());
     }
 
+    /*
+    This test enables and disables Real16 without changing legacy code widths or unknown extension bytes.
+    A conflicting extension prevents unsafe publication.
+    */
     #[test]
     fn real16_session_extension_preserves_legacy_widths_and_unknown_data() {
         use crate::editor::{Editor, Mode};
@@ -1252,6 +1793,10 @@ mod tests {
         assert_eq!(ordinary.payload, before);
     }
 
+    /*
+    This test gives inactive UTF-16 files the same non-Text view defaults as active files.
+    Explicit offsets and unsupported Text mode remain distinct.
+    */
     #[test]
     fn inactive_utf16_files_use_the_same_view_options() {
         use crate::editor::Mode;
@@ -1319,6 +1864,10 @@ mod tests {
         );
     }
 
+    /*
+    This test checks startup offsets and visible tops for inactive Hex and Code files.
+    Each temporary file is removed after its session state is built.
+    */
     #[test]
     fn inactive_session_offsets_keep_the_selected_bytes_visible() {
         use crate::editor::{Editor, Mode};
@@ -1350,6 +1899,94 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    /*
+    This sparse inactive source verifies bounded session initialization above 64 MiB.
+    The End startup position remains a full u64 value without a complete-file buffer.
+    */
+    #[test]
+    fn large_inactive_session_uses_length_only_state() {
+        use crate::editor::{Editor, Mode};
+        use std::fs::OpenOptions;
+
+        let path = std::env::temp_dir().join(format!(
+            "hview-large-session-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let len = crate::paged::BUFFERED_FILE_LIMIT + 1;
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(len)
+            .unwrap();
+        let active = std::path::absolute("active.bin").unwrap();
+        let paths = vec![active, path.clone()];
+        let view = Editor::new(vec![0], Mode::Hex, 0);
+        let offset = crate::cli::Offset {
+            mode: 2,
+            target: crate::cli::OffsetTarget::End,
+        };
+        let state = SavedState::new_files(
+            &paths,
+            0,
+            &view,
+            &Config::default(),
+            Mode::Hex,
+            Some(&offset),
+        )
+        .unwrap();
+        assert_eq!(state.files[1].offset, len - 1);
+        assert_eq!(state.files[1].top, (len - 1) / 16 * 16);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /*
+    This content-free record verifies that legacy SAV fields retain high u64 positions.
+    Encoding and parsing must not narrow the active paged offset or top value.
+    */
+    #[test]
+    fn paged_session_record_preserves_u64_positions() {
+        let path = std::path::absolute("high-offset.bin").unwrap();
+        let saved_path = SavedState::saved_path(&path).unwrap();
+        let offset = u64::from(u32::MAX) + 0x1234;
+        let current = SessionView {
+            path: saved_path,
+            mode: crate::editor::Mode::Hex,
+            offset,
+            top: offset / 16 * 16,
+            code_bits: 64,
+            real_mode: false,
+            wrap: false,
+            tab: true,
+            line_feed: LineFeed::Lf,
+            text_column: 7,
+            local_offset: true,
+        };
+        let state = SavedState::new_session_files(
+            &[path],
+            0,
+            &current,
+            &Config::default(),
+            crate::editor::Mode::Hex,
+            None,
+        )
+        .unwrap();
+        let parsed = parse_saved(&encode_saved(&state.payload).unwrap()).unwrap();
+        assert_eq!(parsed.files[0].offset, offset);
+        assert_eq!(parsed.files[0].top, offset / 16 * 16);
+        assert_eq!(parsed.files[0].code_bits, 64);
+        assert_eq!(parsed.files[0].line_feed, LineFeed::Lf);
+    }
+
+    /*
+    This test checks selected-file updates, new session slots, and path replacement.
+    Defined fields change while retained saved records keep their independent state.
+    */
     #[test]
     fn selected_files_and_new_paths_preserve_saved_records() {
         use crate::editor::{Editor, Mode};

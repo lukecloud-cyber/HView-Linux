@@ -10,14 +10,15 @@ Read [UPSTREAM_REVIEW.md](UPSTREAM_REVIEW.md) for the historical and current Win
 
 - Current scope: all implemented functions in Windows commit `469f13d0959d5bed7fbf068a7c4a5858be16d0a8`.
 - Current Windows source: clean local `master` at `469f13d0959d5bed7fbf068a7c4a5858be16d0a8`.
-- Current Linux branch: local and remote `rust-rewrite` at `2a275daf88dad159165b9ad982dd62fd2983be2d`.
+- Published baseline before L02.2: local and remote `rust-rewrite` at `86e9650293bde582e6acde32a99acc770499ada0`.
+- Current Linux branch: `rust-rewrite`. The L02.2 publication commit contains this completion record.
 - Accepted Linux application baseline: D07 source at `5e4ef68`.
-- Current authorization: scoped application work on L02.1 only.
+- Current authorization: completed scoped application work on L02.2 only. No other application item is authorized.
 - Planning status: L01.1, L01.2, and parent L01 are `Complete`.
-- Application implementation: L02.1 is `Complete`. All other application items remain `Pending` and unauthorized.
-- Detailed plan: three current children are `Complete`; 82 children are `Pending`.
-- Next action: L02.2 is the next item. Plan viewer file-lifecycle integration when the user requests the next item.
-- Request boundary: end this request after L02.1 publication. Do not start L02.2 now.
+- Application implementation: L02.2 and parent L02 are `Complete`. All other incomplete application items remain `Pending` and unauthorized.
+- Detailed plan: four current children are `Complete`; 81 children are `Pending`.
+- Next action: Publish accepted L02.2 only to `origin/rust-rewrite`. Then stop. L03.1 is the next item and remains unauthorized.
+- Request boundary: end this request after L02.2 publication. Do not start another item.
 - Accepted platform decisions: retain scoped HEM functions, closely match the Windows terminal, and support raw-device editing.
 - Device policy: use read-only defaults and explicit writable mode. Permit a user-controlled override for mounted, in-use, or nonexclusive devices.
 - Product policy: do not block a supported, valid, local operation only because the operation is risky.
@@ -32,14 +33,16 @@ Read [UPSTREAM_REVIEW.md](UPSTREAM_REVIEW.md) for the historical and current Win
 - Reviewer: Astra xhigh performs all planning and review.
 - Publication: commit and push reviewed goals only to `origin/rust-rewrite`.
 - Astra High accepted the detailed 85-goal plan after text review; all implementation goals remain pending until explicit user authorization.
-- Current modified files: `src/paged.rs`, `tests/paged_reads.rs`, and `TRACKER.md`.
+- Current modified files: `README.md`, `PLAN.md`, `TRACKER.md`, `VERIFICATION.md`, three Rust files, and three terminal probes.
+- Removed temporary file: `tests/paged_reads.rs`. The normal application target now compiles `src/paged.rs`.
 - Project folder: `/home/sweet_cicero/Projects/HView-Linux`.
 - Repository: [HView-Linux](https://github.com/lukecloud-cyber/HView-Linux).
 
 The current source review used local checkouts only.
 The review did not run the Windows application, HEM modules, or real devices.
-The review did not run a current full PTY or isolated-package suite.
-The current Rust suite has one environment-limited ACL fixture failure.
+The release application passed the current terminal probes.
+The final serialized host Rust suite passed all 101 active tests.
+The sandbox Rust suite kept one ACL fixture failure because `setfacl` rejected UID 1.
 See [UPSTREAM_REVIEW.md](UPSTREAM_REVIEW.md) for the exact failure and source evidence.
 
 ## Status rules
@@ -67,7 +70,7 @@ Each task stays at its recorded status until its checks and Astra acceptance pas
 | ID | Upstream work | Coverage | Dependencies | Required task | Required acceptance |
 |---|---|---|---|---|---|
 | L01 | P01-P07, X03 | Complete records | None | Record the accepted HEM, terminal, device, path, and process-control contracts. | Record scoped application authorization and identify the first dependency-ready application item. |
-| L02 | S01, REQ01 | Missing | L01 | Add bounded regular-file access with stable ownership and `u64` positions. | Check files above 64 MiB, 4 GiB, and memory limits. Check both ends and source changes. |
+| L02 | S01, REQ01 | Complete | L01 | Add bounded regular-file access with stable ownership and `u64` positions. | Check files above 64 MiB, 4 GiB, and memory limits. Check both ends and source changes. |
 | L03 | S02, D07, REQ01/10 | Partial | L02 | Add logical spans and current edit transactions. Retain exact buffered undo state. | Check 256 records, 130 MiB history, 65 MiB changed memory, and 4,096 spans. Check atomic refusal. |
 | L04 | S02, R03/R04 | Scale missing | L03 | Extend guarded Linux saves to logical spans and sparse files. | Check metadata, ACLs, identities, holes, races, reopening, failures, and recovery paths. |
 | L05 | S03, REQ01/13 | Missing | L02, L03 | Add shared Text indexes, resumable scans, and suffix invalidation. | Check cold and warm seeks, cancellation, 64 KiB rows, 4 KiB carry, and bounded checkpoints. |
@@ -127,12 +130,12 @@ The user accepted the HEM exclusion, terminal direction, and device override.
 ### L02: bounded regular-file storage
 
 All L02 children use `W:src/main.rs:8445`, `W:src/paged.rs:20`, and `W:src/paged.rs:213`.
-Linux currently reads the complete file at `L:src/main.rs:810`.
+Linux now selects buffered or paged storage from one opened regular-file descriptor.
 
 | ID | Status | Deliverable | Why and context | Dependencies | Acceptance | Boundary |
 |---|---|---|---|---|---|---|
 | L02.1 | Complete | Add owned bounded file reads. | Whole-file loading prevents files larger than memory from opening. | L01.2 | Check 64 KiB windows, `u64` offsets, short reads, EOF, and files above 64 MiB and 4 GiB. | Regular files only. Preserve actual I/O errors and bounded allocation. |
-| L02.2 | Pending | Connect bounded storage to the file lifecycle. | Views and reopen paths must retain the same source identity across file changes. | L02.1 | Check first and last bytes, limited-memory opening, file switches, reopening, replacement, truncation, and source changes. | Preserve native pathname identity. Keep buffered behavior where upstream uses it. Do not add paged-only analysis routes. |
+| L02.2 | Complete | Connect bounded storage to the file lifecycle. | Views and reopen paths must retain the same source identity across file changes. | L02.1 | Check first and last bytes, limited-memory opening, file switches, reopening, replacement, truncation, and source changes. | Preserve native pathname identity. Keep buffered behavior where upstream uses it. Do not add paged-only analysis routes. |
 
 ### L03: logical spans and edit transactions
 
@@ -467,11 +470,12 @@ Keep the current native-loading and package baseline.
 ### L33: final acceptance
 
 All L33 children use PLAN.md requirements, the current tracker crosswalks, UPSTREAM_REVIEW.md evidence, and historical VERIFICATION.md records.
-The current full Rust suite has an environment-limited ACL failure.
+The current sandbox Rust suite has an environment-limited ACL failure.
+The L02.2 serialized host suite passed all active tests.
 
 | ID | Status | Deliverable | Why and context | Dependencies | Acceptance | Boundary |
 |---|---|---|---|---|---|---|
-| L33.1 | Pending | Run complete Rust and platform acceptance. | Feature checks need a current combined result, including the unresolved ACL environment requirement. | L02-L31, L32.2 | Pass formatting, full tests, strict Clippy, release build, native checks, and relevant Linux save and device checks. Run the unchanged ACL fixture where UID 1 is mapped. | Sol runs checks. Record failures accurately. Use disposable device tests only. |
+| L33.1 | Pending | Run complete Rust and platform acceptance. | Feature checks need a current combined result on a UID-1-capable host. | L02-L31, L32.2 | Pass formatting, full tests, strict Clippy, release build, native checks, and relevant Linux save and device checks. Run the unchanged ACL fixture where UID 1 is mapped. | Sol runs checks. Record failures accurately. Use disposable device tests only. |
 | L33.2 | Pending | Run complete terminal and package acceptance. | Unit tests alone cannot establish key reachability, terminal restoration, or independent package behavior. | L33.1, L32.3 | Pass current PTY suites, standard and small terminal cases, restoration, Unicode, architecture controls, and packaged probes. | Record the tested terminal and package identity. Reuse valid current evidence when no new reason requires another run. |
 | L33.3 | Pending | Complete parity records and Astra acceptance. | The project needs one current requirement matrix with explicit Linux differences and unresolved limits. | L33.2 | Update final records and all crosswalks. Obtain Astra xhigh acceptance for requirements, evidence, exclusions, and documented Linux differences. | Complete only after every required goal and check passes. Record exact next actions for remaining work. |
 
@@ -479,6 +483,9 @@ The current full Rust suite has an environment-limited ACL failure.
 
 | Date | Change | Result | Next action |
 |---|---|---|---|
+| 2026-09-10 | Complete L02.2 file-lifecycle integration. | All required checks and Astra xhigh review passed. | Publish L02.2 to `origin/rust-rewrite`. Then stop. |
+| 2026-09-10 | Implement L02.2 file-lifecycle integration. | The application and release terminal checks passed. The final host Rust suite passed. | Have Astra xhigh review the complete diff and evidence. |
+| 2026-09-10 | Start L02.2 file-lifecycle integration. | The user authorized L02.2 only. Astra xhigh bounded the implementation. | Connect the paged Hex view and its session lifecycle. |
 | 2026-09-10 | Complete L02.1 bounded file reads. | All required checks and Astra xhigh review passed. | Publish L02.1. Then stop before L02.2. |
 | 2026-09-10 | Implement L02.1 bounded file reads. | The focused tests, formatting, strict Clippy, and release build passed. | Have Astra xhigh review the diff and evidence. |
 | 2026-09-10 | Start L02.1 bounded file reads. | The new component owns a regular-file handle and returns bounded windows at `u64` offsets. The bounded FIFO test passed. | Run the complete focused target and required Rust checks. |
@@ -546,6 +553,73 @@ Nine focused tests, the bounded FIFO check, formatting, strict Clippy, and the r
 The component preserves owned windows, native path bytes, checked bounds, and source validation.
 The viewer remains unchanged.
 L02.2 will connect the component to the file lifecycle.
+
+### L02.2 implementation evidence
+
+| Command | Result |
+|---|---|
+| `timeout 30s cargo test --locked --offline paged::tests::fifo_is_rejected_without_blocking` | Passed. The FIFO refusal completed without blocking. |
+| `cargo test --locked --offline` | The first run passed 92 tests, failed three tests, and ignored one test. The corrected second sandbox run passed 100 tests, failed the ACL fixture, and ignored one test. |
+| `cargo test --locked --offline save::tests::replace_rejects_content_path_links_and_locks -- --nocapture --test-threads=1` | Passed unchanged after an unexplained `WouldBlock` failure in the first parallel suite. The second parallel suite also passed the test. |
+| `cargo test --locked --offline save::tests::acl_and_metadata_policy_are_explicit -- --nocapture --test-threads=1` | The sandbox returned `Invalid argument` for `setfacl -m u:1:r--`. |
+| Same isolated ACL command in the host environment | Passed unchanged. The host supports the required named UID ACL. |
+| `cargo test --locked --offline --all-targets -- --test-threads=1` in the host environment | The final corrected source passed 101 tests. One manual benchmark stayed ignored. |
+| `cargo fmt --all -- --check` | Passed. |
+| `cargo check --locked --offline --all-targets` | Passed after the source-comment and shortcut corrections. |
+| `cargo clippy --locked --offline --all-targets -- -D warnings` | Passed. |
+| `cargo build --locked --offline --release` | Passed. |
+| `python3 -m py_compile tests/file_workflow_probe.py tests/terminal_probe.py tests/paged_lifecycle_probe.py` | Passed. |
+| `target/release/hview-linux --self-test` | Passed the native instruction checks. |
+| `python3 tests/paged_lifecycle_probe.py target/release/hview-linux` | Passed under a 256 MiB address-space limit. The rerun checked Ctrl+S and Ctrl+T notices with an unchanged frame. |
+| `python3 tests/file_workflow_probe.py target/release/hview-linux` | Passed. |
+| `python3 tests/terminal_probe.py target/release/hview-linux` | Passed. |
+| `python3 tests/navigation_probe.py target/release/hview-linux` | Passed. |
+| `python3 tests/reliability_probe.py target/release/hview-linux` | Passed. |
+| `python3 tests/edit_history_probe.py target/release/hview-linux` | Passed. |
+| `git diff --check` | Passed for the final worktree diff. |
+
+The first development suite passed 92 tests and ignored one benchmark.
+The paged replacement assertion, the lock test, and the ACL fixture failed.
+The replacement assertion exposed descriptor-first validation wording and was corrected.
+The first replacement PTY rerun used a stale debug binary.
+A rebuilt binary passed the replacement check and hid all replacement bytes before the error.
+
+The application uses buffered storage through 64 MiB.
+Larger regular files retain one owned descriptor and use 64 KiB read windows.
+Buffered Linux virtual files use bounded sequential reads and preserve short reported content.
+
+The paged Hex view retains full `u64` positions.
+The view implements arrows, Home, End, Page Up, Page Down, Goto, picker, switching, and quit.
+The view validates descriptor and pathname identity before every frame.
+L03 and L04 own large-file editing and saves.
+L05 and L16 own large-file Text functions.
+L07 and L08 own large-file Code and format addresses.
+L17 owns large-file search.
+These pending parity functions are temporary limits and are not permanent Linux differences.
+
+Runtime view records contain metadata and no file bytes.
+The records restore positions across mixed buffered and paged file switches.
+Legacy path limits can disable SAV publication without blocking native file operations.
+If publication stops, the application preserves runtime state and existing SAV bytes.
+
+The lifecycle probe used disposable sparse files above 64 MiB and 4 GiB.
+The probe verified first bytes, final bytes, high Goto, switches, restart, replacement, truncation, and reopen.
+The probe verified the Hex-only notice and unsupported format-offset notice.
+The probe also verified native non-UTF-8 picker paths and escaped display text.
+The standalone L02.1 test target was removed after the normal application target included `src/paged.rs`.
+
+Each changed source file contains educational comments for its logical sections.
+The comments explain inputs, data flow, state changes, decisions, and control flow.
+
+Linux metadata validation cannot exclude every concurrent writer.
+Later goals must add paged editing, analysis, Text, Code, and modern session functions.
+
+Astra xhigh accepted L02.2 on September 10, 2026.
+The review covered bounded Hex viewing, native source identity, file switching, runtime state, session preservation, and educational source comments.
+The final serialized host suite passed 101 tests.
+One manual benchmark stayed ignored.
+The original sandbox and transient lock failures remain recorded with their rerun results.
+Large-file modes, editing, saving, search, and analysis remain pending under their assigned goals.
 
 ## Current stage sequence
 
@@ -877,8 +951,9 @@ The findings and limits above remain the persistent evidence summary.
 9. Assign an authorized dependency-ready item to Sol xhigh.
 10. Record results and the next action in this tracker.
 
-Current resume action: L02.2 is the next item.
-Plan viewer file-lifecycle integration when the user requests the next item.
+Current resume action: publish accepted L02.2 only to `origin/rust-rewrite`.
+Then stop.
+L03.1 is the next item and remains unauthorized.
 
 ## Historical D04 through D07 Windows review
 
