@@ -75,6 +75,17 @@ def sparse_file(path: Path | bytes, length: int, markers: list[tuple[int, bytes]
         os.close(descriptor)
 
 
+# This helper reads one bounded marker from a native path and always closes its descriptor.
+# Large sparse checks use the helper without loading complete files.
+def read_at(path: Path | bytes, length: int, offset: int = 0) -> bytes:
+    """Read one bounded marker at an exact file offset."""
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        return os.pread(descriptor, length, offset)
+    finally:
+        os.close(descriptor)
+
+
 # This check opens one source above 4 GiB under a smaller process limit.
 # Separate sessions verify low, final, high, and unsupported command behavior.
 def check_high_offsets(binary: Path, root: Path) -> tuple[Path, int]:
@@ -96,17 +107,16 @@ def check_high_offsets(binary: Path, root: Path) -> tuple[Path, int]:
     )
     require(first, b"41 42 43 44", "The paged view did not show the first bytes.")
 
-    # Save As and tools are unavailable until later bounded-view integration.
-    # Each command must report the limit and then redraw the unchanged source frame.
+    # Tools remain unavailable until later bounded-view integration.
+    # The command must report the limit and then redraw the unchanged source frame.
     unsupported = run_session(
         binary,
         ["--mode=hex", str(source)],
-        [CTRL_S, b"\r", CTRL_T, b"\r", CTRL_Q],
+        [CTRL_T, b"\r", CTRL_Q],
         address_limit_bytes=ADDRESS_LIMIT,
     )
     notice = b"unavailable for the bounded Hex view"
-    if unsupported.count(notice) < 2:
-        raise AssertionError("The paged view did not report both unsupported commands.")
+    require(unsupported, notice, "The paged view did not report the Tools limit.")
     require(
         after_last(unsupported, notice),
         b"41 42 43 44",
@@ -152,7 +162,7 @@ def check_paged_edits(binary: Path, source: Path, high: int) -> None:
     """Check paged Hex edits, retained controls, high offsets, and cancellation."""
 
     # A resize between the two nibbles must keep one history record.
-    # Blocked commands must preserve the edited bytes, history, cursor, and owned source.
+    # Leave commands must preserve the edited bytes, history, cursor, and owned source.
     output = run_session(
         binary,
         ["--mode=hex", str(source)],
@@ -169,10 +179,6 @@ def check_paged_edits(binary: Path, source: Path, high: int) -> None:
             b"C",
             CTRL_Z,
             CTRL_Y,
-            CTRL_S,
-            b"\r",
-            ALT_S,
-            b"\r",
             ALT_N,
             b"\r",
             CTRL_Q,
@@ -190,7 +196,7 @@ def check_paged_edits(binary: Path, source: Path, high: int) -> None:
         ],
         address_limit_bytes=ADDRESS_LIMIT,
     )
-    require(output, b"Memory edits remain", "A blocked command did not retain edit mode.")
+    require(output, b"Alt+S to save", "A blocked command did not retain edit mode.")
     require(output, b"Escape in the editor", "A leave command did not explain cancellation.")
     require(output, b"The undo history is empty", "Cancellation did not clear paged history.")
     require_order(
@@ -273,13 +279,111 @@ def check_paged_edits(binary: Path, source: Path, high: int) -> None:
     )
     require(eof_output, b"cannot extend the file at EOF", "Paged editing did not refuse EOF growth.")
 
-    # The application never publishes the in-memory bytes to the opened file during L03.3.
+    # Explicit cancellation never publishes the in-memory bytes to the opened file.
     descriptor = os.open(source, os.O_RDONLY)
     try:
         if os.pread(descriptor, 4, 0) != b"ABCD" or os.pread(descriptor, 4, high) != b"HIGH":
             raise AssertionError("Paged cancellation changed source bytes on disk.")
     finally:
         os.close(descriptor)
+
+
+# This helper finds the private recovery directory for one native target path.
+# The target note stores exact pathname bytes, so the lookup does not use display text.
+def recovery_for_target(root: Path, target: Path | bytes) -> Path:
+    """Return the single recovery directory for a target."""
+    expected = os.fsencode(target) + b"\n"
+    matches = [
+        folder
+        for folder in root.glob(".HView-save-*")
+        if (folder / "target.txt").read_bytes() == expected
+    ]
+    if len(matches) != 1:
+        raise AssertionError(f"The target has {len(matches)} recovery directories.")
+    return matches[0]
+
+
+# This check publishes paged replacement and Save As results through their physical shortcuts.
+# It verifies fresh baselines, session restart, independent backups, and bounded sparse storage.
+def check_paged_saves(binary: Path, root: Path) -> None:
+    """Check paged replacement and exclusive Save As publication."""
+
+    # Replacement publishes one changed byte and leaves an independent original backup.
+    # A later canceled edit restores the published baseline, and session restart sees that baseline.
+    length = 64 * 1024 * 1024 + 1
+    source = root / "paged-save.bin"
+    session = root / "paged-save.sav"
+    sparse_file(source, length, [(0, b"ABCD"), (length - 1, b"Z")])
+    output = run_session(
+        binary,
+        ["--mode=hex", "--session", str(session), str(source)],
+        [ALT_E, b"ab", ALT_S, ALT_E, b"c", ESCAPE, CTRL_Q],
+        address_limit_bytes=ADDRESS_LIMIT,
+    )
+    require_order(output, b"AB 42 43 44", b"AB C2 43 44", b"AB 42 43 44")
+    descriptor = os.open(source, os.O_RDONLY)
+    try:
+        if os.pread(descriptor, 4, 0) != b"\xabBCD":
+            raise AssertionError("Paged replacement did not publish the logical bytes.")
+    finally:
+        os.close(descriptor)
+    replacement = recovery_for_target(root, source)
+    backup = replacement / "original.bin"
+    descriptor = os.open(backup, os.O_RDONLY)
+    try:
+        if os.pread(descriptor, 4, 0) != b"ABCD":
+            raise AssertionError("Paged replacement did not retain independent original bytes.")
+    finally:
+        os.close(descriptor)
+    restarted = run_session(binary, ["--session", str(session)], [CTRL_Q])
+    require(restarted, b"AB 42 43 44", "Session restart did not use the saved paged baseline.")
+
+    # Save As publishes a new path without changing its source.
+    # A later canceled edit restores the new destination baseline.
+    copy_source = root / "paged-copy-source.bin"
+    destination = root / "paged-copy.bin"
+    sparse_file(copy_source, length, [(0, b"WXYZ"), (length - 1, b"Q")])
+    output = run_session(
+        binary,
+        ["--mode=hex", str(copy_source)],
+        [ALT_E, b"cd", CTRL_S, os.fsencode(destination), b"\r", ALT_E, b"e", ESCAPE, CTRL_Q],
+        address_limit_bytes=ADDRESS_LIMIT,
+    )
+    require(output, b"paged-copy.bin", "Paged Save As did not adopt the destination path.")
+    require_order(output, b"CD 58 59 5A", b"CD E8 59 5A", b"CD 58 59 5A")
+    if read_at(copy_source, 4) != b"WXYZ":
+        raise AssertionError("Paged Save As changed the original source.")
+    if read_at(destination, 4) != b"\xcdXYZ":
+        raise AssertionError("Paged Save As did not publish the logical bytes.")
+
+    # One high-offset replacement proves the save remains bounded below the 4 GiB fixture size.
+    # Sparse target and backup allocation must remain small after publication.
+    high_length = (1 << 32) + 0x2000
+    high = (1 << 32) + 0x100
+    high_source = root / "paged-high-save.bin"
+    sparse_file(
+        high_source,
+        high_length,
+        [(0, b"LOW"), (high, b"HIGH"), (high_length - 1, b"Z")],
+    )
+    run_session(
+        binary,
+        ["--mode=hex", str(high_source)],
+        [ALT_G, f"{high:X}".encode(), b"\r", ALT_E, b"ab", ALT_S, CTRL_Q],
+        address_limit_bytes=ADDRESS_LIMIT,
+    )
+    high_backup = recovery_for_target(root, high_source) / "original.bin"
+    for path, expected in [(high_source, b"\xabIGH"), (high_backup, b"HIGH")]:
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            if os.pread(descriptor, len(expected), high) != expected:
+                raise AssertionError(f"The high save bytes are incorrect for {path!r}.")
+            if os.fstat(descriptor).st_size != high_length:
+                raise AssertionError(f"The high save length is incorrect for {path!r}.")
+            if os.fstat(descriptor).st_blocks * 512 >= 16 * 1024 * 1024:
+                raise AssertionError(f"The high save became dense for {path!r}.")
+        finally:
+            os.close(descriptor)
 
 
 # This check switches between buffered and paged sources before a session restart.
@@ -401,10 +505,10 @@ def check_source_changes(binary: Path, root: Path) -> None:
     require(reopened, b"4E 45 57", "A fresh open did not read the edited replacement source.")
 
 
-# This check selects an invalid UTF-8 pathname through the native picker.
-# Display text uses escapes while the selected Path bytes remain unchanged.
+# This check selects and saves an invalid UTF-8 pathname through the native picker.
+# Display text uses escapes while native open and replacement preserve exact Path bytes.
 def check_native_picker(binary: Path, root: Path) -> None:
-    """Check native non-UTF-8 picker input and escaped display text."""
+    """Check native non-UTF-8 picker input, display, and paged replacement."""
 
     # The initial ASCII path selects the directory without expanding CLI path support.
     # The picker returns the original invalid pathname bytes for the next native open.
@@ -413,14 +517,17 @@ def check_native_picker(binary: Path, root: Path) -> None:
     first = folder / "a-first.bin"
     first.write_bytes(b"FIRST")
     native = os.fsencode(folder) + b"/b-native-\xff.bin"
-    descriptor = os.open(native, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    try:
-        os.write(descriptor, b"NATIVE")
-    finally:
-        os.close(descriptor)
-    output = run_session(binary, ["--mode=hex", str(first)], [ALT_O, DOWN, DOWN, b"\r", CTRL_Q])
+    sparse_file(native, 64 * 1024 * 1024 + 1, [(0, b"NATIVE")])
+    output = run_session(
+        binary,
+        ["--mode=hex", str(first)],
+        [ALT_O, DOWN, DOWN, b"\r", ALT_E, b"ab", ALT_S, CTRL_Q],
+        address_limit_bytes=ADDRESS_LIMIT,
+    )
     require(output, b"b-native-\\xFF.bin", "The picker did not escape invalid pathname bytes.")
-    require(output, b"4E 41 54 49-56 45", "The picker did not open the native pathname.")
+    require(output, b"AB 41 54 49-56 45", "The native paged replacement did not show saved bytes.")
+    if read_at(native, 6) != b"\xabATIVE":
+        raise AssertionError("Paged replacement changed the native pathname or saved incorrect bytes.")
 
 
 # This check makes Save As choose a path that the legacy SAV format cannot represent.
@@ -472,6 +579,52 @@ def check_session_error_preservation(binary: Path, root: Path) -> None:
     if session.read_bytes() != before:
         raise AssertionError("A session representation failure changed existing SAV bytes.")
 
+    # A separate paged case publishes one changed sparse source under an unrepresentable session path.
+    # File switching must retain the native destination and u64 cursor after session publication stops.
+    paged_source = root / "paged-session-source.bin"
+    paged_other = root / "paged-session-other.bin"
+    paged_session = root / "paged-preserved.sav"
+    sparse_file(paged_source, 64 * 1024 * 1024 + 1, [(0x10, b"PAGE")])
+    paged_other.write_bytes(b"other")
+    run_session(
+        binary,
+        ["--mode=hex", "--session", str(paged_session), str(paged_source), str(paged_other)],
+        [CTRL_Q],
+    )
+    paged_before = paged_session.read_bytes()
+    paged_destination = root / "�-paged-copy.bin"
+    terminal_paged_destination = os.fsencode(root) + b"/\x82-paged-copy.bin"
+    output = run_session(
+        binary,
+        ["--session", str(paged_session)],
+        [
+            ALT_G,
+            b"10",
+            b"\r",
+            ALT_E,
+            b"ab",
+            CTRL_S,
+            terminal_paged_destination,
+            b"\r",
+            b"\r",
+            ALT_N,
+            ALT_P,
+            CTRL_Q,
+        ],
+        address_limit_bytes=ADDRESS_LIMIT,
+    )
+    require(output, b"Session disabled", "Paged Save As did not report the session path limit.")
+    returned_paged = after_last(output, b"\\u{FFFD}-paged-copy.bin")
+    require(
+        returned_paged,
+        b"00000011",
+        "The paged destination cursor did not survive file switching.",
+    )
+    if read_at(paged_destination, 4, 0x10) != b"\xabAGE":
+        raise AssertionError("Paged Save As did not publish the native destination bytes.")
+    if paged_session.read_bytes() != paged_before:
+        raise AssertionError("Paged session representation failure changed existing SAV bytes.")
+
 
 # This entry point creates all lifecycle fixtures in one disposable directory.
 # Each check runs the release application through a restored pseudoterminal.
@@ -490,6 +643,7 @@ def main() -> None:
         large, high = check_high_offsets(binary, root)
         check_paged_edits(binary, large, high)
         check_switch_and_restart(binary, root, large, high)
+        check_paged_saves(binary, root)
         check_source_changes(binary, root)
         check_native_picker(binary, root)
         check_session_error_preservation(binary, root)

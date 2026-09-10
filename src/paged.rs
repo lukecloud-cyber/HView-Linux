@@ -332,6 +332,24 @@ impl PagedFile {
     }
 
     /*
+    This check compares another open descriptor with the captured source stamp.
+    Save preparation uses the result before it copies metadata or publishes bytes.
+    */
+    pub(crate) fn validate_descriptor(&self, file: &File) -> io::Result<()> {
+        self.stamp
+            .validate(SourceStamp::from_metadata(&file.metadata()?))
+    }
+
+    /*
+    This identity check confirms that a reopened publication owns the prepared staging inode.
+    It does not accept pathname text or infer identity from file contents.
+    */
+    pub(crate) fn has_identity(&self, device: u64, inode: u64) -> io::Result<bool> {
+        let metadata = self.file.metadata()?;
+        Ok(metadata.dev() == device && metadata.ino() == inode)
+    }
+
+    /*
     Validation compares the native pathname and descriptor with the opened identity.
     The pathname check reports replacement before descriptor metadata changes.
     A replacement pathname cannot redirect the descriptor to another source.
@@ -851,12 +869,104 @@ impl PagedFile {
 
     /*
     This public component operation supplies real Linux queries to the staging helper.
-    Later guarded publication code can use the completed private file without a full source copy.
-    L04.2 will remove the temporary dead-code allowance when it connects guarded publication.
+    Guarded publication code can use the completed private file without a full source copy.
     */
-    #[allow(dead_code)]
     pub(crate) fn write_staged(&self, output: &File) -> io::Result<()> {
         self.write_staged_with(output, |offset, whence| self.seek_extent(offset, whence))
+    }
+
+    /*
+    This operation streams the captured original source into an independent empty staging file.
+    Sparse extents and the bounded fallback use the same source-copy path as logical staging.
+    The edit layout and both history stacks remain unchanged.
+    */
+    pub(crate) fn write_original(&self, output: &File) -> io::Result<()> {
+        let output_metadata = output.metadata()?;
+        if !output_metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "The staging output is not a regular file.",
+            ));
+        }
+        if output_metadata.dev() == self.stamp.device && output_metadata.ino() == self.stamp.inode {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "The staging output identifies the source file.",
+            ));
+        }
+        if output_metadata.len() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "The staging output is not empty.",
+            ));
+        }
+        self.validate()?;
+        output.set_len(self.stamp.len)?;
+        self.write_source_span_with(output, 0, self.stamp.len, 0, |offset, whence| {
+            self.seek_extent(offset, whence)
+        })?;
+        output.sync_all()?;
+        self.validate()
+    }
+
+    /*
+    This verifier compares the captured source with one prepared backup in bounded chunks.
+    It validates source identity around the complete comparison and rejects partial backup data.
+    */
+    pub(crate) fn verify_original(&self, backup: &File) -> io::Result<()> {
+        let metadata = backup.metadata()?;
+        if !metadata.is_file() || metadata.len() != self.stamp.len {
+            return Err(io::Error::other(
+                "The staged backup does not match the original source length.",
+            ));
+        }
+        self.validate()?;
+        let mut source = [0_u8; MAX_READ_BYTES];
+        let mut staged = [0_u8; MAX_READ_BYTES];
+        let mut offset = 0_u64;
+        while offset < self.stamp.len {
+            let count =
+                usize::try_from((self.stamp.len - offset).min(MAX_READ_BYTES as u64)).unwrap();
+            self.file.read_exact_at(&mut source[..count], offset)?;
+            backup.read_exact_at(&mut staged[..count], offset)?;
+            if source[..count] != staged[..count] {
+                return Err(io::Error::other(
+                    "The staged backup does not match the original source bytes.",
+                ));
+            }
+            offset += count as u64;
+        }
+        self.validate()
+    }
+
+    /*
+    This verifier compares one prepared logical file with the current span layout.
+    Fixed buffers keep both reads bounded while memory and source spans share one comparison path.
+    */
+    pub(crate) fn verify_staged(&self, staged: &File) -> io::Result<()> {
+        let metadata = staged.metadata()?;
+        if !metadata.is_file() || metadata.len() != self.layout.len {
+            return Err(io::Error::other(
+                "The staged file does not match the logical source length.",
+            ));
+        }
+        self.validate()?;
+        let mut expected = [0_u8; MAX_READ_BYTES];
+        let mut actual = [0_u8; MAX_READ_BYTES];
+        let mut offset = 0_u64;
+        while offset < self.layout.len {
+            let count =
+                usize::try_from((self.layout.len - offset).min(MAX_READ_BYTES as u64)).unwrap();
+            self.read_merged_unchecked_at(offset, &mut expected[..count])?;
+            staged.read_exact_at(&mut actual[..count], offset)?;
+            if expected[..count] != actual[..count] {
+                return Err(io::Error::other(
+                    "The staged file does not match the logical source bytes.",
+                ));
+            }
+            offset += count as u64;
+        }
+        self.validate()
     }
 
     /*

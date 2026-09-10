@@ -42,7 +42,7 @@ const CODE_EDIT_KEYS: &str =
     " Alt+H Help  Alt+A Assemble  Ctrl+Z/Y Undo/Redo  Alt+S Save  Esc Cancel ";
 const PAGED_KEYS: &str = " Alt: H Help E Edit G Goto O Files P/N Prev/Next | Ctrl+Q Quit ";
 const PAGED_EDIT_KEYS: &str =
-    " Memory edits  No disk save  Ctrl+Z/Y Undo/Redo  Alt+G Goto  Esc Cancel ";
+    " Alt+S Save  Ctrl+S Save As  Ctrl+Z/Y Undo/Redo  Alt+G Goto  Esc Cancel ";
 const RETURN_HISTORY_LIMIT: usize = 256;
 const X86_MAX_INSTRUCTION_BYTES: usize = 15;
 
@@ -1608,7 +1608,7 @@ fn paged_edit_error(
 ) -> io::Result<()> {
     let mut base = vec![String::new(); console.height()];
     if let Some(header) = base.first_mut() {
-        *header = "Edits remain in memory. Large-file saving is unavailable.".into();
+        *header = "Edits remain in memory. Saving requires a stable source.".into();
     }
     if let Some(footer) = base.last_mut() {
         *footer = "Press Escape to cancel all in-memory edits.".into();
@@ -1621,18 +1621,28 @@ fn paged_edit_error(
 }
 
 /*
+This helper ends a replacement view that cannot reopen its published path.
+The missing closed view prevents stale runtime state, and the flag prevents a stale SAV publication.
+*/
+fn close_unusable_paged_view(session_publish: &mut bool) -> (EditorAction, Option<PagedClosed>) {
+    *session_publish = false;
+    (EditorAction::Quit, None)
+}
+
+/*
 This view retains the owned source during all frames and key actions.
 Unsupported modes and address conversions produce notices before Hex display starts.
 Each loop validates the source before it publishes the next frame.
 */
 fn open_paged_editor(
     console: &Console,
-    path: PathBuf,
+    mut path: PathBuf,
     mut source: paged::PagedFile,
     options: &cli::Options,
     config: &config::Config,
     saved: Option<&RuntimeView>,
-) -> io::Result<(EditorAction, PagedClosed)> {
+    session_publish: &mut bool,
+) -> io::Result<(EditorAction, Option<PagedClosed>)> {
     /*
     The first section reports requested Text or Code mode before selecting Hex.
     The notice makes the current large-file limit visible to the user.
@@ -1759,18 +1769,11 @@ fn open_paged_editor(
         let ctrl = key.control & 12 != 0;
 
         /*
-        Active edits keep source ownership during quit, switch, picker, save, and tool commands.
+        Active edits keep source ownership during quit, switch, picker, and tool commands.
         Escape is the only command in this group that discards all in-memory changes.
         */
         if source.editing() && key.code == 27 {
             cancel_paged_edit(&mut source, &mut view, console.height().saturating_sub(2));
-            continue;
-        }
-        if source.editing() && (key.code == 120 || key.is_alt(b'S')) {
-            console.modal(
-                &lines,
-                "No large-file save. Memory edits remain. Press Escape in the editor to cancel.",
-            )?;
             continue;
         }
         if source.editing()
@@ -1782,15 +1785,93 @@ fn open_paged_editor(
         {
             console.modal(
                 &lines,
-                "Memory edits remain. Press Escape in the editor before you leave this file.",
+                "Use Alt+S to save. Press Escape in the editor to cancel edits.",
             )?;
             continue;
         }
-        if source.editing() && ctrl && matches!(key.code, 83 | 84) {
+        if source.editing() && ctrl && key.code == 84 {
             console.modal(
                 &lines,
-                "No large-file save or tools. Memory edits remain. Press Escape in the editor.",
+                "Tools are unavailable. Use Alt+S to save. Press Escape in the editor to cancel.",
             )?;
+            continue;
+        }
+
+        /*
+        Ctrl+S publishes the logical layout to a new native path in either view mode.
+        Failed or canceled Save As keeps the original source, path, edits, history, and cursor.
+        */
+        if ctrl && key.code == 83 {
+            if let Some(name) = console.prompt(&lines, "Save As (new file)")? {
+                let destination = PathBuf::from(name.trim().trim_matches('"'));
+                let result = std::path::absolute(&destination)
+                    .map_err(save::PagedSaveError::Retained)
+                    .and_then(|destination| save::save_as_paged(&destination, &source));
+                match result {
+                    Ok(result) => {
+                        source = result.source;
+                        path = result.path;
+                        let _backup = result.backup;
+                        view.low_nibble = false;
+                        view.hex_start = None;
+                        restore_paged_position(
+                            &mut view,
+                            source.len(),
+                            console.height().saturating_sub(2),
+                        );
+                        if *session_publish
+                            && let Err(error) = config::SavedState::saved_path(&path)
+                        {
+                            disable_session(console, &error)?;
+                            *session_publish = false;
+                        }
+                        if let Some(warning) = result.warning {
+                            console.modal(&lines, &warning)?;
+                        }
+                    }
+                    Err(save::PagedSaveError::Retained(error))
+                    | Err(save::PagedSaveError::PublishedSaveAs(error)) => {
+                        console.modal(&lines, &error.to_string())?;
+                    }
+                    Err(save::PagedSaveError::PublishedReplacement(error)) => {
+                        console.modal(&lines, &error.to_string())?;
+                        return Ok(close_unusable_paged_view(session_publish));
+                    }
+                }
+            }
+            continue;
+        }
+
+        /*
+        Alt+S and legacy macro F9 replace the active paged file only during editing.
+        Successful publication adopts a fresh descriptor and clears edit history through that new owner.
+        */
+        if source.editing() && (key.is_alt(b'S') || key.code == 120) {
+            match save::replace_paged(&path, &source) {
+                Ok(result) => {
+                    source = result.source;
+                    path = result.path;
+                    let _backup = result.backup;
+                    view.low_nibble = false;
+                    view.hex_start = None;
+                    restore_paged_position(
+                        &mut view,
+                        source.len(),
+                        console.height().saturating_sub(2),
+                    );
+                    if let Some(warning) = result.warning {
+                        console.modal(&lines, &warning)?;
+                    }
+                }
+                Err(save::PagedSaveError::Retained(error))
+                | Err(save::PagedSaveError::PublishedSaveAs(error)) => {
+                    console.modal(&lines, &error.to_string())?;
+                }
+                Err(save::PagedSaveError::PublishedReplacement(error)) => {
+                    console.modal(&lines, &error.to_string())?;
+                    return Ok(close_unusable_paged_view(session_publish));
+                }
+            }
             continue;
         }
 
@@ -1799,18 +1880,22 @@ fn open_paged_editor(
         The outer lifecycle stores that bounded state before it opens another source.
         */
         if (ctrl && key.code == 81) || matches!(key.code, 27 | 121) {
-            return Ok((EditorAction::Quit, PagedClosed { path, view }));
+            return Ok((EditorAction::Quit, Some(PagedClosed { path, view })));
         }
         if (ctrl && key.code == 123) || key.is_alt(b'N') {
-            return Ok((EditorAction::Next, PagedClosed { path, view }));
+            return Ok((EditorAction::Next, Some(PagedClosed { path, view })));
         }
         if (ctrl && key.code == 122) || key.is_alt(b'P') {
-            return Ok((EditorAction::Previous, PagedClosed { path, view }));
+            return Ok((EditorAction::Previous, Some(PagedClosed { path, view })));
         }
-        if (ctrl && matches!(key.code, 83 | 84)) || key.is_alt(b'S') {
+        if key.is_alt(b'S') {
+            console.modal(&lines, "There are no in-memory edits to save.")?;
+            continue;
+        }
+        if ctrl && key.code == 84 {
             console.modal(
                 &lines,
-                "This operation is unavailable for the bounded Hex view.",
+                "Analysis tools are unavailable for the bounded Hex view.",
             )?;
             continue;
         }
@@ -1875,7 +1960,7 @@ fn open_paged_editor(
                 console.modal(
                     &lines,
                     if source.editing() {
-                        "Memory edits have no disk save. Ctrl+Z undoes. Ctrl+Y redoes. Escape cancels."
+                        "Alt+S saves. Ctrl+S saves as. Ctrl+Z undoes. Ctrl+Y redoes. Escape cancels."
                     } else {
                         "Paged Hex uses Alt+E Edit, Alt+G Goto, Alt+O Files, Alt+P/N Switch, and Ctrl+Q Quit."
                     },
@@ -1968,7 +2053,7 @@ fn open_paged_editor(
                 if let Some(next) =
                     select_file(console, path.parent().unwrap_or(Path::new(".")).to_owned())?
                 {
-                    return Ok((EditorAction::Pick(next), PagedClosed { path, view }));
+                    return Ok((EditorAction::Pick(next), Some(PagedClosed { path, view })));
                 }
             }
             code if (113..=119).contains(&code)
@@ -2816,8 +2901,9 @@ fn run() -> io::Result<()> {
                     &options,
                     &config,
                     saved_view,
+                    &mut session_publish,
                 )?;
-                (action, Some(ClosedView::Paged(closed)))
+                (action, closed.map(ClosedView::Paged))
             }
         };
 
@@ -3641,6 +3727,35 @@ mod tests {
         assert!(restored_path("\\\\server\\file.bin").is_err());
         assert!(restored_path("folder\\file.bin").is_err());
         assert!(restored_path("relative.bin").is_err());
+    }
+
+    /*
+    This test applies the unusable-view result before the final session publication gate.
+    A replacement that published but cannot reopen must leave existing SAV bytes unchanged.
+    */
+    #[test]
+    fn published_paged_replacement_disables_session_publication() {
+        let folder = std::env::temp_dir().join(format!(
+            "hview-paged-session-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&folder).unwrap();
+        let path = folder.join("state.sav");
+        std::fs::write(&path, b"existing SAV bytes").unwrap();
+
+        let mut session_publish = true;
+        let (action, closed) = close_unusable_paged_view(&mut session_publish);
+        assert!(matches!(action, EditorAction::Quit));
+        assert!(closed.is_none());
+        if session_publish {
+            std::fs::write(&path, b"stale SAV bytes").unwrap();
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing SAV bytes");
+        std::fs::remove_dir_all(folder).unwrap();
     }
 
     /*

@@ -1,3 +1,8 @@
+/*
+This module publishes buffered and paged regular-file saves through private recovery directories.
+Descriptor-relative operations preserve target identity while bounded verification checks prepared bytes and metadata.
+*/
+use crate::paged::PagedFile;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -6,6 +11,10 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+/*
+These Linux constants define descriptor-relative opens, private publication, and expected xattr errors.
+The fixed recovery names identify the prepared result, original backup, and exact native target note.
+*/
 const O_RDWR: c_int = 2;
 const O_CREAT: c_int = 0o100;
 const O_EXCL: c_int = 0o200;
@@ -25,12 +34,20 @@ const NEW_FILE: &CStr = c"new.bin";
 const ORIGINAL_FILE: &CStr = c"original.bin";
 const TARGET_FILE: &CStr = c"target.txt";
 
+/*
+This C layout supplies nanosecond timestamps to futimens.
+The fields match Linux time_t values on the supported 64-bit target.
+*/
 #[repr(C)]
 struct Timespec {
     tv_sec: i64,
     tv_nsec: i64,
 }
 
+/*
+These libc calls keep staging, metadata, and publication relative to owned directory descriptors.
+Descriptor-relative operations reduce pathname substitution between validation and mutation.
+*/
 unsafe extern "C" {
     fn openat(dirfd: c_int, path: *const c_char, flags: c_int, ...) -> c_int;
     fn mkdirat(dirfd: c_int, path: *const c_char, mode: u32) -> c_int;
@@ -65,6 +82,10 @@ unsafe extern "C" {
     fn symlinkat(target: *const c_char, newdirfd: c_int, linkpath: *const c_char) -> c_int;
 }
 
+/*
+One file state records every target field that must remain stable before replacement publication.
+The xattr list contains supported user metadata and the POSIX access ACL.
+*/
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FileState {
     dev: u64,
@@ -81,6 +102,10 @@ struct FileState {
     xattrs: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
+/*
+Source metadata adds the original access time to the guarded target state.
+The independent backup uses both original timestamps after bounded content verification.
+*/
 #[derive(Clone)]
 struct SourceMetadata {
     state: FileState,
@@ -88,6 +113,10 @@ struct SourceMetadata {
     atime_nsec: i64,
 }
 
+/*
+One target owns its canonical parent descriptor and exact native file name.
+Publication uses these values without resolving the target path again.
+*/
 struct Target {
     parent_path: PathBuf,
     path: PathBuf,
@@ -95,6 +124,10 @@ struct Target {
     name: CString,
 }
 
+/*
+One stage owns a private recovery directory beside its target.
+The keep flag selects cleanup or retained recovery evidence when the owner drops.
+*/
 struct Stage {
     folder_name: CString,
     folder_path: PathBuf,
@@ -103,6 +136,62 @@ struct Stage {
     keep: bool,
 }
 
+/*
+This result gives the paged viewer a fresh source after successful publication.
+An optional warning reports a completed rename with incomplete final synchronization.
+*/
+pub(crate) struct PagedSaveOutcome {
+    pub(crate) source: PagedFile,
+    pub(crate) path: PathBuf,
+    pub(crate) backup: Option<PathBuf>,
+    pub(crate) warning: Option<String>,
+}
+
+/*
+This error distinguishes retained edit sessions from published paths that could not reopen.
+Replacement publication makes the old active path unusable, while Save As retains the old source.
+*/
+#[derive(Debug)]
+pub(crate) enum PagedSaveError {
+    Retained(io::Error),
+    PublishedReplacement(io::Error),
+    PublishedSaveAs(io::Error),
+}
+
+/*
+These trait implementations expose the exact underlying I/O message and convert prepublication failures.
+The caller matches the variant before it changes the active paged view.
+*/
+impl std::fmt::Display for PagedSaveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Retained(error)
+            | Self::PublishedReplacement(error)
+            | Self::PublishedSaveAs(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for PagedSaveError {}
+
+impl From<io::Error> for PagedSaveError {
+    fn from(error: io::Error) -> Self {
+        Self::Retained(error)
+    }
+}
+
+/*
+This wrapper reuses the application pathname formatter for save messages.
+Save operations retain their Path values and never derive an operational path from display text.
+*/
+fn display_path(path: &Path) -> String {
+    crate::display_path(path.as_os_str())
+}
+
+/*
+This conversion prepares one native file name for libc without changing its pathname bytes.
+A zero byte cannot enter a Linux pathname and receives a clear input error.
+*/
 fn os_name(name: &std::ffi::OsStr) -> io::Result<CString> {
     CString::new(name.as_bytes()).map_err(|_| {
         io::Error::new(
@@ -112,6 +201,10 @@ fn os_name(name: &std::ffi::OsStr) -> io::Result<CString> {
     })
 }
 
+/*
+This constructor separates a destination into one canonical parent and one exact native name.
+The opened parent descriptor anchors every later stage and publication operation.
+*/
 fn target(path: &Path) -> io::Result<Target> {
     let name = path
         .file_name()
@@ -134,6 +227,10 @@ fn target(path: &Path) -> io::Result<Target> {
     })
 }
 
+/*
+This wrapper converts one openat result into an owned File or the actual operating-system error.
+Callers select exact flags for targets, stages, and inspection descriptors.
+*/
 fn open_at(dir: RawFd, name: &CStr, flags: c_int, mode: u32) -> io::Result<File> {
     let fd = unsafe { openat(dir, name.as_ptr(), flags, mode) };
     if fd < 0 {
@@ -143,6 +240,10 @@ fn open_at(dir: RawFd, name: &CStr, flags: c_int, mode: u32) -> io::Result<File>
     }
 }
 
+/*
+This target open requests read and write access without following a final symbolic link.
+It translates only link and permission errors that require an explicit Save As action.
+*/
 fn open_target(target: &Target) -> io::Result<File> {
     open_at(
         target.parent.as_raw_fd(),
@@ -167,6 +268,10 @@ fn open_target(target: &Target) -> io::Result<File> {
     })
 }
 
+/*
+This early inspection reads target type and privilege fields without opening file contents.
+The later writable open and state capture repeat the required guards through the owned descriptor.
+*/
 fn inspect_target(target: &Target) -> io::Result<()> {
     let file = open_at(
         target.parent.as_raw_fd(),
@@ -185,10 +290,48 @@ fn inspect_target(target: &Target) -> io::Result<()> {
     require_unprivileged_mode(&metadata)
 }
 
+/*
+This check rejects an existing paged Save As destination before private staging writes begin.
+An identity match reports a source alias, while any other entry reports an existing destination.
+*/
+fn require_new_paged_target(target: &Target, paged: &PagedFile) -> io::Result<()> {
+    match open_at(
+        target.parent.as_raw_fd(),
+        &target.name,
+        O_PATH | O_CLOEXEC | O_NOFOLLOW,
+        0,
+    ) {
+        Ok(file) => {
+            let metadata = file.metadata()?;
+            if paged.has_identity(metadata.dev(), metadata.ino())? {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "The Save As destination identifies the active source.",
+                ))
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "The Save As destination already exists.",
+                ))
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/*
+This common error identifies a target or source change that invalidates the accepted save baseline.
+Callers preserve editor state and require a fresh source open.
+*/
 fn changed() -> io::Error {
     io::Error::other("The file changed outside the editor. Reload the file before saving.")
 }
 
+/*
+This policy accepts only one regular target pathname for guarded replacement.
+Multiple hard links would make replacement semantics different for another pathname.
+*/
 fn require_regular(metadata: &fs::Metadata) -> io::Result<()> {
     if !metadata.file_type().is_file() {
         return Err(io::Error::other(
@@ -203,6 +346,10 @@ fn require_regular(metadata: &fs::Metadata) -> io::Result<()> {
     Ok(())
 }
 
+/*
+This policy refuses set-user-ID and set-group-ID targets before staging.
+Replacement cannot safely preserve privileged execution semantics for changed bytes.
+*/
 fn require_unprivileged_mode(metadata: &fs::Metadata) -> io::Result<()> {
     if metadata.mode() & 0o6000 != 0 {
         return Err(io::Error::other(
@@ -212,10 +359,18 @@ fn require_unprivileged_mode(metadata: &fs::Metadata) -> io::Result<()> {
     Ok(())
 }
 
+/*
+This classifier identifies the Linux results that mean an extended attribute does not exist or lacks support.
+Other errors retain their operating-system details.
+*/
 fn is_no_xattr(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(ENODATA | ENOTSUP))
 }
 
+/*
+This reader obtains one complete extended-attribute value while its reported size can change.
+Eight bounded retries handle size growth, and a disappearing accepted attribute marks the target changed.
+*/
 fn xattr_value(file: &File, name: &CStr) -> io::Result<Vec<u8>> {
     for _ in 0..8 {
         let size = unsafe { fgetxattr(file.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
@@ -247,6 +402,10 @@ fn xattr_value(file: &File, name: &CStr) -> io::Result<Vec<u8>> {
     Err(changed())
 }
 
+/*
+This policy accepts user attributes and the POSIX access ACL.
+Privileged or unknown namespaces require Save As because replacement cannot preserve them safely.
+*/
 fn check_xattr_name(name: &[u8]) -> io::Result<()> {
     if name.starts_with(b"user.") || name == b"system.posix_acl_access" {
         return Ok(());
@@ -262,7 +421,15 @@ fn check_xattr_name(name: &[u8]) -> io::Result<()> {
     )))
 }
 
+/*
+This collector reads, validates, and sorts every supported descriptor xattr.
+The sorted result gives stable metadata comparisons before publication.
+*/
 fn xattrs(file: &File) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    /*
+    The outer loop retries when the required name-list size changes.
+    An unsupported xattr interface produces an empty supported list.
+    */
     for _ in 0..8 {
         let size = unsafe { flistxattr(file.as_raw_fd(), std::ptr::null_mut(), 0) };
         if size < 0 {
@@ -283,6 +450,10 @@ fn xattrs(file: &File) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
             return Err(error);
         }
         list.truncate(read as usize);
+        /*
+        Each zero-terminated name receives a policy check and one complete value read.
+        Sorting removes filesystem enumeration order from later identity checks.
+        */
         let mut result = Vec::new();
         for bytes in list
             .split(|byte| *byte == 0)
@@ -298,6 +469,10 @@ fn xattrs(file: &File) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
     Err(changed())
 }
 
+/*
+This snapshot combines Linux identity, content times, link count, permissions, ownership, and supported xattrs.
+Replacement compares a later snapshot before the rename commit point.
+*/
 fn file_state(file: &File) -> io::Result<FileState> {
     let metadata = file.metadata()?;
     Ok(FileState {
@@ -316,6 +491,10 @@ fn file_state(file: &File) -> io::Result<FileState> {
     })
 }
 
+/*
+This capture validates replacement policy and retains the original access time.
+The returned state supplies both publication guards and staged metadata.
+*/
 fn source_metadata(file: &File) -> io::Result<SourceMetadata> {
     let metadata = file.metadata()?;
     require_regular(&metadata)?;
@@ -327,6 +506,10 @@ fn source_metadata(file: &File) -> io::Result<SourceMetadata> {
     })
 }
 
+/*
+This buffered verifier checks exact length and contents through one reusable 64 KiB buffer.
+EOF or a byte mismatch reports an external source change.
+*/
 fn check_contents(file: &mut File, expected: &[u8]) -> io::Result<()> {
     let length = u64::try_from(expected.len())
         .map_err(|_| io::Error::other("The file is too large to save."))?;
@@ -350,7 +533,15 @@ fn check_contents(file: &mut File, expected: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/*
+This writer first removes current supported xattrs and then applies the captured ordered list.
+Any failed metadata write stops staging before publication.
+*/
 fn set_xattrs(file: &File, attrs: &[(Vec<u8>, Vec<u8>)]) -> io::Result<()> {
+    /*
+    Removing current supported values prevents an inherited default ACL from surviving unexpectedly.
+    Missing values need no correction.
+    */
     for (name, _) in xattrs(file)? {
         let name = CString::new(name).map_err(|_| changed())?;
         if unsafe { fremovexattr(file.as_raw_fd(), name.as_ptr()) } < 0 {
@@ -360,6 +551,10 @@ fn set_xattrs(file: &File, attrs: &[(Vec<u8>, Vec<u8>)]) -> io::Result<()> {
             }
         }
     }
+    /*
+    Each captured native name receives its exact byte value.
+    The error names the metadata item that the save could not preserve.
+    */
     for (name, value) in attrs {
         let name = CString::new(name.as_slice()).map_err(|_| changed())?;
         if unsafe {
@@ -382,6 +577,10 @@ fn set_xattrs(file: &File, attrs: &[(Vec<u8>, Vec<u8>)]) -> io::Result<()> {
     Ok(())
 }
 
+/*
+This function applies owner, group, mode, and supported xattrs to a prepared replacement.
+The final verification confirms the staged descriptor before publication.
+*/
 fn apply_metadata(file: &File, source: &SourceMetadata) -> io::Result<()> {
     let current = file.metadata()?;
     if (current.uid(), current.gid()) != (source.state.uid, source.state.gid)
@@ -397,6 +596,10 @@ fn apply_metadata(file: &File, source: &SourceMetadata) -> io::Result<()> {
     verify_metadata(file, source)
 }
 
+/*
+This comparison checks the replacement metadata fields that must match the captured source.
+Identity, size, and timestamps follow the new-file and backup policies separately.
+*/
 fn verify_metadata(file: &File, source: &SourceMetadata) -> io::Result<()> {
     let metadata = file.metadata()?;
     if metadata.uid() != source.state.uid
@@ -411,6 +614,10 @@ fn verify_metadata(file: &File, source: &SourceMetadata) -> io::Result<()> {
     Ok(())
 }
 
+/*
+This function restores exact source access and modification times on the independent backup.
+The immediate metadata check rejects a filesystem that cannot represent the requested values.
+*/
 fn set_original_times(file: &File, source: &SourceMetadata) -> io::Result<()> {
     let times = [
         Timespec {
@@ -447,6 +654,10 @@ fn set_original_times(file: &File, source: &SourceMetadata) -> io::Result<()> {
     Ok(())
 }
 
+/*
+This generator reads cryptographic random bytes from the operating system for one private directory name.
+The hexadecimal result contains no path separator or zero byte.
+*/
 fn random_folder_name() -> io::Result<CString> {
     let mut random = [0_u8; 16];
     File::open("/dev/urandom")?.read_exact(&mut random)?;
@@ -459,9 +670,17 @@ fn random_folder_name() -> io::Result<CString> {
 }
 
 impl Stage {
+    /*
+    This constructor creates and verifies one private recovery directory beside the destination.
+    It anchors all files through a descriptor and records the exact native target path.
+    */
     fn new(target: &Target) -> io::Result<Self> {
         let parent = target.parent.try_clone()?;
         loop {
+            /*
+            The first section creates an unpredictable directory with owner-only access.
+            A name collision generates another candidate without changing the target.
+            */
             let folder_name = random_folder_name()?;
             if unsafe { mkdirat(target.parent.as_raw_fd(), folder_name.as_ptr(), 0o700) } < 0 {
                 let error = io::Error::last_os_error();
@@ -472,6 +691,10 @@ impl Stage {
             }
             #[cfg(test)]
             substitute_stage_name(target.parent.as_raw_fd(), &folder_name)?;
+            /*
+            The next section opens the new entry without following substitutions.
+            A failed open removes only the original directory name through its parent descriptor.
+            */
             let dir = match open_at(
                 target.parent.as_raw_fd(),
                 &folder_name,
@@ -490,6 +713,10 @@ impl Stage {
                     return Err(error);
                 }
             };
+            /*
+            Descriptor metadata must identify a directory owned by the current effective user.
+            The permission check then confirms exact owner-only recovery access.
+            */
             let metadata = match dir.metadata() {
                 Ok(metadata) => metadata,
                 Err(error) => {
@@ -528,6 +755,10 @@ impl Stage {
                     "The save cannot protect the recovery directory.",
                 ));
             }
+            /*
+            The accepted directory becomes a Stage owner with cleanup enabled.
+            The target note completes construction before any content file enters the stage.
+            */
             let folder_os = std::ffi::OsString::from_vec(folder_name.as_bytes().to_vec());
             let mut stage = Self {
                 folder_path: target.parent_path.join(folder_os),
@@ -541,6 +772,10 @@ impl Stage {
         }
     }
 
+    /*
+    This method writes the exact native target bytes into the private recovery note.
+    The final newline separates the pathname from later terminal or inspection output.
+    */
     fn write_note(&mut self, target: &Path) -> io::Result<()> {
         let mut note = self.create(TARGET_FILE, 0o600)?;
         note.write_all(target.as_os_str().as_bytes())?;
@@ -548,6 +783,10 @@ impl Stage {
         note.sync_all()
     }
 
+    /*
+    This method creates one exclusive stage file without following links.
+    The caller selects a restrictive backup mode or a Save As mode filtered by umask.
+    */
     fn create(&self, name: &CStr, mode: u32) -> io::Result<File> {
         open_at(
             self.dir.as_raw_fd(),
@@ -557,6 +796,10 @@ impl Stage {
         )
     }
 
+    /*
+    This buffered helper creates and writes one complete byte slice.
+    The test hook can stop midway to verify private-file cleanup before publication.
+    */
     fn write_data(&self, name: &CStr, data: &[u8], mode: u32) -> io::Result<File> {
         let mut file = self.create(name, mode)?;
         #[cfg(test)]
@@ -568,6 +811,10 @@ impl Stage {
         Ok(file)
     }
 
+    /*
+    This method synchronizes prepared directory entries before publication.
+    Earlier preparation helpers synchronize file bytes through their owned descriptors.
+    */
     fn sync_preparation(&self) -> io::Result<()> {
         self.dir.sync_all()?;
         #[cfg(test)]
@@ -577,29 +824,40 @@ impl Stage {
         self.parent.sync_all()
     }
 
+    /*
+    This formatter states whether publication occurred before an error.
+    It includes escaped recovery-path text while Stage retains the underlying native path.
+    */
     fn recovery_error(&self, error: io::Error, published: bool) -> io::Error {
         let message = if published {
             format!(
                 "Publication finished, but final synchronization failed. New bytes may already be visible. Recovery files remain in {}. Error: {error}",
-                self.folder_path.display()
+                display_path(&self.folder_path)
             )
         } else {
             format!(
                 "Save publication failed. Recovery files remain in {}. Error: {error}",
-                self.folder_path.display()
+                display_path(&self.folder_path)
             )
         };
         io::Error::new(error.kind(), message)
     }
 
-    fn publish(&mut self, target: &Target, replace: bool) -> io::Result<()> {
+    /*
+    This publication path returns a final synchronization warning after a successful rename.
+    Paged callers can reopen the published inode before they decide whether the active view remains usable.
+    */
+    fn publish_tracked(&mut self, target: &Target, replace: bool) -> io::Result<Option<io::Error>> {
         self.keep = true;
         #[cfg(test)]
         if take_fault(FAULT_PUBLISH) {
             let error = injected("publication");
             return Err(self.recovery_error(error, false));
         }
-        // An uncooperative writer can change the target after the final check and before this rename.
+        /*
+        The rename commits the prepared inode through owned directory descriptors.
+        An uncooperative writer can still change the target after the final check and before this operation.
+        */
         let result = unsafe {
             if replace {
                 renameat(
@@ -621,24 +879,51 @@ impl Stage {
         if result < 0 {
             return Err(self.recovery_error(io::Error::last_os_error(), false));
         }
+        /*
+        Final directory synchronization starts only after a successful rename.
+        A later error becomes a warning because new bytes can already be visible.
+        */
         #[cfg(test)]
         if take_fault(FAULT_FINAL_SYNC) {
             let error = injected("final synchronization");
-            return Err(self.recovery_error(error, true));
+            return Ok(Some(self.recovery_error(error, true)));
         }
-        self.dir
-            .sync_all()
-            .map_err(|error| self.recovery_error(error, true))?;
-        self.parent
-            .sync_all()
-            .map_err(|error| self.recovery_error(error, true))?;
+        if let Err(error) = self.dir.sync_all() {
+            return Ok(Some(self.recovery_error(error, true)));
+        }
+        if let Err(error) = self.parent.sync_all() {
+            return Ok(Some(self.recovery_error(error, true)));
+        }
+        Ok(None)
+    }
+
+    /*
+    Buffered callers retain their established error contract for incomplete final synchronization.
+    Successful Save As publication removes its empty recovery directory.
+    */
+    fn publish(&mut self, target: &Target, replace: bool) -> io::Result<()> {
+        if let Some(error) = self.publish_tracked(target, replace)? {
+            return Err(error);
+        }
         if !replace {
             self.keep = false;
         }
         Ok(())
     }
+
+    /*
+    This completion flag removes a successful paged Save As recovery directory after verified reopening.
+    Replacement saves retain their independent original backup.
+    */
+    fn finish_save_as(&mut self) {
+        self.keep = false;
+    }
 }
 
+/*
+The destructor removes private files and the recovery directory only while cleanup remains enabled.
+Published replacement backups and failed-publication evidence remain for explicit user recovery.
+*/
 impl Drop for Stage {
     fn drop(&mut self) {
         if self.keep {
@@ -659,6 +944,10 @@ impl Drop for Stage {
     }
 }
 
+/*
+This buffered preparation writes, verifies, labels, timestamps, and synchronizes the original-byte backup.
+The returned descriptor stays open until the buffered publication sequence finishes.
+*/
 fn prepare_backup(stage: &Stage, before: &[u8], source: &SourceMetadata) -> io::Result<File> {
     let mut backup = stage.write_data(ORIGINAL_FILE, before, 0o600)?;
     check_contents(&mut backup, before)?;
@@ -668,6 +957,10 @@ fn prepare_backup(stage: &Stage, before: &[u8], source: &SourceMetadata) -> io::
     Ok(backup)
 }
 
+/*
+This buffered preparation writes and verifies the future target bytes.
+Replacement copies captured metadata, while Save As keeps its new-file mode and current umask.
+*/
 fn prepare_new(stage: &Stage, after: &[u8], source: Option<&SourceMetadata>) -> io::Result<File> {
     let mode = if source.is_some() { 0o600 } else { 0o666 };
     let mut new_file = stage.write_data(NEW_FILE, after, mode)?;
@@ -679,6 +972,64 @@ fn prepare_new(stage: &Stage, after: &[u8], source: Option<&SourceMetadata>) -> 
     Ok(new_file)
 }
 
+/*
+This preparation streams the captured paged source into an independent original-byte backup.
+The backup receives the existing metadata and original access and modification times.
+*/
+fn prepare_paged_backup(
+    stage: &Stage,
+    paged: &PagedFile,
+    source: &SourceMetadata,
+) -> io::Result<File> {
+    /*
+    Bounded source streaming and comparison complete before captured metadata enters the backup.
+    The synchronized descriptor remains available for the final source comparison.
+    */
+    let backup = stage.create(ORIGINAL_FILE, 0o600)?;
+    #[cfg(test)]
+    if take_fault(FAULT_WRITE) {
+        return Err(injected("staging write"));
+    }
+    paged.write_original(&backup)?;
+    paged.verify_original(&backup)?;
+    apply_metadata(&backup, source)?;
+    set_original_times(&backup, source)?;
+    backup.sync_all()?;
+    Ok(backup)
+}
+
+/*
+This preparation streams the current logical spans into one fresh publication file.
+Replacement metadata comes from the locked target, while Save As uses the current umask.
+*/
+fn prepare_paged_new(
+    stage: &Stage,
+    paged: &PagedFile,
+    source: Option<&SourceMetadata>,
+) -> io::Result<File> {
+    /*
+    Bounded logical staging establishes exact bytes and length before optional replacement metadata.
+    Synchronization makes this descriptor ready for the stage-directory barrier.
+    */
+    let mode = if source.is_some() { 0o600 } else { 0o666 };
+    let new_file = stage.create(NEW_FILE, mode)?;
+    #[cfg(test)]
+    if take_fault(FAULT_WRITE) {
+        return Err(injected("staging write"));
+    }
+    paged.write_staged(&new_file)?;
+    if let Some(source) = source {
+        apply_metadata(&new_file, source)?;
+    }
+    paged.verify_staged(&new_file)?;
+    new_file.sync_all()?;
+    Ok(new_file)
+}
+
+/*
+This buffered final guard compares descriptor metadata and complete accepted source bytes.
+It repeats the checks through a new pathname open before the rename commit point.
+*/
 fn check_target(
     target: &Target,
     original: &mut File,
@@ -697,6 +1048,51 @@ fn check_target(
     check_contents(&mut current, before)
 }
 
+/*
+This final guard checks the locked paged target, its pathname, metadata, and original bytes.
+The independent backup supplies bounded content verification before publication.
+*/
+fn check_paged_target(
+    target: &Target,
+    original: &File,
+    expected: &FileState,
+    paged: &PagedFile,
+    backup: &File,
+) -> io::Result<()> {
+    paged.validate()?;
+    paged.validate_descriptor(original)?;
+    if file_state(original)? != *expected {
+        return Err(changed());
+    }
+    paged.verify_original(backup)?;
+
+    let current = open_target(target)?;
+    require_regular(&current.metadata()?)?;
+    paged.validate_descriptor(&current)?;
+    if file_state(&current)? != *expected {
+        return Err(changed());
+    }
+    paged.validate()
+}
+
+/*
+This helper reopens one published path and verifies the prepared staging identity.
+It rejects a substituted path before the caller adopts a new paged baseline.
+*/
+fn reopen_paged(path: &Path, device: u64, inode: u64) -> io::Result<PagedFile> {
+    #[cfg(test)]
+    if take_fault(FAULT_PAGED_REOPEN) {
+        return Err(injected("published source reopen"));
+    }
+    let source = PagedFile::open(path)?;
+    if !source.has_identity(device, inode)? {
+        return Err(io::Error::other(
+            "The published path identifies a different file.",
+        ));
+    }
+    Ok(source)
+}
+
 /// Replace a regular file and keep an independent backup beside the target.
 ///
 /// Advisory locks coordinate only with processes that use compatible locks.
@@ -705,6 +1101,10 @@ fn check_target(
 /// Cleanup errors can leave an incomplete recovery directory.
 /// A power loss after publication and before directory synchronization makes the publication result uncertain.
 pub fn replace(path: &Path, before: &[u8], after: &[u8]) -> io::Result<PathBuf> {
+    /*
+    The first section opens, locks, validates, and captures one exact regular target.
+    A failure here creates no recovery directory and leaves the target unchanged.
+    */
     let target = target(path)?;
     inspect_target(&target)?;
     let mut original = open_target(&target)?;
@@ -719,6 +1119,10 @@ pub fn replace(path: &Path, before: &[u8], after: &[u8]) -> io::Result<PathBuf> 
     let source = source_metadata(&original)?;
     check_contents(&mut original, before)?;
 
+    /*
+    The second section prepares both byte images before the final target guard.
+    Publication retains the independent backup directory and returns its native path.
+    */
     let mut stage = Stage::new(&target)?;
     let _backup = prepare_backup(&stage, before, &source)?;
     let _new_file = prepare_new(&stage, after, Some(&source))?;
@@ -734,6 +1138,10 @@ pub fn replace(path: &Path, before: &[u8], after: &[u8]) -> io::Result<PathBuf> 
 /// Cleanup errors can leave an incomplete recovery directory.
 /// A power loss after publication and before directory synchronization makes the publication result uncertain.
 pub fn save_as(path: &Path, data: &[u8]) -> io::Result<PathBuf> {
+    /*
+    Save As stages one complete buffered image and publishes it with exclusive rename semantics.
+    A successful publication returns the resolved native destination path.
+    */
     let target = target(path)?;
     let mut stage = Stage::new(&target)?;
     let _new_file = prepare_new(&stage, data, None)?;
@@ -742,6 +1150,139 @@ pub fn save_as(path: &Path, data: &[u8]) -> io::Result<PathBuf> {
     Ok(target.path)
 }
 
+/*
+This guarded replacement saves current paged spans and keeps an independent original backup.
+The caller retains its active source for all failures that occur before publication.
+*/
+pub(crate) fn replace_paged(
+    path: &Path,
+    paged: &PagedFile,
+) -> Result<PagedSaveOutcome, PagedSaveError> {
+    /*
+    The first section validates one stable source and the same writable target descriptor.
+    The advisory lock prevents compatible writers from entering the publication interval.
+    */
+    paged.validate()?;
+    let target = target(path)?;
+    inspect_target(&target)?;
+    let original = open_target(&target)?;
+    original.try_lock().map_err(|error| match error {
+        TryLockError::WouldBlock => PagedSaveError::Retained(io::Error::other(
+            "The save target is in use. Close the other writer or use Save As.",
+        )),
+        TryLockError::Error(error) => PagedSaveError::Retained(io::Error::other(format!(
+            "The save cannot lock the target. Use Save As. Error: {error}"
+        ))),
+    })?;
+    paged.validate_descriptor(&original)?;
+    let source = source_metadata(&original)?;
+
+    /*
+    This section prepares and verifies both independent files before the final target guard.
+    The new-file identity remains available through its descriptor after rename.
+    */
+    let mut stage = Stage::new(&target)?;
+    let backup = prepare_paged_backup(&stage, paged, &source)?;
+    let new_file = prepare_paged_new(&stage, paged, Some(&source))?;
+    let metadata = new_file.metadata()?;
+    let new_identity = (metadata.dev(), metadata.ino());
+    check_paged_target(&target, &original, &source.state, paged, &backup)?;
+    set_original_times(&backup, &source)?;
+    backup.sync_all()?;
+    stage.sync_preparation()?;
+    paged.validate()?;
+    paged.validate_descriptor(&original)?;
+    if file_state(&original)? != source.state {
+        return Err(changed().into());
+    }
+
+    /*
+    This section publishes the staged inode and then requires the same inode on reopen.
+    A successful reopen establishes a new source baseline even when final synchronization reports a warning.
+    */
+    let warning = stage.publish_tracked(&target, true)?;
+    let backup_path = stage
+        .folder_path
+        .join(std::ffi::OsStr::from_bytes(ORIGINAL_FILE.to_bytes()));
+    let reopened = reopen_paged(&target.path, new_identity.0, new_identity.1).map_err(|error| {
+        let warning = warning
+            .as_ref()
+            .map(|warning| format!(" Final synchronization warning: {warning}"))
+            .unwrap_or_default();
+        PagedSaveError::PublishedReplacement(io::Error::new(
+            error.kind(),
+            format!(
+                "Publication finished at {}. The replacement cannot reopen. Original bytes remain in {}.{warning} Reopen error: {error}",
+                display_path(&target.path),
+                display_path(&backup_path)
+            ),
+        ))
+    })?;
+    Ok(PagedSaveOutcome {
+        source: reopened,
+        path: target.path,
+        backup: Some(backup_path),
+        warning: warning.map(|error| error.to_string()),
+    })
+}
+
+/*
+This guarded Save As publishes current paged spans without replacing an existing destination.
+The original source and its complete edit session remain usable if the published destination cannot reopen.
+*/
+pub(crate) fn save_as_paged(
+    path: &Path,
+    paged: &PagedFile,
+) -> Result<PagedSaveOutcome, PagedSaveError> {
+    /*
+    The first section validates the source and refuses any existing destination before staging.
+    The active source remains unchanged throughout this independent publication path.
+    */
+    paged.validate()?;
+    let target = target(path)?;
+    require_new_paged_target(&target, paged)?;
+    let mut stage = Stage::new(&target)?;
+    let new_file = prepare_paged_new(&stage, paged, None)?;
+    let metadata = new_file.metadata()?;
+    let new_identity = (metadata.dev(), metadata.ino());
+    stage.sync_preparation()?;
+    paged.verify_staged(&new_file)?;
+    paged.validate()?;
+
+    /*
+    This section uses RENAME_NOREPLACE and then verifies the exact published inode.
+    Successful clean publication removes the private staging directory after adoption.
+    */
+    let warning = stage.publish_tracked(&target, false)?;
+    let reopened = reopen_paged(&target.path, new_identity.0, new_identity.1).map_err(|error| {
+        let warning = warning
+            .as_ref()
+            .map(|warning| format!(" Final synchronization warning: {warning}"))
+            .unwrap_or_default();
+        PagedSaveError::PublishedSaveAs(io::Error::new(
+            error.kind(),
+            format!(
+                "Publication finished at {}, but the destination cannot reopen. The original source and memory edits remain active. Recovery files remain in {}.{warning} Reopen error: {error}",
+                display_path(&target.path),
+                display_path(&stage.folder_path)
+            ),
+        ))
+    })?;
+    if warning.is_none() {
+        stage.finish_save_as();
+    }
+    Ok(PagedSaveOutcome {
+        source: reopened,
+        path: target.path,
+        backup: None,
+        warning: warning.map(|error| error.to_string()),
+    })
+}
+
+/*
+These test fault identifiers stop one exact save phase through thread-local state.
+The hooks cannot enter production builds or user configuration.
+*/
 #[cfg(test)]
 const FAULT_WRITE: u8 = 1;
 #[cfg(test)]
@@ -752,6 +1293,8 @@ const FAULT_PUBLISH: u8 = 3;
 const FAULT_FINAL_SYNC: u8 = 4;
 #[cfg(test)]
 const FAULT_STAGE_SUBSTITUTE: u8 = 5;
+#[cfg(test)]
+const FAULT_PAGED_REOPEN: u8 = 6;
 
 #[cfg(test)]
 thread_local! {
@@ -761,11 +1304,19 @@ thread_local! {
     };
 }
 
+/*
+This test helper arms one phase failure for the current test thread.
+The next matching phase consumes the value.
+*/
 #[cfg(test)]
 fn set_fault(fault: u8) {
     FAULT.with(|value| value.set(fault));
 }
 
+/*
+This test helper records an outside target and arms recovery-directory substitution.
+The Stage constructor invokes the substitution after its initial mkdir operation.
+*/
 #[cfg(test)]
 fn set_stage_substitute(path: &Path) {
     let path = CString::new(path.as_os_str().as_bytes()).unwrap();
@@ -773,6 +1324,10 @@ fn set_stage_substitute(path: &Path) {
     set_fault(FAULT_STAGE_SUBSTITUTE);
 }
 
+/*
+This test-only operation replaces the new directory name with a symbolic link to an outside fixture.
+The production O_NOFOLLOW open must reject the substituted entry without changing the fixture.
+*/
 #[cfg(test)]
 fn substitute_stage_name(parent: RawFd, folder_name: &CStr) -> io::Result<()> {
     if !take_fault(FAULT_STAGE_SUBSTITUTE) {
@@ -788,6 +1343,10 @@ fn substitute_stage_name(parent: RawFd, folder_name: &CStr) -> io::Result<()> {
     Ok(())
 }
 
+/*
+This test helper consumes a fault only when the current phase matches.
+Other save phases leave the pending value available.
+*/
 #[cfg(test)]
 fn take_fault(fault: u8) -> bool {
     FAULT.with(|value| {
@@ -800,20 +1359,37 @@ fn take_fault(fault: u8) -> bool {
     })
 }
 
+/*
+This test helper creates one stable operating-system error for an injected phase.
+Tests compare the phase text with the matching publication state.
+*/
 #[cfg(test)]
 fn injected(action: &str) -> io::Error {
     io::Error::other(format!("Injected {action} failure."))
 }
 
+/*
+These tests exercise buffered and paged saves through disposable directories.
+They verify bytes, metadata, identity, failure ownership, and bounded sparse publication.
+*/
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paged::PagedEditCursor;
     use std::os::unix::fs::symlink;
     use std::process::Command;
 
+    /*
+    One fixture owns a unique temporary directory and all recovery folders created below it.
+    Drop removes the complete disposable tree after each test.
+    */
     struct Fixture(PathBuf);
 
     impl Fixture {
+        /*
+        This constructor uses the production random-name generator for one collision-resistant test directory.
+        The caller creates all source and destination paths below this owner.
+        */
         fn new() -> Self {
             let name = random_folder_name().unwrap();
             let path = std::env::temp_dir().join(std::ffi::OsStr::from_bytes(name.as_bytes()));
@@ -821,6 +1397,10 @@ mod tests {
             Self(path)
         }
 
+        /*
+        This method lists only private save recovery directories in the fixture root.
+        Tests use the result to verify cleanup or retained evidence.
+        */
         fn recovery_dirs(&self) -> Vec<PathBuf> {
             fs::read_dir(&self.0)
                 .unwrap()
@@ -835,12 +1415,20 @@ mod tests {
         }
     }
 
+    /*
+    Fixture cleanup removes source files, published files, and retained private recovery evidence.
+    No test path remains after the Fixture owner drops.
+    */
     impl Drop for Fixture {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).unwrap();
         }
     }
 
+    /*
+    This helper attaches one supported user xattr through the same Linux descriptor API as production code.
+    Tests use the value to verify exact replacement metadata.
+    */
     fn set_test_xattr(file: &File, name: &CStr, value: &[u8]) {
         assert_eq!(
             unsafe {
@@ -856,8 +1444,62 @@ mod tests {
         );
     }
 
+    /*
+    This helper creates one complete paged edit cursor for backend transactions.
+    Tests vary the offset while keeping the viewport and nibble state deterministic.
+    */
+    fn paged_cursor(offset: u64) -> PagedEditCursor {
+        PagedEditCursor {
+            offset,
+            top: offset.saturating_sub(16),
+            low_nibble: false,
+        }
+    }
+
+    /*
+    This helper opens one source and applies a single structural edit with history.
+    The returned owner lets each save check inspect retained or reset state.
+    */
+    fn edited_paged(path: &Path, start: u64, remove_len: u64, replacement: &[u8]) -> PagedFile {
+        let mut paged = PagedFile::open(path).unwrap();
+        paged.begin_edit().unwrap();
+        assert!(
+            paged
+                .splice_bytes(
+                    start,
+                    remove_len,
+                    replacement,
+                    paged_cursor(start),
+                    paged_cursor(start + replacement.len() as u64),
+                    false,
+                )
+                .unwrap()
+        );
+        paged
+    }
+
+    /*
+    This helper reads one small logical source after a save outcome establishes its new baseline.
+    Large sparse tests use positioned markers instead of this complete test-only read.
+    */
+    fn small_paged_bytes(paged: &PagedFile) -> Vec<u8> {
+        paged
+            .read_window(0, usize::try_from(paged.len()).unwrap())
+            .unwrap()
+            .bytes
+            .into_vec()
+    }
+
+    /*
+    This test replaces one buffered target while preserving policy metadata and an independent backup.
+    Later source-descriptor writes prove that neither published file aliases the old descriptor.
+    */
     #[test]
     fn replace_preserves_bytes_metadata_and_independent_backup() {
+        /*
+        The first section creates the source metadata and captures its prepublication inode.
+        Exact timestamps and a user xattr make policy loss visible.
+        */
         let fixture = Fixture::new();
         let path = fixture.0.join("sample.bin");
         fs::write(&path, b"original").unwrap();
@@ -882,6 +1524,10 @@ mod tests {
         let source = source_metadata(&file).unwrap();
         let old_inode = file.metadata().unwrap().ino();
 
+        /*
+        The second section checks published bytes, backup bytes, identity, and every preserved metadata field.
+        The backup timestamp check occurs before reading its contents can update access time.
+        */
         let backup = replace(&path, b"original", b"edited").unwrap();
         let backup_file = File::open(&backup).unwrap();
         let backup_metadata = backup_file.metadata().unwrap();
@@ -906,14 +1552,26 @@ mod tests {
         assert_eq!(xattrs(&saved).unwrap(), source.state.xattrs);
         assert_eq!(xattrs(&backup_file).unwrap(), source.state.xattrs);
 
+        /*
+        A write through the old descriptor changes only the unlinked inode.
+        The published replacement and independent backup must keep their accepted bytes.
+        */
         file.seek(SeekFrom::Start(0)).unwrap();
         file.write_all(b"changed!").unwrap();
         assert_eq!(fs::read(&backup).unwrap(), b"original");
         assert_eq!(fs::read(&path).unwrap(), b"edited");
     }
 
+    /*
+    This test rejects changed bytes, nonregular paths, links, locks, and pathname substitution.
+    Each condition stops before buffered replacement publication.
+    */
     #[test]
     fn replace_rejects_content_path_links_and_locks() {
+        /*
+        Initial checks cover stale accepted bytes and a directory target.
+        Both inputs keep their existing filesystem objects unchanged.
+        */
         let fixture = Fixture::new();
         let path = fixture.0.join("sample.bin");
         fs::write(&path, b"changed").unwrap();
@@ -925,6 +1583,10 @@ mod tests {
                 .contains("regular file")
         );
 
+        /*
+        Symbolic-link and hard-link checks preserve every linked source path.
+        Removing the test hard link restores one-link state for the lock check.
+        */
         let link = fixture.0.join("link.bin");
         symlink(&path, &link).unwrap();
         assert!(
@@ -944,6 +1606,10 @@ mod tests {
         );
         fs::remove_file(&hard).unwrap();
 
+        /*
+        An advisory lock held by another descriptor blocks compatible replacement.
+        Releasing the fixture lock permits later checks to use the target.
+        */
         let lock = File::open(&path).unwrap();
         lock.try_lock().unwrap();
         assert!(
@@ -954,6 +1620,10 @@ mod tests {
         );
         drop(lock);
 
+        /*
+        The final section replaces the pathname after descriptor state capture.
+        The repeated target open detects the new inode before publication.
+        */
         let target = target(&path).unwrap();
         let original = open_target(&target).unwrap();
         let state = file_state(&original).unwrap();
@@ -964,6 +1634,10 @@ mod tests {
         assert!(check_target(&target, &mut original, &state, b"changed").is_err());
     }
 
+    /*
+    This test refuses unwritable and privileged buffered replacement targets.
+    Every refusal preserves original bytes and creates no recovery data.
+    */
     #[test]
     fn replace_rejects_read_only_and_privilege_modes() {
         let fixture = Fixture::new();
@@ -975,6 +1649,10 @@ mod tests {
         assert!(error.to_string().contains("Save As"));
         assert_eq!(fs::read(&read_only).unwrap(), b"original");
 
+        /*
+        Each privileged mode receives its own target and exact mode assertion.
+        The shared policy error identifies both set-user-ID and set-group-ID conditions.
+        */
         for (name, mode) in [("setuid.bin", 0o4755), ("setgid.bin", 0o2755)] {
             let path = fixture.0.join(name);
             fs::write(&path, b"original").unwrap();
@@ -987,6 +1665,10 @@ mod tests {
         assert!(fixture.recovery_dirs().is_empty());
     }
 
+    /*
+    This test substitutes the recovery directory name with a link to an outside file.
+    Descriptor checks must preserve the victim bytes and permissions.
+    */
     #[test]
     fn stage_name_substitution_does_not_change_victim_permissions() {
         let fixture = Fixture::new();
@@ -1009,8 +1691,16 @@ mod tests {
         );
     }
 
+    /*
+    This test verifies exclusive buffered Save As for files, links, and a destination race.
+    A refused race retains prepared bytes in its private recovery directory.
+    */
     #[test]
     fn save_as_uses_atomic_destination_refusal() {
+        /*
+        Initial publication creates one destination and refuses a second write to the same name.
+        Existing destination bytes remain exact.
+        */
         let fixture = Fixture::new();
         let path = fixture.0.join("new.bin");
         assert_eq!(save_as(&path, b"new").unwrap(), path);
@@ -1021,6 +1711,10 @@ mod tests {
         );
         assert_eq!(fs::read(&path).unwrap(), b"new");
 
+        /*
+        A dangling link is still an existing destination entry.
+        Exclusive publication must preserve the link itself.
+        */
         let dangling = fixture.0.join("dangling.bin");
         symlink(fixture.0.join("missing.bin"), &dangling).unwrap();
         assert_eq!(
@@ -1034,6 +1728,10 @@ mod tests {
                 .is_symlink()
         );
 
+        /*
+        The race fixture creates a link after preparation and before exclusive rename.
+        RENAME_NOREPLACE preserves both the raced entry and staged new bytes.
+        */
         let raced_path = fixture.0.join("raced.bin");
         let raced_target = target(&raced_path).unwrap();
         let mut stage = Stage::new(&raced_target).unwrap();
@@ -1056,8 +1754,16 @@ mod tests {
         );
     }
 
+    /*
+    This test maps each injected buffered failure phase to cleanup, recovery, and visible publication state.
+    It preserves actual target bytes at every boundary.
+    */
     #[test]
     fn failures_keep_or_remove_the_correct_recovery_data() {
+        /*
+        Private write and prepublication synchronization failures remove incomplete stage data.
+        Neither phase creates the destination.
+        */
         let fixture = Fixture::new();
         let path = fixture.0.join("new.bin");
 
@@ -1071,6 +1777,10 @@ mod tests {
         assert!(!path.exists());
         assert!(fixture.recovery_dirs().is_empty());
 
+        /*
+        A Save As publication failure retains complete prepared bytes for recovery.
+        The destination does not exist because rename did not occur.
+        */
         set_fault(FAULT_PUBLISH);
         let error = save_as(&path, b"recover data").unwrap_err();
         assert!(error.to_string().contains("Recovery files remain"));
@@ -1082,6 +1792,10 @@ mod tests {
         );
         fs::remove_dir_all(&recovery[0]).unwrap();
 
+        /*
+        A final Save As synchronization failure follows rename.
+        The error states that destination bytes can already be visible and retains recovery evidence.
+        */
         set_fault(FAULT_FINAL_SYNC);
         let error = save_as(&path, b"visible data").unwrap_err();
         assert!(error.to_string().contains("may already be visible"));
@@ -1091,6 +1805,10 @@ mod tests {
             fs::remove_dir_all(recovery).unwrap();
         }
 
+        /*
+        Replacement publication failure retains original, new, and target-note files.
+        The external target keeps original bytes until rename succeeds.
+        */
         let replace_path = fixture.0.join("replace.bin");
         fs::write(&replace_path, b"original").unwrap();
         set_fault(FAULT_PUBLISH);
@@ -1106,6 +1824,10 @@ mod tests {
         assert_eq!(fs::read(recovery[0].join("new.bin")).unwrap(), b"edited");
         fs::remove_dir_all(&recovery[0]).unwrap();
 
+        /*
+        Replacement final synchronization failure keeps the new target and independent original backup.
+        Retained recovery data explains both byte states.
+        */
         set_fault(FAULT_FINAL_SYNC);
         let error = replace(&replace_path, b"original", b"edited").unwrap_err();
         assert!(error.to_string().contains("may already be visible"));
@@ -1118,8 +1840,424 @@ mod tests {
         );
     }
 
+    /*
+    This test replaces one edited paged source and verifies bytes, metadata, backup times, and fresh history.
+    A later canceled edit proves that the reopened owner supplies the new source baseline.
+    */
+    #[test]
+    fn paged_replacement_preserves_metadata_and_adopts_the_prepared_inode() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("paged.bin");
+        fs::write(&path, b"abcdef").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        set_test_xattr(&file, c"user.hview-paged", b"metadata");
+        let times = [
+            Timespec {
+                tv_sec: 1_600_000_100,
+                tv_nsec: 123_456_789,
+            },
+            Timespec {
+                tv_sec: 1_600_000_101,
+                tv_nsec: 987_654_321,
+            },
+        ];
+        assert_eq!(unsafe { futimens(file.as_raw_fd(), times.as_ptr()) }, 0);
+        let expected = source_metadata(&file).unwrap();
+        drop(file);
+
+        let paged = edited_paged(&path, 2, 2, b"XYZ");
+        let outcome = replace_paged(&path, &paged).unwrap();
+        let backup = outcome.backup.unwrap();
+        assert_eq!(outcome.path, path);
+        assert!(outcome.warning.is_none());
+        assert_eq!(fs::read(&path).unwrap(), b"abXYZef");
+        assert_eq!(small_paged_bytes(&outcome.source), b"abXYZef");
+        assert!(!outcome.source.editing());
+        assert!(!outcome.source.has_changes());
+
+        /*
+        This section checks replacement and backup metadata after every bounded verification read completed.
+        The restored backup timestamps must remain exact at the operation boundary.
+        */
+        let saved = File::open(&path).unwrap();
+        let saved_metadata = saved.metadata().unwrap();
+        let backup_file = File::open(&backup).unwrap();
+        let backup_metadata = backup_file.metadata().unwrap();
+        assert_ne!(saved_metadata.ino(), expected.state.ino);
+        assert!(
+            outcome
+                .source
+                .has_identity(saved_metadata.dev(), saved_metadata.ino())
+                .unwrap()
+        );
+        assert_eq!(saved_metadata.mode() & 0o7777, 0o640);
+        assert_eq!(saved_metadata.uid(), expected.state.uid);
+        assert_eq!(saved_metadata.gid(), expected.state.gid);
+        assert_eq!(xattrs(&saved).unwrap(), expected.state.xattrs);
+        assert_eq!(xattrs(&backup_file).unwrap(), expected.state.xattrs);
+        assert_eq!(
+            (backup_metadata.atime(), backup_metadata.atime_nsec()),
+            (times[0].tv_sec, times[0].tv_nsec)
+        );
+        assert_eq!(
+            (backup_metadata.mtime(), backup_metadata.mtime_nsec()),
+            (times[1].tv_sec, times[1].tv_nsec)
+        );
+        assert_eq!(fs::read(&backup).unwrap(), b"abcdef");
+
+        let mut reopened = outcome.source;
+        reopened.begin_edit().unwrap();
+        reopened
+            .replace_bytes(0, b"Q", paged_cursor(0), paged_cursor(1), false)
+            .unwrap();
+        reopened.cancel_edit();
+        assert_eq!(small_paged_bytes(&reopened), b"abXYZef");
+    }
+
+    /*
+    This test publishes replacement, insertion, deletion, and empty layouts through exclusive Save As.
+    Each result owns a clean baseline while the original source bytes remain unchanged.
+    */
+    #[test]
+    fn paged_save_as_preserves_each_structural_layout() {
+        let fixture = Fixture::new();
+        /*
+        Each row prepares one logical layout and its exact expected destination bytes.
+        The outcome must adopt a clean source while the original source remains unchanged.
+        */
+        for (name, start, remove, replacement, expected) in [
+            ("unchanged", 0, 0, &b""[..], &b"abcdef"[..]),
+            ("replace", 2, 2, &b"XYZ"[..], &b"abXYZef"[..]),
+            ("insert", 6, 0, &b"!"[..], &b"abcdef!"[..]),
+            ("delete", 1, 4, &b""[..], &b"af"[..]),
+            ("empty", 0, 6, &b""[..], &b""[..]),
+        ] {
+            let source_path = fixture.0.join(format!("{name}-source.bin"));
+            let destination = fixture.0.join(format!("{name}-copy.bin"));
+            fs::write(&source_path, b"abcdef").unwrap();
+            let paged = if remove == 0 && replacement.is_empty() {
+                PagedFile::open(&source_path).unwrap()
+            } else {
+                edited_paged(&source_path, start, remove, replacement)
+            };
+            let outcome = save_as_paged(&destination, &paged).unwrap();
+            assert_eq!(outcome.path, destination);
+            assert_eq!(fs::read(&destination).unwrap(), expected);
+            assert_eq!(small_paged_bytes(&outcome.source), expected);
+            let metadata = fs::metadata(&destination).unwrap();
+            assert!(
+                outcome
+                    .source
+                    .has_identity(metadata.dev(), metadata.ino())
+                    .unwrap()
+            );
+            assert_eq!(fs::read(&source_path).unwrap(), b"abcdef");
+            assert!(outcome.backup.is_none());
+            assert!(outcome.warning.is_none());
+            assert!(!outcome.source.editing());
+            assert!(!outcome.source.has_changes());
+        }
+    }
+
+    /*
+    This test publishes unchanged, replacement, growth, shrinkage, and empty layouts through replacement Save.
+    Every recovery backup keeps the complete original bytes for its target.
+    */
+    #[test]
+    fn paged_replacement_preserves_each_structural_layout() {
+        let fixture = Fixture::new();
+        /*
+        Each row creates an independent target, logical layout, and expected result.
+        The replacement outcome must own a clean baseline with an exact original backup.
+        */
+        for (name, start, remove, replacement, expected) in [
+            ("unchanged", 0, 0, &b""[..], &b"abcdef"[..]),
+            ("replace", 2, 2, &b"XY"[..], &b"abXYef"[..]),
+            ("grow", 2, 1, &b"XYZ"[..], &b"abXYZdef"[..]),
+            ("shrink", 1, 4, &b"Q"[..], &b"aQf"[..]),
+            ("empty", 0, 6, &b""[..], &b""[..]),
+        ] {
+            let path = fixture.0.join(format!("replacement-{name}.bin"));
+            fs::write(&path, b"abcdef").unwrap();
+            let paged = if remove == 0 && replacement.is_empty() {
+                PagedFile::open(&path).unwrap()
+            } else {
+                edited_paged(&path, start, remove, replacement)
+            };
+            let outcome = replace_paged(&path, &paged).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), expected);
+            assert_eq!(small_paged_bytes(&outcome.source), expected);
+            assert_eq!(fs::read(outcome.backup.unwrap()).unwrap(), b"abcdef");
+            assert!(!outcome.source.editing());
+            assert!(!outcome.source.has_changes());
+        }
+    }
+
+    /*
+    This test saves sparse high-offset source spans and memory bytes without dense physical allocation.
+    The replacement backup remains independent and keeps the complete original sparse length.
+    */
+    #[test]
+    fn paged_replacement_preserves_sparse_bytes_above_four_gib() {
+        use std::os::unix::fs::FileExt;
+
+        let fixture = Fixture::new();
+        let path = fixture.0.join("sparse.bin");
+        let length = (4_u64 << 30) + 0x20_001;
+        let high = (4_u64 << 30) + 0x10_000;
+        let file = File::create(&path).unwrap();
+        file.set_len(length).unwrap();
+        file.write_all_at(b"A", 0).unwrap();
+        file.write_all_at(b"B", 65_536).unwrap();
+        file.write_all_at(b"Z", length - 1).unwrap();
+        file.sync_all().unwrap();
+
+        let paged = edited_paged(&path, high, 0, b"XY");
+        let outcome = replace_paged(&path, &paged).unwrap();
+        let backup = outcome.backup.unwrap();
+        assert_eq!(outcome.source.len(), length + 2);
+        let saved = File::open(&path).unwrap();
+        let original = File::open(&backup).unwrap();
+        let mut bytes = [0_u8; 2];
+        saved.read_exact_at(&mut bytes, high).unwrap();
+        assert_eq!(&bytes, b"XY");
+        saved.read_exact_at(&mut bytes[..1], length + 1).unwrap();
+        assert_eq!(bytes[0], b'Z');
+        original.read_exact_at(&mut bytes[..1], high).unwrap();
+        assert_eq!(bytes[0], 0);
+        original.read_exact_at(&mut bytes[..1], length - 1).unwrap();
+        assert_eq!(bytes[0], b'Z');
+        assert_eq!(original.metadata().unwrap().len(), length);
+        assert!(saved.metadata().unwrap().blocks() * 512 < 16 * 1024 * 1024);
+        assert!(original.metadata().unwrap().blocks() * 512 < 16 * 1024 * 1024);
+    }
+
+    /*
+    This test distinguishes final synchronization warnings from published reopen failures.
+    Save As reopen failure must retain the original paged edit owner and its history.
+    */
+    #[test]
+    fn paged_publication_outcomes_preserve_the_correct_owner() {
+        let fixture = Fixture::new();
+
+        /*
+        A post-rename synchronization failure returns a warning with an adopted new baseline.
+        Published target bytes prove that the warning cannot describe an unchanged file.
+        */
+        let warning_path = fixture.0.join("warning.bin");
+        fs::write(&warning_path, b"abc").unwrap();
+        let warning_source = edited_paged(&warning_path, 0, 1, b"X");
+        set_fault(FAULT_FINAL_SYNC);
+        let warning = replace_paged(&warning_path, &warning_source).unwrap();
+        assert_eq!(fs::read(&warning_path).unwrap(), b"Xbc");
+        assert!(warning.warning.unwrap().contains("may already be visible"));
+        assert!(!warning.source.editing());
+
+        /*
+        Save As final synchronization failure also adopts the published destination with a warning.
+        The original source path and bytes remain independent.
+        */
+        let warning_source_path = fixture.0.join("save-as-warning-source.bin");
+        let warning_destination = fixture.0.join("save-as-warning-destination.bin");
+        fs::write(&warning_source_path, b"abc").unwrap();
+        let warning_source = edited_paged(&warning_source_path, 0, 1, b"W");
+        set_fault(FAULT_FINAL_SYNC);
+        let warning = save_as_paged(&warning_destination, &warning_source).unwrap();
+        assert_eq!(warning.path, warning_destination);
+        assert_eq!(fs::read(&warning_destination).unwrap(), b"Wbc");
+        assert_eq!(fs::read(&warning_source_path).unwrap(), b"abc");
+        assert!(warning.warning.unwrap().contains("may already be visible"));
+        assert!(!warning.source.editing());
+
+        /*
+        Replacement reopen failure reports an unusable active path and independent backup location.
+        The external target already contains new bytes.
+        */
+        let replace_path = fixture.0.join("replace-reopen.bin");
+        fs::write(&replace_path, b"abc").unwrap();
+        let replace_source = edited_paged(&replace_path, 0, 1, b"Y");
+        set_fault(FAULT_PAGED_REOPEN);
+        let error = replace_paged(&replace_path, &replace_source).err().unwrap();
+        assert!(matches!(&error, PagedSaveError::PublishedReplacement(_)));
+        assert!(error.to_string().contains("Original bytes remain"));
+        assert_eq!(fs::read(&replace_path).unwrap(), b"Ybc");
+        let recovery = fixture.recovery_dirs();
+        assert!(recovery.iter().any(|path| {
+            fs::read(path.join("original.bin")).ok().as_deref() == Some(&b"abc"[..])
+        }));
+
+        /*
+        Save As reopen failure keeps the original paged owner, logical edit, and both history directions.
+        Explicit cancellation still restores the original source layout.
+        */
+        let source_path = fixture.0.join("save-as-source.bin");
+        let destination = fixture.0.join("save-as-destination.bin");
+        fs::write(&source_path, b"abc").unwrap();
+        let mut save_as_source = edited_paged(&source_path, 0, 1, b"Z");
+        set_fault(FAULT_PAGED_REOPEN);
+        let error = save_as_paged(&destination, &save_as_source).err().unwrap();
+        assert!(matches!(&error, PagedSaveError::PublishedSaveAs(_)));
+        assert_eq!(fs::read(&destination).unwrap(), b"Zbc");
+        assert_eq!(small_paged_bytes(&save_as_source), b"Zbc");
+        assert!(save_as_source.undo().unwrap().is_some());
+        assert_eq!(small_paged_bytes(&save_as_source), b"abc");
+        assert!(save_as_source.redo().unwrap().is_some());
+        save_as_source.cancel_edit();
+        assert_eq!(small_paged_bytes(&save_as_source), b"abc");
+        assert_eq!(fs::read(&source_path).unwrap(), b"abc");
+    }
+
+    /*
+    This test refuses existing destinations, source aliases, and mismatched replacement identities before publication.
+    Every failure keeps the source layout and Undo history available.
+    */
+    #[test]
+    fn paged_save_refusals_keep_edit_state_and_destinations() {
+        let fixture = Fixture::new();
+        let source_path = fixture.0.join("source.bin");
+        let existing = fixture.0.join("existing.bin");
+        let other = fixture.0.join("other.bin");
+        fs::write(&source_path, b"abc").unwrap();
+        fs::write(&existing, b"existing").unwrap();
+        fs::write(&other, b"other").unwrap();
+        let mut source = edited_paged(&source_path, 0, 1, b"X");
+
+        /*
+        Existing and source-alias destinations fail before exclusive publication.
+        A replacement path that identifies another file also fails the descriptor identity guard.
+        */
+        let existing_error = save_as_paged(&existing, &source).err().unwrap();
+        assert!(matches!(existing_error, PagedSaveError::Retained(_)));
+        assert_eq!(fs::read(&existing).unwrap(), b"existing");
+        let alias_error = save_as_paged(&source_path, &source).err().unwrap();
+        assert_eq!(
+            match alias_error {
+                PagedSaveError::Retained(error) => error.kind(),
+                _ => panic!("The source alias reached publication."),
+            },
+            io::ErrorKind::InvalidInput
+        );
+        let replacement_error = replace_paged(&other, &source).err().unwrap();
+        assert!(matches!(replacement_error, PagedSaveError::Retained(_)));
+        assert_eq!(fs::read(&other).unwrap(), b"other");
+        /*
+        The accepted memory bytes and Undo record remain available after every refusal.
+        One Undo restores the captured source bytes.
+        */
+        assert_eq!(small_paged_bytes(&source), b"Xbc");
+        assert!(source.undo().unwrap().is_some());
+        assert_eq!(small_paged_bytes(&source), b"abc");
+
+        /*
+        An external source change fails before staging and leaves the active edit owner intact.
+        Explicit cancellation remains available without accepting a new source stamp.
+        */
+        let changed_path = fixture.0.join("changed.bin");
+        fs::write(&changed_path, b"abc").unwrap();
+        let mut changed_source = edited_paged(&changed_path, 0, 1, b"X");
+        fs::write(&changed_path, b"external").unwrap();
+        let error = replace_paged(&changed_path, &changed_source).err().unwrap();
+        assert!(matches!(error, PagedSaveError::Retained(_)));
+        assert!(changed_source.editing());
+        assert!(changed_source.has_changes());
+        changed_source.cancel_edit();
+        assert!(!changed_source.editing());
+        assert!(changed_source.validate().is_err());
+        assert_eq!(fs::read(&changed_path).unwrap(), b"external");
+        assert!(fixture.recovery_dirs().is_empty());
+    }
+
+    /*
+    This test applies the established target policy to the paged replacement route.
+    Symbolic links, hard links, advisory locks, read-only targets, and privileged modes must fail before publication.
+    */
+    #[test]
+    fn paged_replacement_uses_existing_target_policy() {
+        let fixture = Fixture::new();
+
+        /*
+        A symbolic-link target cannot identify the active source for replacement.
+        The referenced regular file remains unchanged.
+        */
+        let symlink_source = fixture.0.join("symlink-source.bin");
+        let symlink_path = fixture.0.join("symlink.bin");
+        fs::write(&symlink_source, b"abc").unwrap();
+        symlink(&symlink_source, &symlink_path).unwrap();
+        let source = edited_paged(&symlink_source, 0, 1, b"X");
+        let error = replace_paged(&symlink_path, &source).err().unwrap();
+        assert!(error.to_string().contains("symbolic link"));
+        assert_eq!(fs::read(&symlink_source).unwrap(), b"abc");
+
+        /*
+        A source with two pathname links fails the established replacement policy.
+        Both names continue to identify the original bytes.
+        */
+        let hard_path = fixture.0.join("hard.bin");
+        let hard_alias = fixture.0.join("hard-alias.bin");
+        fs::write(&hard_path, b"abc").unwrap();
+        fs::hard_link(&hard_path, &hard_alias).unwrap();
+        let source = edited_paged(&hard_path, 0, 1, b"X");
+        let error = replace_paged(&hard_path, &source).err().unwrap();
+        assert!(error.to_string().contains("hard links"));
+        assert_eq!(fs::read(&hard_alias).unwrap(), b"abc");
+
+        /*
+        Another compatible advisory lock blocks replacement before staging.
+        Dropping the lock ends only the fixture condition.
+        */
+        let lock_path = fixture.0.join("locked.bin");
+        fs::write(&lock_path, b"abc").unwrap();
+        let source = edited_paged(&lock_path, 0, 1, b"X");
+        let lock = File::open(&lock_path).unwrap();
+        lock.try_lock().unwrap();
+        let error = replace_paged(&lock_path, &source).err().unwrap();
+        assert!(error.to_string().contains("in use"));
+        drop(lock);
+
+        /*
+        A read-only target returns PermissionDenied and keeps its disk bytes.
+        The test runs on the required unprivileged host identity.
+        */
+        let read_only = fixture.0.join("read-only.bin");
+        fs::write(&read_only, b"abc").unwrap();
+        fs::set_permissions(&read_only, fs::Permissions::from_mode(0o444)).unwrap();
+        let source = edited_paged(&read_only, 0, 1, b"X");
+        let error = replace_paged(&read_only, &source).err().unwrap();
+        assert!(matches!(
+            error,
+            PagedSaveError::Retained(error) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(fs::read(&read_only).unwrap(), b"abc");
+
+        /*
+        A privileged target mode fails before recovery staging starts.
+        The final directory check confirms that every refusal left no recovery data.
+        */
+        let privileged = fixture.0.join("privileged.bin");
+        fs::write(&privileged, b"abc").unwrap();
+        fs::set_permissions(&privileged, fs::Permissions::from_mode(0o4755)).unwrap();
+        let source = edited_paged(&privileged, 0, 1, b"X");
+        let error = replace_paged(&privileged, &source).err().unwrap();
+        assert!(error.to_string().contains("set-user-ID"));
+        assert_eq!(fs::read(&privileged).unwrap(), b"abc");
+        assert!(fixture.recovery_dirs().is_empty());
+    }
+
+    /*
+    This test verifies POSIX access ACL preservation and removal of inherited ACLs for plain files.
+    It covers both buffered and paged replacement paths.
+    */
     #[test]
     fn acl_and_metadata_policy_are_explicit() {
+        /*
+        The fixture adds one named-user access ACL and a default parent ACL.
+        Buffered replacement must copy the source ACL to target and backup.
+        */
         let fixture = Fixture::new();
         let path = fixture.0.join("acl.bin");
         let plain_path = fixture.0.join("plain.bin");
@@ -1147,6 +2285,34 @@ mod tests {
         assert_eq!(xattrs(&File::open(&path).unwrap()).unwrap(), acl);
         assert_eq!(xattrs(&File::open(backup).unwrap()).unwrap(), acl);
 
+        /*
+        The paged route uses the same ACL metadata functions for the published file and independent backup.
+        The edit changes one byte without changing the accepted access ACL.
+        */
+        let paged_path = fixture.0.join("paged-acl.bin");
+        fs::write(&paged_path, b"paged").unwrap();
+        let status = Command::new("setfacl")
+            .args(["-m", "u:1:r--"])
+            .arg(&paged_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let paged_acl = xattrs(&File::open(&paged_path).unwrap()).unwrap();
+        let paged = edited_paged(&paged_path, 0, 1, b"P");
+        let outcome = replace_paged(&paged_path, &paged).unwrap();
+        assert_eq!(
+            xattrs(&File::open(&paged_path).unwrap()).unwrap(),
+            paged_acl
+        );
+        assert_eq!(
+            xattrs(&File::open(outcome.backup.unwrap()).unwrap()).unwrap(),
+            paged_acl
+        );
+
+        /*
+        A plain source must not acquire the parent default ACL in either published file.
+        Stage metadata replacement removes inherited supported attributes before final verification.
+        */
         let plain_attrs = xattrs(&File::open(&plain_path).unwrap()).unwrap();
         assert!(plain_attrs.is_empty());
         let plain_backup = replace(&plain_path, b"plain", b"edited").unwrap();
@@ -1161,6 +2327,10 @@ mod tests {
                 .is_empty()
         );
 
+        /*
+        The final checks define accepted and refused xattr namespaces directly.
+        Privileged metadata receives a specific policy message.
+        */
         assert!(check_xattr_name(b"user.note").is_ok());
         assert!(check_xattr_name(b"system.posix_acl_access").is_ok());
         assert!(
@@ -1172,8 +2342,16 @@ mod tests {
         assert!(check_xattr_name(b"system.unknown").is_err());
     }
 
+    /*
+    This test reports a missing destination parent before it creates a stage or target.
+    The requested path remains absent.
+    */
     #[test]
     fn staging_failure_does_not_change_a_target() {
+        /*
+        The missing parent makes target construction fail before private-directory creation.
+        The error kind and absent destination identify that exact boundary.
+        */
         let fixture = Fixture::new();
         let path = fixture.0.join("missing").join("new.bin");
         assert_eq!(
@@ -1183,8 +2361,16 @@ mod tests {
         assert!(!path.exists());
     }
 
+    /*
+    This test saves empty buffered output, a multiwindow backup, and one Unicode destination.
+    The cases keep exact data across zero, large, and non-ASCII inputs.
+    */
     #[test]
     fn empty_large_and_unicode_files_save() {
+        /*
+        The first section replaces a multiwindow source with an empty logical result.
+        The target becomes empty while its independent backup keeps every original byte.
+        */
         let fixture = Fixture::new();
         let path = fixture.0.join("large.bin");
         let data = vec![0xa5; 131_073];
@@ -1193,6 +2379,10 @@ mod tests {
         assert!(fs::read(&path).unwrap().is_empty());
         assert_eq!(fs::read(backup).unwrap(), data);
 
+        /*
+        The final section publishes one buffered Save As path with non-ASCII UTF-8 characters.
+        The exact native PathBuf and bytes survive publication.
+        */
         let unicode = fixture.0.join("données.bin");
         assert_eq!(save_as(&unicode, b"new").unwrap(), unicode);
         assert_eq!(fs::read(unicode).unwrap(), b"new");

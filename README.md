@@ -101,9 +101,9 @@ For ordinary raw files, `--virtual` uses the value as a file offset. Raw ELF fil
 | `Alt+F` | The key starts an ASCII or masked hexadecimal search. |
 | `Alt+R` | The key finds the next match. |
 | `Alt+B` | The key finds the previous match. |
-| `Alt+S` | The key saves buffered edits. Active paged edits keep their in-memory state. |
+| `Alt+S` | The key saves active buffered or paged edits. |
 | `Alt+O` | The key opens the file browser outside editing. |
-| `Ctrl+S` | The key saves the buffer to a new file. |
+| `Ctrl+S` | The key saves the current data to a new file. |
 | `Ctrl+T` | The key opens the analysis tools. |
 | `Alt+P` | The key opens the previous input file. |
 | `Alt+N` | The key opens the next input file. |
@@ -231,8 +231,8 @@ Buffered files through 64 MiB support all editing and saving operations in this 
 
 Larger regular files support in-memory Hex nibble replacement, undo, redo, and explicit cancellation.
 Paged Hex overtype cannot extend the file at EOF.
-Large-file disk saving remains unavailable.
-File switching and quit remain unavailable until `Esc` cancels all paged edits.
+Paged Save and Save As stream logical bytes through bounded private staging files.
+File switching and quit remain unavailable until paged edits are saved or canceled.
 
 Press `Alt+E` to start editing. Hex mode replaces nibbles, and Code mode assembles one Intel instruction.
 
@@ -262,10 +262,16 @@ Failed, canceled, and unchanged edits preserve redo history. The history holds u
 
 The application removes the oldest records when necessary. An operation larger than the history byte limit fails before buffer changes.
 
-For buffered files, press `Alt+S` to replace the current file.
-Press `Ctrl+S` to save the buffered data under a new name.
+Press `Alt+S` to replace the current file.
+Press `Ctrl+S` to save the current data under a new name.
 
-Successful saves establish a new edit baseline and clear both histories. Failed saves preserve both histories. Edit cancellation clears both histories.
+Successful saves establish a new edit baseline and clear both histories. Prepublication failures preserve edits and both histories.
+
+A paged final synchronization warning adopts the verified published baseline. The warning states that new bytes can already be visible.
+
+A published replacement reopen failure closes the unusable view and prevents SAV publication. The independent original backup remains available.
+
+A published Save As reopen failure retains the original source, edits, and histories. Edit cancellation clears both histories.
 
 An in-place save checks the original bytes, file identity, metadata, and an advisory file lock before publication.
 
@@ -315,7 +321,7 @@ Paged Hex edits use bounded logical spans and stay in memory.
 The view keeps at most 256 undo records within the 130 MiB history limit.
 Press `Esc` to discard those edits and restore source bytes.
 
-Large-file Text, Code, format addresses, saving, search, and analysis remain pending parity work.
+Large-file Text, Code, format addresses, structural edit controls, search, and analysis remain pending parity work.
 
 For buffered files, comparison also reads the other file into memory. Select file sizes that fit available memory with these copies.
 
