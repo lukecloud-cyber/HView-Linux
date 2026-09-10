@@ -248,7 +248,7 @@ One completed hexadecimal byte, confirmed assembly patch, Fill range, or XOR ran
 
 Undo and redo restore bytes, buffer length, cursor, viewport, and nibble selection. A changed edit clears redo history.
 
-Failed, canceled, and unchanged edits preserve redo history. The history holds up to 256 records within 64 MiB of stored bytes.
+Failed, canceled, and unchanged edits preserve redo history. The history holds up to 256 records within 130 MiB of stored bytes.
 
 The application removes the oldest records when necessary. An operation larger than the history byte limit fails before buffer changes.
 

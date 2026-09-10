@@ -1,8 +1,21 @@
+/*
+This module owns buffered file data, view state, editing, and presentation helpers.
+The Editor applies range transactions to complete buffered data and preserves exact cursor state in bounded history.
+Paged files use the related logical-layout owner in paged.rs.
+*/
 use std::{collections::VecDeque, fmt::Write};
 
+/*
+Buffered and paged editors share the Windows history limits.
+The record limit bounds operation count, and the byte limit bounds retained byte copies.
+*/
 const EDIT_HISTORY_LIMIT: usize = 256;
-const EDIT_HISTORY_BYTES: usize = 64 * 1024 * 1024;
+const EDIT_HISTORY_BYTES: usize = 130 * 1024 * 1024;
 
+/*
+One buffered cursor snapshot contains the byte position, viewport, and Hex nibble selection.
+History records use these values to restore the exact view around an operation.
+*/
 #[derive(Clone, Copy)]
 struct EditCursor {
     offset: u64,
@@ -10,6 +23,11 @@ struct EditCursor {
     low_nibble: bool,
 }
 
+/*
+One buffered history record stores the changed range before and after one transaction.
+Separate lengths support growth and shrinkage while cursor fields restore the related view.
+The group flag joins two Hex nibble inputs into one byte operation.
+*/
 struct EditRecord {
     start: usize,
     before: Vec<u8>,
@@ -21,19 +39,35 @@ struct EditRecord {
     hex_group: bool,
 }
 
+/*
+This record method reports the complete retained byte cost for history accounting.
+The caller adds the result only after checked operation planning succeeds.
+*/
 impl EditRecord {
+    /*
+    This method adds the before and after byte vector lengths for one record.
+    Buffered history planning uses the result for eviction and current byte accounting.
+    */
     fn bytes(&self) -> usize {
         self.before.len() + self.after.len()
     }
 }
 
+/*
+This helper checks one proposed buffered record against the shared 130 MiB byte limit.
+An overflow or oversized result fails before editor data or history changes.
+*/
 fn history_size(before: usize, after: usize) -> Result<usize, String> {
     before
         .checked_add(after)
         .filter(|&bytes| bytes <= EDIT_HISTORY_BYTES)
-        .ok_or("The edit exceeds the 64 MiB undo history limit.".into())
+        .ok_or("The edit exceeds the 130 MiB undo history limit.".into())
 }
 
+/*
+Mode selects the current buffered presentation and command rules.
+Text, Hex, and Code reuse the same byte buffer and common view state.
+*/
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Text,
@@ -41,12 +75,20 @@ pub enum Mode {
     Code,
 }
 
+/*
+ByteOrder selects how the raw model interprets multi-byte values.
+The configured value passes to the value inspector through workbench.rs.
+*/
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ByteOrder {
     Little,
     Big,
 }
 
+/*
+RawModel supplies an explicit base, machine width, and byte order for unformatted code.
+Validation prevents a configured address range from exceeding the selected architecture width.
+*/
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RawModel {
     pub base: u64,
@@ -54,7 +96,15 @@ pub struct RawModel {
     pub byte_order: ByteOrder,
 }
 
+/*
+Raw-model validation maps the final buffered byte through the selected address model.
+The format module returns the precise range error before configuration changes.
+*/
 impl RawModel {
+    /*
+    This method checks the final file byte through the proposed raw address mapping.
+    An empty buffer uses address zero so invalid base and width combinations still fail.
+    */
     fn validate(self, file_len: usize) -> Result<(), String> {
         let last = u64::try_from(file_len.saturating_sub(1))
             .map_err(|_| "The raw file size exceeds the address range.")?;
@@ -63,6 +113,10 @@ impl RawModel {
     }
 }
 
+/*
+Key lists navigation actions after the console converts terminal input.
+Editor navigation applies mode-specific movement and viewport correction for each action.
+*/
 #[derive(Clone, Copy, Debug)]
 pub enum Key {
     Left,
@@ -77,6 +131,11 @@ pub enum Key {
     FileEnd,
 }
 
+/*
+Editor owns the complete buffered bytes and all active view settings.
+Public fields support the established main loop and session wrappers.
+Private fields preserve the edit baseline, histories, byte accounting, and Hex group state.
+*/
 pub struct Editor {
     pub data: Vec<u8>,
     pub offset: u64,
@@ -107,7 +166,16 @@ pub struct Editor {
     hex_start: Option<EditCursor>,
 }
 
+/*
+These methods create the buffered editor and apply its navigation, rendering, and transaction rules.
+Each mutation keeps byte data, cursor state, dirty state, and bounded history consistent.
+*/
 impl Editor {
+    /*
+    This constructor accepts owned bytes, an initial mode, and a requested byte offset.
+    It clamps the offset and aligns Text mode to the current line start.
+    Remaining settings receive the established Linux defaults before the main loop uses them.
+    */
     pub fn new(data: Vec<u8>, mode: Mode, offset: u64) -> Self {
         let mut offset = offset.min(data.len() as u64);
         if mode == Mode::Text {
@@ -144,6 +212,10 @@ impl Editor {
         }
     }
 
+    /*
+    This setter validates a proposed raw model against the current byte length.
+    A failure preserves the previous model, and success publishes the new selection.
+    */
     pub fn set_raw_model(&mut self, raw_model: Option<RawModel>) -> Result<(), String> {
         if let Some(model) = raw_model {
             model.validate(self.data.len())?;
@@ -152,6 +224,10 @@ impl Editor {
         Ok(())
     }
 
+    /*
+    This check validates a proposed byte length under the optional raw model.
+    Edit planning calls the check before any growth changes the buffer.
+    */
     pub fn validate_raw_len(&self, new_len: usize) -> Result<(), String> {
         if let Some(model) = self.raw_model {
             model.validate(new_len)?;
@@ -159,14 +235,26 @@ impl Editor {
         Ok(())
     }
 
+    /*
+    This query selects decoder width from the active raw model or normal Code settings.
+    Decoder setup uses the returned width for the next instruction.
+    */
     pub fn decode_bits(&self) -> u32 {
         self.raw_model.map_or(self.code_bits, |model| model.bits)
     }
 
+    /*
+    This query enables Real16 only when no raw model overrides normal Code settings.
+    The decoder uses the result with the selected bit width.
+    */
     pub fn decode_real_mode(&self) -> bool {
         self.raw_model.is_none() && self.real_mode
     }
 
+    /*
+    This method returns raw metadata or parses the current file format from buffered bytes.
+    Raw metadata receives a fresh length check before address operations use it.
+    */
     pub fn metadata(&self) -> Result<crate::format::Metadata, String> {
         match self.raw_model {
             Some(model) => {
@@ -177,6 +265,10 @@ impl Editor {
         }
     }
 
+    /*
+    This method converts one user address through the current metadata and byte buffer.
+    Format validation and mapping errors pass unchanged to the caller.
+    */
     pub fn convert_address(
         &self,
         kind: crate::format::AddressKind,
@@ -185,6 +277,10 @@ impl Editor {
         self.metadata()?.convert_address(&self.data, kind, value)
     }
 
+    /*
+    This helper captures the current position, viewport, and nibble selection.
+    A new transaction stores the snapshot as its before cursor.
+    */
     fn cursor(&self) -> EditCursor {
         EditCursor {
             offset: self.offset,
@@ -193,12 +289,20 @@ impl Editor {
         }
     }
 
+    /*
+    This helper restores one cursor snapshot after a history operation.
+    It clamps byte and viewport positions to the restored buffered length.
+    */
     fn set_cursor(&mut self, cursor: EditCursor) {
         self.offset = cursor.offset.min(self.data.len() as u64);
         self.top = cursor.top.min(self.data.len() as u64);
         self.low_nibble = cursor.low_nibble;
     }
 
+    /*
+    This helper closes a pending two-nibble Hex group and clears its initial cursor.
+    The retained record remains one complete undo operation.
+    */
     fn close_hex_group(&mut self) {
         if let Some(record) = self.undo_history.back_mut() {
             record.hex_group = false;
@@ -206,10 +310,18 @@ impl Editor {
         self.hex_start = None;
     }
 
+    /*
+    This public boundary closes a pending Hex group before another user action.
+    Main uses the method when a non-Hex command interrupts input.
+    */
     pub fn end_hex_group(&mut self) {
         self.close_hex_group();
     }
 
+    /*
+    This reset removes both history branches and their byte accounting.
+    Save, cancellation, and a new baseline call the reset together with related state changes.
+    */
     fn clear_edit_history(&mut self) {
         self.undo_history.clear();
         self.redo_history.clear();
@@ -217,6 +329,10 @@ impl Editor {
         self.hex_start = None;
     }
 
+    /*
+    This helper counts bytes that differ from the edit baseline in one affected range.
+    Transaction application uses the count to update dirty state without scanning the complete buffer.
+    */
     fn difference_count(&self, start: usize, end: usize) -> usize {
         let Some(backup) = &self.backup else {
             return 0;
@@ -226,6 +342,11 @@ impl Editor {
             .count()
     }
 
+    /*
+    This commit helper applies one prepared history side to the owned byte buffer.
+    It grows before copying, truncates afterward, updates changed-byte accounting, and restores the cursor.
+    All fallible allocation and model checks occur before this helper runs.
+    */
     fn apply_record_bytes(
         &mut self,
         start: usize,
@@ -246,6 +367,11 @@ impl Editor {
         self.set_cursor(cursor);
     }
 
+    /*
+    This transaction planner validates one fixed buffered replacement and prepares its history record.
+    It completes range, cursor, model, history, and allocation checks before data changes.
+    A real edit clears redo, evicts oldest records when necessary, applies bytes, and stores one undo record.
+    */
     fn record_edit(
         &mut self,
         start: usize,
@@ -254,6 +380,10 @@ impl Editor {
         after_cursor: EditCursor,
         hex_group: bool,
     ) -> Result<bool, String> {
+        /*
+        First, validate mode, range, resulting length, cursor bounds, and raw address limits.
+        A byte-identical fixed replacement returns before history or data changes.
+        */
         if !self.editing {
             return Err("Press F3 to enter edit mode.".into());
         }
@@ -277,6 +407,10 @@ impl Editor {
         if before_len == after_len && source == replacement {
             return Ok(false);
         }
+        /*
+        Next, allocate the before bytes, any required buffer growth, and one undo slot.
+        The editor still owns its unchanged data and both unchanged history branches.
+        */
         let record_bytes = history_size(source.len(), replacement.len())?;
         let mut before = Vec::new();
         before
@@ -292,6 +426,10 @@ impl Editor {
             .try_reserve(1)
             .map_err(|_| "Cannot allocate the edit history.")?;
 
+        /*
+        Finally, clear redo and evict the oldest undo records within both limits.
+        The prepared record then applies its after bytes and becomes the newest undo record.
+        */
         while let Some(record) = self.redo_history.pop_front() {
             self.history_bytes -= record.bytes();
         }
@@ -319,6 +457,10 @@ impl Editor {
         Ok(true)
     }
 
+    /*
+    This public wrapper captures the current cursor for one fixed buffered replacement.
+    It closes any Hex group after successful planning, including a byte-identical no-op.
+    */
     pub fn replace_bytes(
         &mut self,
         start: usize,
@@ -343,6 +485,10 @@ impl Editor {
         result.map(|_| ())
     }
 
+    /*
+    Undo validates restored length and reserves buffer or redo storage before mutation.
+    It then applies the before bytes, restores the before cursor, and moves the record to redo.
+    */
     pub fn undo(&mut self) -> Result<bool, String> {
         let Some(record) = self.undo_history.back() else {
             return Ok(false);
@@ -370,6 +516,10 @@ impl Editor {
         Ok(true)
     }
 
+    /*
+    Redo validates applied length and reserves buffer or undo storage before mutation.
+    It then applies the after bytes, restores the after cursor, and moves the record to undo.
+    */
     pub fn redo(&mut self) -> Result<bool, String> {
         let Some(record) = self.redo_history.back() else {
             return Ok(false);
@@ -397,6 +547,10 @@ impl Editor {
         Ok(true)
     }
 
+    /*
+    Goto closes Hex grouping and moves to a checked requested position.
+    Text aligns to a line start, while Hex centers and clamps its row viewport.
+    */
     pub fn goto(&mut self, offset: u64, rows: usize) {
         self.close_hex_group();
         self.offset = offset.min(self.data.len() as u64);
@@ -410,6 +564,10 @@ impl Editor {
         }
     }
 
+    /*
+    This action starts buffered editing only in Hex or Code mode.
+    It allocates an exact baseline before it clears history and changes edit state.
+    */
     pub fn toggle_edit(&mut self) -> Result<(), String> {
         if self.mode == Mode::Text {
             return Err("Editing is supported only in hex and code modes.".into());
@@ -430,6 +588,10 @@ impl Editor {
         Ok(())
     }
 
+    /*
+    Cancellation restores the owned baseline and removes all buffered edit history.
+    It clamps the cursor to restored data and returns the editor to clean normal mode.
+    */
     pub fn cancel_edit(&mut self) {
         if let Some(data) = self.backup.take() {
             self.data = data;
@@ -442,6 +604,10 @@ impl Editor {
         self.low_nibble = false;
     }
 
+    /*
+    A successful save makes current bytes the new external baseline.
+    It removes the old backup and history, then returns the editor to clean normal mode.
+    */
     pub fn saved(&mut self) {
         self.backup = None;
         self.clear_edit_history();
@@ -451,7 +617,16 @@ impl Editor {
         self.low_nibble = false;
     }
 
+    /*
+    Hex input converts one character and prepares the selected high or low nibble.
+    A first nibble opens one record, and its matching second nibble completes that record.
+    The method updates bytes, dirty accounting, cursor state, and group state together.
+    */
     pub fn hex_digit(&mut self, c: char) -> Result<(), String> {
+        /*
+        First, validate edit mode, the digit, the current offset, and possible growth.
+        The raw model check prevents an invalid appended byte before history changes.
+        */
         if !self.editing || self.mode != Mode::Hex {
             return Err("Press F3 to enter hex edit mode.".into());
         }
@@ -469,6 +644,10 @@ impl Editor {
                 .ok_or("The edit buffer exceeds the address range.")?;
             self.validate_raw_len(new_len)?;
         }
+        /*
+        Next, calculate the replacement byte and the cursor after this nibble.
+        The first-nibble cursor remains available until the byte group closes.
+        */
         let low_nibble = self.low_nibble;
         let before_cursor = self.hex_start.unwrap_or_else(|| self.cursor());
         let current = self.data.get(index).copied().unwrap_or(0);
@@ -483,6 +662,10 @@ impl Editor {
                 .undo_history
                 .back()
                 .is_some_and(|record| record.hex_group && record.start == index);
+        /*
+        Finally, update the open record or create one new transaction.
+        A byte-identical input still advances nibble state without a new history record.
+        */
         if grouped {
             let affected_end = index + 1;
             let before = self.difference_count(index, affected_end);
@@ -513,6 +696,11 @@ impl Editor {
         Ok(())
     }
 
+    /*
+    Navigation closes Hex grouping before it applies one mode-specific key.
+    Text delegates to line movement, Code ignores these keys, and Hex updates byte or nibble position.
+    Final correction keeps the selected Hex position inside the visible viewport.
+    */
     pub fn navigate(&mut self, key: Key, rows: usize, width: usize) {
         self.close_hex_group();
         if self.mode == Mode::Text {
@@ -522,6 +710,10 @@ impl Editor {
         if self.mode != Mode::Hex {
             return;
         }
+        /*
+        Hex movement uses the current logical size and one visible page size.
+        Edit mode changes Left and Right from byte movement to nibble movement.
+        */
         let size = self.data.len() as u64;
         let page = rows.max(1) as u64 * 16;
         match key {
@@ -584,6 +776,10 @@ impl Editor {
                 self.low_nibble = false;
             }
         }
+        /*
+        After movement, clamp the offset and adjust top only when the cursor leaves the viewport.
+        This correction preserves its row position when possible.
+        */
         self.offset = self.offset.min(size);
         if self.offset < self.top {
             self.top = self.offset / 16 * 16;
@@ -593,6 +789,12 @@ impl Editor {
         }
     }
 
+    /*
+    Text navigation moves a horizontal column or one displayed row.
+    A displayed row ends at the delimiter or the width limit.
+    Page actions repeat line movement for the visible row count.
+    The final offset follows the updated top because Text selects its first visible byte.
+    */
     fn navigate_text(&mut self, key: Key, rows: usize, width: usize) {
         let line_width = if self.wrap { width.max(1) } else { 512 };
         match key {
@@ -652,6 +854,12 @@ impl Editor {
         self.offset = self.top;
     }
 
+    /*
+    This renderer creates the requested visible body rows from current buffered state.
+    Hex formats fixed byte rows, and Text advances displayed rows.
+    This fallback shows a Code notice, while main.rs renders actual Code instructions.
+    Every returned line is clipped to the terminal width.
+    */
     pub fn render_body(&self, width: usize, rows: usize) -> Vec<String> {
         let mut output = Vec::with_capacity(rows);
         let mut pos = self.top.min(self.data.len() as u64) as usize;
@@ -685,6 +893,10 @@ impl Editor {
     }
 }
 
+/*
+This helper combines one hexadecimal digit with the selected nibble of a byte.
+It preserves the other nibble and masks the input to four bits.
+*/
 pub fn replace_nibble(byte: u8, digit: u8, low: bool) -> u8 {
     if low {
         (byte & 0xf0) | (digit & 15)
@@ -694,10 +906,18 @@ pub fn replace_nibble(byte: u8, digit: u8, low: bool) -> u8 {
 }
 
 #[cfg(test)]
+/*
+This test-only wrapper renders one standard Hex row with the default delimiter.
+Unit tests compare the result with the recovered terminal format.
+*/
 pub fn hex_line(data: &[u8], offset: u64) -> String {
     hex_line_with_delimiter(data, offset, '-')
 }
 
+/*
+This formatter builds one address, hexadecimal, and CP437 preview row.
+The native u64 address stays visible even when the data slice has no matching usize position.
+*/
 fn hex_line_with_delimiter(data: &[u8], offset: u64, delimiter: char) -> String {
     let mut line = format!(" {offset:08X}:  ");
     let data = usize::try_from(offset)
@@ -719,6 +939,10 @@ fn hex_line_with_delimiter(data: &[u8], offset: u64, delimiter: char) -> String 
     line
 }
 
+/*
+This helper finds the first byte of the Text line that contains the requested offset.
+It searches the buffered prefix for the final configured delimiter.
+*/
 fn text_start(data: &[u8], offset: usize, delimiter: &[u8]) -> usize {
     data[..offset]
         .windows(delimiter.len())
@@ -726,6 +950,11 @@ fn text_start(data: &[u8], offset: usize, delimiter: &[u8]) -> usize {
         .map_or(0, |pos| pos + delimiter.len())
 }
 
+/*
+This formatter reads one buffered Text line from a checked start position.
+It stops at the configured delimiter or width and can expand tabs to eight-column boundaries.
+The returned next position feeds the following visible row.
+*/
 fn text_line(
     data: &[u8],
     start: usize,
@@ -760,6 +989,10 @@ fn text_line(
     (line, pos)
 }
 
+/*
+This conversion maps each byte to the established CP437 display character.
+ASCII stays direct, while fixed tables provide control glyphs and high characters.
+*/
 pub fn cp437(byte: u8) -> char {
     const LOW: &str = " ☺☻♥♦♣♠•◘○◙♂♀♪♫☼►◄↕‼¶§▬↨↑↓→←∟↔▲▼";
     const HIGH: &str = "ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■\u{a0}";
@@ -773,10 +1006,22 @@ pub fn cp437(byte: u8) -> char {
 
 #[cfg(test)]
 mod tests {
+    /*
+    These tests verify buffered view behavior, raw models, edit history, and presentation helpers.
+    They use owned in-memory buffers and inspect private accounting within this module.
+    */
     use super::*;
 
+    /*
+    This recovered contract test follows Hex editing, history, navigation, Text lines, and CP437 output.
+    The sequence checks the established buffered behavior through its public methods.
+    */
     #[test]
     fn recovered_editor_contract() {
+        /*
+        First, edit one Hex byte and verify its grouped history state.
+        Cancellation and EOF growth then restore the exact original buffer.
+        */
         let data: Vec<u8> = (0..64).collect();
         let mut editor = Editor::new(data.clone(), Mode::Hex, 0);
         assert_eq!(
@@ -804,6 +1049,10 @@ mod tests {
         assert_eq!(editor.data.len(), 65);
         editor.cancel_edit();
         assert_eq!(editor.data, data);
+        /*
+        Next, check search position, bounded Goto, and basic Hex navigation.
+        These operations use the same offset state that history restores.
+        */
         editor.goto(32, 28);
         let pattern = crate::operations::Pattern::exact(vec![0x21, 0x22]).unwrap();
         assert_eq!(
@@ -817,6 +1066,10 @@ mod tests {
         assert_eq!(editor.offset, 0);
         editor.navigate(Key::Down, 28, 119);
         assert_eq!(editor.offset, 16);
+        /*
+        Finally, verify delimiter lines, tab expansion, clipping, and all CP437 byte mappings.
+        These presentation checks consume the final buffered state without changing it.
+        */
         assert_eq!(
             text_line(b"abc\r\ndef", 0, 119, false, b"\r\n"),
             ("abc".into(), 5)
@@ -831,8 +1084,16 @@ mod tests {
         }
     }
 
+    /*
+    This test verifies that raw-model selection is atomic and overrides normal Code settings.
+    Removing the model restores the underlying width and Real16 selection.
+    */
     #[test]
     fn raw_model_is_atomic_and_auto_restores_the_underlying_mode() {
+        /*
+        First, apply one valid raw model and verify its width and address mapping.
+        The raw model temporarily overrides the normal Real16 setting.
+        */
         let mut editor = Editor::new(vec![0x90, 0xc3], Mode::Code, 0);
         editor.code_bits = 16;
         editor.real_mode = true;
@@ -850,6 +1111,10 @@ mod tests {
             Ok((0x401001, 32))
         );
 
+        /*
+        Next, reject an invalid model and verify that the accepted model stays active.
+        No byte or configuration state changes during the failed selection.
+        */
         assert!(
             editor
                 .set_raw_model(Some(RawModel {
@@ -861,14 +1126,24 @@ mod tests {
         );
         assert_eq!(editor.raw_model, Some(raw));
 
+        /*
+        Finally, remove the raw model and expose the retained normal Code settings.
+        */
         editor.set_raw_model(None).unwrap();
         assert_eq!(editor.raw_model, None);
         assert_eq!(editor.decode_bits(), 16);
         assert!(editor.decode_real_mode());
     }
 
+    /*
+    This test checks empty raw mappings and rejects Hex growth beyond configured address ranges.
+    Each failure preserves bytes, model, cursor, nibble state, and dirty state.
+    */
     #[test]
     fn raw_model_checks_empty_buffers_and_hex_growth_without_mutation() {
+        /*
+        First, verify that empty raw metadata cannot map a nonexistent byte.
+        */
         let mut empty = Editor::new(Vec::new(), Mode::Code, 0);
         empty
             .set_raw_model(Some(RawModel {
@@ -883,6 +1158,10 @@ mod tests {
                 .is_err()
         );
 
+        /*
+        Next, test 32-bit and 64-bit address overflow during one-byte Hex growth.
+        Every rejected input keeps its complete editor state.
+        */
         for (base, bits) in [(u64::from(u32::MAX), 32), (u64::MAX, 64)] {
             let mut editor = Editor::new(vec![0x90], Mode::Hex, 1);
             let raw = RawModel {
@@ -903,8 +1182,16 @@ mod tests {
         }
     }
 
+    /*
+    This test joins two Hex nibbles and verifies exact cursor restoration through undo and redo.
+    It also checks that a byte-identical replacement preserves redo history.
+    */
     #[test]
     fn edit_history_groups_nibbles_and_preserves_redo_on_noop() {
+        /*
+        First, complete one two-nibble byte and verify undo and redo cursor state.
+        A byte-identical operation after undo must retain the redo record.
+        */
         let mut editor = Editor::new(vec![0x12], Mode::Hex, 0);
         editor.toggle_edit().unwrap();
 
@@ -928,6 +1215,10 @@ mod tests {
             (1, false, true)
         );
 
+        /*
+        Next, undo and redo an incomplete first nibble.
+        A later low nibble creates a separate record after the history action closes grouping.
+        */
         editor.cancel_edit();
         editor.goto(0, 1);
         editor.toggle_edit().unwrap();
@@ -950,8 +1241,15 @@ mod tests {
         assert_eq!((editor.data[0], editor.low_nibble), (0x12, false));
     }
 
+    /*
+    This test restores structural growth, dirty state, and cursors through buffered history.
+    A raw-model redo failure remains atomic, while a later real edit clears redo.
+    */
     #[test]
     fn range_history_handles_growth_dirty_state_and_raw_redo_rejection() {
+        /*
+        First, grow the buffer and verify restored length, cursor, viewport, and dirty state.
+        */
         let mut editor = Editor::new(vec![0x90], Mode::Code, 1);
         editor.toggle_edit().unwrap();
         editor.replace_bytes(1, vec![0xc3], (2, 1)).unwrap();
@@ -961,6 +1259,10 @@ mod tests {
         assert!(editor.undo().unwrap());
         assert_eq!(editor.data, [0x90]);
         assert_eq!((editor.offset, editor.top, editor.dirty), (1, 0, false));
+        /*
+        Next, make the pending redo invalid under a raw address model.
+        The failure keeps the complete current editor and redo state.
+        */
         editor
             .set_raw_model(Some(RawModel {
                 base: u64::from(u32::MAX),
@@ -974,6 +1276,10 @@ mod tests {
             (editor.data.clone(), editor.offset, editor.top, editor.dirty),
             state
         );
+        /*
+        Finally, restore normal configuration, apply redo, and verify new-edit invalidation.
+        Returning bytes to the baseline also clears dirty state.
+        */
         editor.set_raw_model(None).unwrap();
         assert!(editor.redo().unwrap());
         assert_eq!(editor.data, [0x90, 0xc3]);
@@ -989,8 +1295,16 @@ mod tests {
         assert!(!editor.redo().unwrap());
     }
 
+    /*
+    This test separates interrupted Hex groups and retains only the newest 256 records.
+    Cancellation restores original bytes and clears the retained history.
+    */
     #[test]
     fn edit_history_interrupts_hex_groups_and_evicts_oldest_records() {
+        /*
+        First, a separate replacement interrupts an incomplete nibble group.
+        Two undo actions then restore the grouped and original byte states.
+        */
         let mut editor = Editor::new(vec![0x12], Mode::Hex, 0);
         editor.toggle_edit().unwrap();
         editor.hex_digit('f').unwrap();
@@ -1002,6 +1316,10 @@ mod tests {
         assert!(editor.undo().unwrap());
         assert_eq!((editor.data[0], editor.low_nibble), (0x12, false));
 
+        /*
+        Next, create 257 operations and verify that only the newest 256 remain.
+        Cancellation then restores the original baseline and removes all history.
+        */
         editor.cancel_edit();
         editor.toggle_edit().unwrap();
         for index in 0..=EDIT_HISTORY_LIMIT {
@@ -1021,8 +1339,16 @@ mod tests {
         assert!(!editor.undo().unwrap());
     }
 
+    /*
+    This test applies the buffered 130 MiB history budget through eviction and refusal.
+    An oversized operation preserves bytes, cursor state, dirty state, and the redo branch.
+    */
     #[test]
     fn history_byte_limit_evicts_and_rejects_edits_atomically() {
+        /*
+        First, equal-size large records force byte-based eviction below the 256-record limit.
+        Undo reaches the oldest retained byte state and cannot reach the original state.
+        */
         let size = EDIT_HISTORY_BYTES / 4;
         let mut editor = Editor::new(vec![0; size], Mode::Hex, 0);
         editor.toggle_edit().unwrap();
@@ -1038,6 +1364,10 @@ mod tests {
         assert!(!editor.undo().unwrap());
         drop(editor);
 
+        /*
+        Next, an individually oversized record fails while one redo record exists.
+        The failure preserves bytes, cursor state, dirty state, and both history branches.
+        */
         let size = EDIT_HISTORY_BYTES / 2 + 1;
         let mut editor = Editor::new(vec![0; size], Mode::Hex, 0);
         editor.toggle_edit().unwrap();

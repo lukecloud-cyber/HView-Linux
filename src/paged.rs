@@ -4,7 +4,7 @@ The paged form reads small windows at u64 offsets.
 The handle keeps the opened source stable when its pathname changes.
 Metadata checks reject detected source changes before or after each read.
 */
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
@@ -22,6 +22,8 @@ The metadata check then rejects every nonregular source.
 pub(crate) const BUFFERED_FILE_LIMIT: u64 = 64 * 1024 * 1024;
 pub(crate) const MAX_READ_BYTES: usize = 64 * 1024;
 const BLOCK_BYTES: usize = 64 * 1024 * 1024;
+const EDIT_HISTORY_LIMIT: usize = 256;
+const EDIT_HISTORY_BYTES: usize = 130 * 1024 * 1024;
 const CHANGED_BYTES_LIMIT: usize = 65 * 1024 * 1024;
 const CHANGED_RANGES_LIMIT: usize = 4096;
 const O_NONBLOCK: i32 = 0o4000;
@@ -115,6 +117,32 @@ Splice planning creates a complete replacement layout before state changes.
 struct Layout {
     spans: Vec<DataSpan>,
     len: u64,
+}
+
+/*
+The edit cursor stores all Hex position state for one operation boundary.
+Undo restores the before cursor, and redo restores the after cursor.
+The u64 fields retain positions above the process address range.
+*/
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PagedEditCursor {
+    pub(crate) offset: u64,
+    pub(crate) top: u64,
+    pub(crate) low_nibble: bool,
+}
+
+/*
+One history record stores the layout that is not currently active.
+Undo and redo swap this alternate layout with the current layout.
+Hex grouping retains the first cursor and updates the final cursor.
+*/
+struct EditRecord {
+    alternate: Layout,
+    before_cursor: PagedEditCursor,
+    after_cursor: PagedEditCursor,
+    hex_group: bool,
+    group_start: u64,
+    group_len: usize,
 }
 
 /*
@@ -212,6 +240,7 @@ pub(crate) struct ReadWindow {
 /*
 PagedFile owns one read-only descriptor, its native path, and open-time metadata.
 Its layout maps the current logical bytes to source and memory spans.
+The history owns alternate layouts while edit mode is active.
 The component stores no display text or pathname conversion.
 */
 pub(crate) struct PagedFile {
@@ -219,6 +248,10 @@ pub(crate) struct PagedFile {
     path: PathBuf,
     stamp: SourceStamp,
     layout: Layout,
+    editing: bool,
+    undo_history: VecDeque<EditRecord>,
+    redo_history: VecDeque<EditRecord>,
+    history_bytes: usize,
 }
 
 /*
@@ -251,14 +284,20 @@ impl PagedFile {
             })
             .into_iter()
             .collect();
+        let layout = Layout {
+            spans,
+            len: stamp.len,
+        };
+        let history_bytes = Self::layouts_cost(std::iter::once(&layout))?;
         Ok(Self {
             file,
             path: path.to_owned(),
             stamp,
-            layout: Layout {
-                spans,
-                len: stamp.len,
-            },
+            layout,
+            editing: false,
+            undo_history: VecDeque::new(),
+            redo_history: VecDeque::new(),
+            history_bytes,
         })
     }
 
@@ -678,28 +717,36 @@ impl PagedFile {
     }
 
     /*
-    This accounting counts span storage and each immutable allocation one time.
+    This accounting combines current and alternate layouts for one history state.
+    It counts every span vector capacity and each immutable allocation one time.
     Shared slices count their complete backing allocation instead of visible bytes.
-    Fallible set reservation prevents hidden allocation failure during limit checks.
+    Fallible set reservation occurs before each new allocation identity is inserted.
     */
-    fn layout_cost(layout: &Layout) -> io::Result<usize> {
-        let descriptors = layout
-            .spans
-            .capacity()
-            .checked_mul(std::mem::size_of::<DataSpan>())
-            .ok_or_else(|| io::Error::other("The paged edit memory cost is too large."))?;
+    fn layouts_cost<'a>(layouts: impl IntoIterator<Item = &'a Layout>) -> io::Result<usize> {
         let mut allocations = HashSet::new();
-        allocations
-            .try_reserve(layout.spans.len())
-            .map_err(|_| io::Error::other("Cannot allocate the paged edit memory check."))?;
-        let mut cost = descriptors;
-        for span in &layout.spans {
-            if let DataSpan::Memory { bytes, .. } = span {
-                let identity = Arc::as_ptr(bytes) as *const u8 as usize;
-                if allocations.insert(identity) {
-                    cost = cost.checked_add(bytes.len()).ok_or_else(|| {
-                        io::Error::other("The paged edit memory cost is too large.")
-                    })?;
+        let mut cost = 0_usize;
+        for layout in layouts {
+            let descriptors = layout
+                .spans
+                .capacity()
+                .checked_mul(std::mem::size_of::<DataSpan>())
+                .ok_or_else(|| io::Error::other("The paged edit memory cost is too large."))?;
+            cost = cost
+                .checked_add(descriptors)
+                .ok_or_else(|| io::Error::other("The paged edit memory cost is too large."))?;
+            for span in &layout.spans {
+                if let DataSpan::Memory { bytes, .. } = span {
+                    let identity = Arc::as_ptr(bytes) as *const u8 as usize;
+                    if !allocations.contains(&identity) {
+                        allocations.try_reserve(1).map_err(|_| {
+                            io::Error::other("Cannot allocate the paged edit memory check.")
+                        })?;
+                    }
+                    if allocations.insert(identity) {
+                        cost = cost.checked_add(bytes.len()).ok_or_else(|| {
+                            io::Error::other("The paged edit memory cost is too large.")
+                        })?;
+                    }
                 }
             }
         }
@@ -707,10 +754,149 @@ impl PagedFile {
     }
 
     /*
-    This operation applies one replacement, insertion, or deletion to the logical layout.
-    All range, allocation, span, and live-memory checks finish before layout assignment.
-    Equal-byte edits return false and preserve the exact current layout.
-    L03.2 will add cursor state and operation history to this entry point.
+    This check applies the 65 MiB bound to one proposed current layout.
+    A failure leaves the current layout and both history stacks unchanged.
+    */
+    fn validate_live(planned: &Layout) -> io::Result<()> {
+        if Self::layouts_cost(std::iter::once(planned))? > CHANGED_BYTES_LIMIT {
+            return Err(io::Error::other(
+                "Paged source and memory spans cannot exceed 65 MiB.",
+            ));
+        }
+        Ok(())
+    }
+
+    /*
+    A grouped second nibble replaces only the current layout in retained history.
+    This function calculates its accepted total before the group record changes.
+    */
+    fn grouped_history_cost(&self, planned: &Layout) -> io::Result<usize> {
+        Self::validate_live(planned)?;
+        let cost = Self::layouts_cost(
+            std::iter::once(planned)
+                .chain(self.undo_history.iter().map(|record| &record.alternate))
+                .chain(self.redo_history.iter().map(|record| &record.alternate)),
+        )?;
+        if cost > EDIT_HISTORY_BYTES {
+            return Err(io::Error::other(
+                "The paged edit exceeds the 130 MiB retained history limit.",
+            ));
+        }
+        Ok(cost)
+    }
+
+    /*
+    A new operation adds the current layout as one alternate undo layout.
+    This planner reserves record storage and finds the smallest oldest-record eviction.
+    Redo layouts are absent from the candidate because a real new operation clears redo.
+    It returns the accepted byte cost so no fallible refresh follows mutation.
+    */
+    fn prepare_new_history(&mut self, planned: &Layout) -> io::Result<(usize, usize)> {
+        Self::validate_live(planned)?;
+        self.undo_history
+            .try_reserve(1)
+            .map_err(|_| io::Error::other("Cannot allocate the paged edit history."))?;
+        for drop_count in 0..=self.undo_history.len() {
+            let records = self.undo_history.len() - drop_count + 1;
+            if records > EDIT_HISTORY_LIMIT {
+                continue;
+            }
+            let cost = Self::layouts_cost(
+                std::iter::once(planned)
+                    .chain(std::iter::once(&self.layout))
+                    .chain(
+                        self.undo_history
+                            .iter()
+                            .skip(drop_count)
+                            .map(|record| &record.alternate),
+                    ),
+            )?;
+            if cost <= EDIT_HISTORY_BYTES {
+                return Ok((drop_count, cost));
+            }
+        }
+        Err(io::Error::other(
+            "The paged edit exceeds the 130 MiB retained history limit.",
+        ))
+    }
+
+    /*
+    These queries expose edit mode and logical changes to the future viewer connection.
+    A source-only normalized layout means that no logical change remains.
+    */
+    #[allow(dead_code)]
+    pub(crate) fn editing(&self) -> bool {
+        self.editing
+    }
+
+    /*
+    This query compares the current layout with its normalized source baseline.
+    Undo and cancellation use the same layout shape to report no remaining change.
+    */
+    #[allow(dead_code)]
+    pub(crate) fn has_changes(&self) -> bool {
+        self.layout.len != self.stamp.len
+            || self.layout.spans.len() != usize::from(self.stamp.len != 0)
+            || self.layout.spans.first().is_some_and(
+                |span| !matches!(span, DataSpan::Source { start: 0, len } if *len == self.stamp.len),
+            )
+    }
+
+    /*
+    Begin edit validates the stable source before it changes the mode flag.
+    The existing source layout becomes the cancellation baseline.
+    */
+    #[allow(dead_code)]
+    pub(crate) fn begin_edit(&mut self) -> io::Result<()> {
+        self.validate()?;
+        self.editing = true;
+        Ok(())
+    }
+
+    /*
+    This method stops a pending two-nibble group at a user-action boundary.
+    The current record remains a normal complete undo record.
+    */
+    #[allow(dead_code)]
+    pub(crate) fn end_hex_group(&mut self) {
+        if let Some(record) = self.undo_history.back_mut() {
+            record.hex_group = false;
+        }
+    }
+
+    /*
+    Fixed replacement is a small wrapper around the structural splice transaction.
+    L03.3 will use this route for paged Hex overtype.
+    */
+    #[allow(dead_code)]
+    pub(crate) fn replace_bytes(
+        &mut self,
+        start: u64,
+        replacement: &[u8],
+        before_cursor: PagedEditCursor,
+        after_cursor: PagedEditCursor,
+        hex_group: bool,
+    ) -> io::Result<bool> {
+        if replacement.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "A paged edit must replace at least one byte.",
+            ));
+        }
+        self.splice_bytes(
+            start,
+            replacement.len() as u64,
+            replacement,
+            before_cursor,
+            after_cursor,
+            hex_group,
+        )
+    }
+
+    /*
+    This operation applies one replacement, insertion, or deletion to logical history.
+    All range, allocation, span, live-memory, and history checks precede mutation.
+    Equal-byte edits preserve history unless a second nibble completes its open group.
     */
     #[allow(dead_code)]
     pub(crate) fn splice_bytes(
@@ -718,11 +904,19 @@ impl PagedFile {
         start: u64,
         remove_len: u64,
         replacement: &[u8],
+        before_cursor: PagedEditCursor,
+        after_cursor: PagedEditCursor,
+        hex_group: bool,
     ) -> io::Result<bool> {
         /*
-        First, reject oversized operations and invalid logical ranges.
-        These checks do not allocate replacement storage or change the layout.
+        First, require edit mode and reject oversized or invalid logical ranges.
+        Source validation occurs before operation planning can publish new state.
         */
+        if !self.editing {
+            return Err(io::Error::other(
+                "Start edit mode before you change the file.",
+            ));
+        }
         if remove_len > BLOCK_BYTES as u64 || replacement.len() > BLOCK_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -753,14 +947,32 @@ impl PagedFile {
                     "The edited file length exceeds the supported Linux file-offset range.",
                 )
             })?;
+        self.validate()?;
 
         /*
-        Next, preserve exact state for a logical no-op.
-        A real operation receives one fully checked candidate layout.
+        Next, detect a no-op before allocating a candidate layout.
+        A matching second nibble closes its current record and advances its final cursor.
+        Other no-ops retain both history branches and every cursor.
         */
         if remove_len == replacement_len && self.range_matches(start, replacement)? {
+            if !hex_group
+                && let Some(record) = self.undo_history.back_mut().filter(|record| {
+                    record.hex_group
+                        && record.group_start == start
+                        && record.group_len == replacement.len()
+                })
+            {
+                record.after_cursor = after_cursor;
+                record.hex_group = false;
+            }
             return Ok(false);
         }
+
+        /*
+        Next, create the complete candidate and identify a valid history plan.
+        A real matching second nibble updates one existing record.
+        Other real operations prepare one new record and remove the redo branch.
+        */
         let replacement_span = self.replacement_span(start, remove_len, replacement)?;
         let planned = Self::plan_splice(
             &self.layout,
@@ -769,19 +981,111 @@ impl PagedFile {
             replacement_span,
             replacement_len,
         )?;
-        if Self::layout_cost(&planned)? > CHANGED_BYTES_LIMIT {
-            return Err(io::Error::other(
-                "Paged source and memory spans cannot exceed 65 MiB.",
-            ));
+        let grouped = !hex_group
+            && self.undo_history.back().is_some_and(|record| {
+                record.hex_group
+                    && record.group_start == start
+                    && record.group_len == replacement.len()
+                    && remove_len == replacement_len
+            });
+        if grouped {
+            let history_bytes = self.grouped_history_cost(&planned)?;
+            self.validate()?;
+            self.layout = planned;
+            let record = self.undo_history.back_mut().unwrap();
+            record.after_cursor = after_cursor;
+            record.hex_group = false;
+            self.history_bytes = history_bytes;
+            return Ok(true);
         }
 
-        /*
-        Finally, validate the stable source after all candidate work.
-        Assignment publishes the candidate only after every required check passes.
-        */
+        let (drop_count, history_bytes) = self.prepare_new_history(&planned)?;
         self.validate()?;
-        self.layout = planned;
+
+        /*
+        Finally, apply the accepted plan with no remaining fallible operation.
+        Redo clearing, oldest-record eviction, layout replacement, and record insertion commit together.
+        */
+        self.redo_history.clear();
+        for _ in 0..drop_count {
+            self.undo_history.pop_front();
+        }
+        let alternate = std::mem::replace(&mut self.layout, planned);
+        self.undo_history.push_back(EditRecord {
+            alternate,
+            before_cursor,
+            after_cursor,
+            hex_group,
+            group_start: start,
+            group_len: replacement.len(),
+        });
+        self.history_bytes = history_bytes;
         Ok(true)
+    }
+
+    /*
+    Undo validates the source and reserves the redo destination before mutation.
+    It closes any nibble group, swaps one alternate layout, and returns the before cursor.
+    The combined history cost does not change during this ownership transfer.
+    */
+    #[allow(dead_code)]
+    pub(crate) fn undo(&mut self) -> io::Result<Option<PagedEditCursor>> {
+        self.validate()?;
+        self.redo_history
+            .try_reserve(1)
+            .map_err(|_| io::Error::other("Cannot allocate the paged edit history."))?;
+        let Some(mut record) = self.undo_history.pop_back() else {
+            return Ok(None);
+        };
+        record.hex_group = false;
+        std::mem::swap(&mut self.layout, &mut record.alternate);
+        let cursor = record.before_cursor;
+        self.redo_history.push_back(record);
+        Ok(Some(cursor))
+    }
+
+    /*
+    Redo validates the source and reserves the undo destination before mutation.
+    It swaps one alternate layout and returns the recorded after cursor.
+    The combined history cost stays at its accepted value.
+    */
+    #[allow(dead_code)]
+    pub(crate) fn redo(&mut self) -> io::Result<Option<PagedEditCursor>> {
+        self.validate()?;
+        self.undo_history
+            .try_reserve(1)
+            .map_err(|_| io::Error::other("Cannot allocate the paged edit history."))?;
+        let Some(mut record) = self.redo_history.pop_back() else {
+            return Ok(None);
+        };
+        std::mem::swap(&mut self.layout, &mut record.alternate);
+        let cursor = record.after_cursor;
+        self.undo_history.push_back(record);
+        Ok(Some(cursor))
+    }
+
+    /*
+    Cancellation restores one normalized source layout without source validation.
+    The action stays available after source changes or history evictions.
+    It clears both history branches and leaves the captured source stamp unchanged.
+    */
+    #[allow(dead_code)]
+    pub(crate) fn cancel_edit(&mut self) {
+        let spans = (self.stamp.len != 0)
+            .then_some(DataSpan::Source {
+                start: 0,
+                len: self.stamp.len,
+            })
+            .into_iter()
+            .collect();
+        self.layout = Layout {
+            spans,
+            len: self.stamp.len,
+        };
+        self.undo_history.clear();
+        self.redo_history.clear();
+        self.history_bytes = self.layout.spans.capacity() * std::mem::size_of::<DataSpan>();
+        self.editing = false;
     }
 }
 
@@ -809,7 +1113,8 @@ mod tests {
     */
     use super::{
         BLOCK_BYTES, BUFFERED_FILE_LIMIT, CHANGED_BYTES_LIMIT, CHANGED_RANGES_LIMIT, DataSpan,
-        Layout, MAX_READ_BYTES, OpenedSource, PagedFile, open_source,
+        EDIT_HISTORY_BYTES, EDIT_HISTORY_LIMIT, EditRecord, Layout, MAX_READ_BYTES, OpenedSource,
+        PagedEditCursor, PagedFile, open_source,
     };
     use std::ffi::CString;
     use std::fs::{self, File, FileTimes, OpenOptions};
@@ -835,6 +1140,10 @@ mod tests {
     */
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
+    /*
+    One fixture owns a unique disposable directory for its test lifetime.
+    The path supplies all related file and FIFO names to later helpers.
+    */
     struct Fixture {
         path: PathBuf,
     }
@@ -945,6 +1254,37 @@ mod tests {
     }
 
     /*
+    This helper creates exact cursor values for history tests.
+    The offset, viewport, and nibble fields remain visible in returned undo results.
+    */
+    fn cursor(offset: u64, top: u64, low_nibble: bool) -> PagedEditCursor {
+        PagedEditCursor {
+            offset,
+            top,
+            low_nibble,
+        }
+    }
+
+    /*
+    Existing logical-span tests use this history-aware splice adapter.
+    The first call starts edit mode and each call records one independent operation.
+    L03.2 tests call the full entry directly when cursor or grouping behavior matters.
+    */
+    fn splice(
+        source: &mut PagedFile,
+        start: u64,
+        remove_len: u64,
+        replacement: &[u8],
+    ) -> io::Result<bool> {
+        if !source.editing() {
+            source.begin_edit()?;
+        }
+        let before = cursor(start, start, false);
+        let after = cursor(start + replacement.len() as u64, start, false);
+        source.splice_bytes(start, remove_len, replacement, before, after, false)
+    }
+
+    /*
     These checks exercise the public splice entry for replacement, insertion, and deletion.
     Restoration bytes map back to one normalized source span.
     Equal bytes preserve the exact current layout and return a no-op result.
@@ -956,23 +1296,24 @@ mod tests {
         fs::write(&path, b"0123456789")?;
         let mut source = PagedFile::open(&path)?;
 
-        assert!(source.splice_bytes(2, 3, b"AB")?);
+        assert!(splice(&mut source, 2, 3, b"AB")?);
         assert_eq!(read_all(&source)?, b"01AB56789");
-        assert!(source.splice_bytes(source.len(), 0, b"XYZ")?);
+        let end = source.len();
+        assert!(splice(&mut source, end, 0, b"XYZ")?);
         assert_eq!(read_all(&source)?, b"01AB56789XYZ");
-        assert!(source.splice_bytes(4, 5, b"")?);
+        assert!(splice(&mut source, 4, 5, b"")?);
         assert_eq!(read_all(&source)?, b"01ABXYZ");
 
         let signature = layout_signature(&source.layout);
-        assert!(!source.splice_bytes(2, 2, b"AB")?);
+        assert!(!splice(&mut source, 2, 2, b"AB")?);
         assert_eq!(layout_signature(&source.layout), signature);
 
         let restore_path = fixture.file("restore.bin");
         fs::write(&restore_path, b"0123456789")?;
         let mut restored = PagedFile::open(&restore_path)?;
-        assert!(restored.splice_bytes(2, 2, b"XY")?);
+        assert!(splice(&mut restored, 2, 2, b"XY")?);
         assert_eq!(restored.layout.spans.len(), 3);
-        assert!(restored.splice_bytes(2, 2, b"23")?);
+        assert!(splice(&mut restored, 2, 2, b"23")?);
         assert_eq!(read_all(&restored)?, b"0123456789");
         assert_eq!(restored.layout.spans.len(), 1);
         assert!(matches!(
@@ -994,17 +1335,17 @@ mod tests {
         File::create(&path)?;
         let mut source = PagedFile::open(&path)?;
 
-        assert!(!source.splice_bytes(0, 0, b"")?);
-        assert!(source.splice_bytes(0, 0, b"abc")?);
-        assert!(source.splice_bytes(3, 0, b"def")?);
+        assert!(!splice(&mut source, 0, 0, b"")?);
+        assert!(splice(&mut source, 0, 0, b"abc")?);
+        assert!(splice(&mut source, 3, 0, b"def")?);
         assert_eq!(read_all(&source)?, b"abcdef");
-        assert!(source.splice_bytes(0, 6, b"")?);
+        assert!(splice(&mut source, 0, 6, b"")?);
         assert_eq!(source.len(), 0);
         assert!(source.layout.spans.is_empty());
 
         let signature = layout_signature(&source.layout);
-        assert!(source.splice_bytes(1, 0, b"x").is_err());
-        assert!(source.splice_bytes(0, 1, b"").is_err());
+        assert!(splice(&mut source, 1, 0, b"x").is_err());
+        assert!(splice(&mut source, 0, 1, b"").is_err());
         assert_eq!(source.len(), 0);
         assert_eq!(layout_signature(&source.layout), signature);
         Ok(())
@@ -1025,7 +1366,7 @@ mod tests {
         fs::write(&path, &original)?;
         let mut source = PagedFile::open(&path)?;
         let start = MAX_READ_BYTES as u64 - 4;
-        assert!(source.splice_bytes(start, 8, b"changed!")?);
+        assert!(splice(&mut source, start, 8, b"changed!")?);
 
         let mut expected = original.clone();
         expected.splice(
@@ -1038,7 +1379,7 @@ mod tests {
             &expected[start as usize - 4..start as usize + 12]
         );
         let prefix = source.read_window(0, 8)?;
-        assert!(source.splice_bytes(1, 2, b"later")?);
+        assert!(splice(&mut source, 1, 2, b"later")?);
         drop(source);
         assert_eq!(&*prefix.bytes, &original[..8]);
         Ok(())
@@ -1136,7 +1477,12 @@ mod tests {
         for &(start, remove, replacement) in operations {
             let start = start.min(oracle.len());
             let remove = remove.min(oracle.len() - start);
-            assert!(source.splice_bytes(start as u64, remove as u64, replacement)?);
+            assert!(splice(
+                &mut source,
+                start as u64,
+                remove as u64,
+                replacement,
+            )?);
             oracle.splice(start..start + remove, replacement.iter().copied());
             assert_eq!(source.len(), oracle.len() as u64);
             assert_eq!(read_all(&source)?, oracle);
@@ -1255,7 +1601,7 @@ mod tests {
         let capacity = source.layout.spans.capacity();
         let signature = layout_signature(&source.layout);
         let bytes = source.read_window(0, 8)?.bytes;
-        assert!(source.splice_bytes(1, 0, b"x").is_err());
+        assert!(splice(&mut source, 1, 0, b"x").is_err());
         assert_eq!(source.len(), length);
         assert_eq!(source.layout.spans.capacity(), capacity);
         assert_eq!(layout_signature(&source.layout), signature);
@@ -1285,7 +1631,7 @@ mod tests {
         ];
         let layout = Layout { spans, len: 3 };
         assert_eq!(
-            PagedFile::layout_cost(&layout)?,
+            PagedFile::layouts_cost(std::iter::once(&layout))?,
             layout.spans.capacity() * std::mem::size_of::<DataSpan>() + shared.len()
         );
 
@@ -1300,7 +1646,10 @@ mod tests {
             spans: exact_spans,
             len: exact_len as u64,
         };
-        assert_eq!(PagedFile::layout_cost(&exact)?, CHANGED_BYTES_LIMIT);
+        assert_eq!(
+            PagedFile::layouts_cost(std::iter::once(&exact))?,
+            CHANGED_BYTES_LIMIT
+        );
         drop(exact);
 
         let refused_spans = vec![DataSpan::Memory {
@@ -1312,7 +1661,7 @@ mod tests {
             spans: refused_spans,
             len: exact_len as u64 + 1,
         };
-        assert!(PagedFile::layout_cost(&refused)? > CHANGED_BYTES_LIMIT);
+        assert!(PagedFile::layouts_cost(std::iter::once(&refused))? > CHANGED_BYTES_LIMIT);
         Ok(())
     }
 
@@ -1328,7 +1677,7 @@ mod tests {
         File::create(&empty_path)?;
         let mut source = PagedFile::open(&empty_path)?;
         let replacement = vec![0x5a_u8; BLOCK_BYTES];
-        assert!(source.splice_bytes(0, 0, &replacement)?);
+        assert!(splice(&mut source, 0, 0, &replacement)?);
         drop(replacement);
         assert_eq!(source.len(), BLOCK_BYTES as u64);
         assert_eq!(&*source.read_window(0, 1)?.bytes, &[0x5a]);
@@ -1337,15 +1686,17 @@ mod tests {
             &[0x5a]
         );
 
-        assert!(source.splice_bytes(0, BLOCK_BYTES as u64 - 1, b"")?);
+        assert!(splice(&mut source, 0, BLOCK_BYTES as u64 - 1, b"",)?);
         assert_eq!(source.len(), 1);
         assert_eq!(&*source.read_window(0, 1)?.bytes, &[0x5a]);
         let signature = layout_signature(&source.layout);
         let capacity = source.layout.spans.capacity();
+        let undo_len = source.undo_history.len();
+        let redo_len = source.redo_history.len();
+        let history_bytes = source.history_bytes;
         let extra = vec![0x33_u8; 1024 * 1024];
         assert!(
-            source
-                .splice_bytes(source.len(), 0, &extra)
+            splice(&mut source, 1, 0, &extra)
                 .unwrap_err()
                 .to_string()
                 .contains("65 MiB")
@@ -1354,17 +1705,23 @@ mod tests {
         assert_eq!(source.layout.spans.capacity(), capacity);
         assert_eq!(layout_signature(&source.layout), signature);
         assert_eq!(&*source.read_window(0, 1)?.bytes, &[0x5a]);
+        assert_eq!(source.undo_history.len(), undo_len);
+        assert_eq!(source.redo_history.len(), redo_len);
+        assert_eq!(source.history_bytes, history_bytes);
 
         let too_large = vec![0_u8; BLOCK_BYTES + 1];
-        assert!(source.splice_bytes(0, 0, &too_large).is_err());
-        assert!(source.splice_bytes(0, BLOCK_BYTES as u64 + 1, b"").is_err());
+        assert!(splice(&mut source, 0, 0, &too_large).is_err());
+        assert!(splice(&mut source, 0, BLOCK_BYTES as u64 + 1, b"").is_err());
         assert_eq!(source.layout.spans.capacity(), capacity);
         assert_eq!(layout_signature(&source.layout), signature);
+        assert_eq!(source.undo_history.len(), undo_len);
+        assert_eq!(source.redo_history.len(), redo_len);
+        assert_eq!(source.history_bytes, history_bytes);
 
         let removal_path = fixture.file("removal.bin");
         sparse_file(&removal_path, BLOCK_BYTES as u64 + 2, &[])?;
         let mut removal = PagedFile::open(&removal_path)?;
-        assert!(removal.splice_bytes(0, BLOCK_BYTES as u64, b"")?);
+        assert!(splice(&mut removal, 0, BLOCK_BYTES as u64, b"")?);
         assert_eq!(removal.len(), 2);
         Ok(())
     }
@@ -1372,6 +1729,7 @@ mod tests {
     /*
     A sparse source keeps logical edits and reads above the 4 GiB boundary.
     The replacement changes only one bounded memory span near the high offset.
+    Undo and redo return high cursor fields and restore the related high bytes.
     */
     #[test]
     fn logical_spans_keep_offsets_above_four_gib() -> io::Result<()> {
@@ -1381,9 +1739,13 @@ mod tests {
         sparse_file(&path, high + 8, &[(high, b"original")])?;
         let mut source = PagedFile::open(&path)?;
 
-        assert!(source.splice_bytes(high + 1, 3, b"XYZ")?);
+        assert!(splice(&mut source, high + 1, 3, b"XYZ")?);
         assert_eq!(&*source.read_window(high, 8)?.bytes, b"oXYZinal");
         assert_eq!(source.len(), high + 8);
+        assert_eq!(source.undo()?, Some(cursor(high + 1, high + 1, false)));
+        assert_eq!(&*source.read_window(high, 8)?.bytes, b"original");
+        assert_eq!(source.redo()?, Some(cursor(high + 4, high + 1, false)));
+        assert_eq!(&*source.read_window(high, 8)?.bytes, b"oXYZinal");
         Ok(())
     }
 
@@ -1397,7 +1759,7 @@ mod tests {
         let changed_path = fixture.file("changed.bin");
         fs::write(&changed_path, b"abcdef")?;
         let mut changed = PagedFile::open(&changed_path)?;
-        assert!(changed.splice_bytes(1, 1, b"X")?);
+        assert!(splice(&mut changed, 1, 1, b"X")?);
         let file = OpenOptions::new().write(true).open(&changed_path)?;
         file.set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1)))?;
         assert!(changed.read_window(1, 1).is_err());
@@ -1406,10 +1768,337 @@ mod tests {
         let old_path = fixture.file("old.bin");
         fs::write(&replaced_path, b"abcdef")?;
         let mut replaced = PagedFile::open(&replaced_path)?;
-        assert!(replaced.splice_bytes(1, 1, b"Y")?);
+        assert!(splice(&mut replaced, 1, 1, b"Y")?);
         fs::rename(&replaced_path, &old_path)?;
         fs::write(&replaced_path, b"uvwxyz")?;
         assert!(replaced.read_window(1, 1).is_err());
+        Ok(())
+    }
+
+    /*
+    Structural history swaps complete layouts and returns exact cursor snapshots.
+    The snapshots keep u64 values that are larger than the fixture file.
+    Undo restores the original length, and redo restores the expanded length.
+    */
+    #[test]
+    fn structural_history_restores_lengths_and_high_cursors() -> io::Result<()> {
+        let fixture = Fixture::new("structural-history")?;
+        let path = fixture.file("source.bin");
+        fs::write(&path, b"abcdef")?;
+        let mut source = PagedFile::open(&path)?;
+        source.begin_edit()?;
+        let before = cursor(u64::from(u32::MAX) + 17, u64::from(u32::MAX), true);
+        let after = cursor(u64::MAX - 1, u64::MAX - 32, false);
+
+        assert!(source.splice_bytes(1, 2, b"WXYZ", before, after, false)?);
+        assert_eq!(read_all(&source)?, b"aWXYZdef");
+        assert!(source.has_changes());
+        assert_eq!(source.undo()?, Some(before));
+        assert_eq!(read_all(&source)?, b"abcdef");
+        assert!(!source.has_changes());
+        assert_eq!(source.redo()?, Some(after));
+        assert_eq!(read_all(&source)?, b"aWXYZdef");
+        assert!(source.has_changes());
+        Ok(())
+    }
+
+    /*
+    Two real Hex nibbles update one record and retain its first and final cursors.
+    A matching second nibble also closes the group without adding a record.
+    An explicit group boundary makes the next nibble a separate operation.
+    */
+    #[test]
+    fn hex_groups_handle_real_noop_and_interrupted_second_nibbles() -> io::Result<()> {
+        let fixture = Fixture::new("hex-groups")?;
+        let path = fixture.file("source.bin");
+        fs::write(&path, [0x12])?;
+        let mut source = PagedFile::open(&path)?;
+        source.begin_edit()?;
+        let first = cursor(0, 0, false);
+        let middle = cursor(0, 0, true);
+        let final_cursor = cursor(1, 0, false);
+
+        assert!(source.replace_bytes(0, &[0xf2], first, middle, true)?);
+        assert!(source.replace_bytes(0, &[0xf4], middle, final_cursor, false)?);
+        assert_eq!(source.undo_history.len(), 1);
+        assert_eq!(source.undo()?, Some(first));
+        assert_eq!(&*source.read_window(0, 1)?.bytes, &[0x12]);
+        assert_eq!(source.redo()?, Some(final_cursor));
+        assert_eq!(&*source.read_window(0, 1)?.bytes, &[0xf4]);
+
+        source.cancel_edit();
+        source.begin_edit()?;
+        assert!(source.replace_bytes(0, &[0xf2], first, middle, true)?);
+        assert!(!source.replace_bytes(0, &[0xf2], middle, final_cursor, false)?);
+        assert_eq!(source.undo_history.len(), 1);
+        assert_eq!(source.undo()?, Some(first));
+        assert_eq!(source.redo()?, Some(final_cursor));
+
+        source.cancel_edit();
+        source.begin_edit()?;
+        assert!(source.replace_bytes(0, &[0xa2], first, middle, true)?);
+        source.end_hex_group();
+        assert!(source.replace_bytes(0, &[0xa5], middle, final_cursor, false)?);
+        assert_eq!(source.undo_history.len(), 2);
+        assert_eq!(source.undo()?, Some(middle));
+        assert_eq!(&*source.read_window(0, 1)?.bytes, &[0xa2]);
+        assert_eq!(source.undo()?, Some(first));
+        assert_eq!(&*source.read_window(0, 1)?.bytes, &[0x12]);
+        Ok(())
+    }
+
+    /*
+    An ordinary no-op keeps the existing redo branch and consumes no record.
+    A later real operation clears redo only after its complete plan succeeds.
+    */
+    #[test]
+    fn noops_preserve_redo_and_real_operations_invalidate_it() -> io::Result<()> {
+        let fixture = Fixture::new("redo-rules")?;
+        let path = fixture.file("source.bin");
+        fs::write(&path, b"abc")?;
+        let mut source = PagedFile::open(&path)?;
+        source.begin_edit()?;
+        let initial = cursor(0, 0, false);
+        let changed = cursor(1, 0, false);
+
+        assert!(source.replace_bytes(0, b"x", initial, changed, false)?);
+        assert_eq!(source.undo()?, Some(initial));
+        let bytes = source.history_bytes;
+        assert!(!source.replace_bytes(0, b"a", initial, changed, false)?);
+        assert_eq!(source.redo_history.len(), 1);
+        assert_eq!(source.history_bytes, bytes);
+        assert!(source.replace_bytes(1, b"y", initial, changed, false)?);
+        assert!(source.redo_history.is_empty());
+        assert_eq!(&*source.read_window(0, 3)?.bytes, b"ayc");
+        Ok(())
+    }
+
+    /*
+    The record count keeps the newest 256 independent operations.
+    Cancellation remains available after eviction and restores the source-only baseline.
+    */
+    #[test]
+    fn record_limit_evicts_oldest_and_cancel_restores_source() -> io::Result<()> {
+        let fixture = Fixture::new("record-limit")?;
+        let path = fixture.file("source.bin");
+        fs::write(&path, vec![0_u8; EDIT_HISTORY_LIMIT + 1])?;
+        let mut source = PagedFile::open(&path)?;
+        source.begin_edit()?;
+        for index in 0..=EDIT_HISTORY_LIMIT {
+            let position = index as u64;
+            source.replace_bytes(
+                position,
+                &[1],
+                cursor(position, 0, false),
+                cursor(position + 1, 0, false),
+                false,
+            )?;
+        }
+        assert_eq!(source.undo_history.len(), EDIT_HISTORY_LIMIT);
+
+        for _ in 0..EDIT_HISTORY_LIMIT {
+            assert!(source.undo()?.is_some());
+        }
+        assert!(source.undo()?.is_none());
+        assert_eq!(source.read_window(0, 2)?.bytes.as_ref(), &[1, 0]);
+
+        source.cancel_edit();
+        assert!(!source.editing());
+        assert!(!source.has_changes());
+        assert!(source.undo_history.is_empty());
+        assert!(source.redo_history.is_empty());
+        assert_eq!(source.read_window(0, 2)?.bytes.as_ref(), &[0, 0]);
+        Ok(())
+    }
+
+    /*
+    Three layouts fill the retained-history budget with separate allocations.
+    A grouped replacement cannot evict records, so its added span cost fails atomically.
+    The same non-grouped operation can evict the oldest record and then commit.
+    */
+    #[test]
+    fn history_budget_refuses_groups_and_evicts_for_new_operations() -> io::Result<()> {
+        let fixture = Fixture::new("history-budget")?;
+        let path = fixture.file("source.bin");
+        fs::write(&path, b"abc")?;
+        let mut source = PagedFile::open(&path)?;
+        source.begin_edit()?;
+        let descriptor = std::mem::size_of::<DataSpan>();
+        let large = 60 * 1024 * 1024;
+        let old = EDIT_HISTORY_BYTES - large * 2 - descriptor * 3;
+
+        source.layout = Layout {
+            spans: vec![DataSpan::Memory {
+                bytes: vec![0x11_u8; large].into(),
+                start: 0,
+                len: large,
+            }],
+            len: large as u64,
+        };
+        let old_layout = Layout {
+            spans: vec![DataSpan::Memory {
+                bytes: vec![0x22_u8; old].into(),
+                start: 0,
+                len: old,
+            }],
+            len: old as u64,
+        };
+        let group_layout = Layout {
+            spans: vec![DataSpan::Memory {
+                bytes: vec![0x33_u8; large].into(),
+                start: 0,
+                len: large,
+            }],
+            len: large as u64,
+        };
+        source.undo_history.push_back(EditRecord {
+            alternate: old_layout,
+            before_cursor: cursor(0, 0, false),
+            after_cursor: cursor(0, 0, false),
+            hex_group: false,
+            group_start: 0,
+            group_len: 1,
+        });
+        source.undo_history.push_back(EditRecord {
+            alternate: group_layout,
+            before_cursor: cursor(0, 0, false),
+            after_cursor: cursor(0, 0, true),
+            hex_group: true,
+            group_start: 0,
+            group_len: 1,
+        });
+        source.history_bytes = PagedFile::layouts_cost(
+            std::iter::once(&source.layout)
+                .chain(source.undo_history.iter().map(|record| &record.alternate)),
+        )?;
+        assert_eq!(source.history_bytes, EDIT_HISTORY_BYTES);
+
+        let signature = layout_signature(&source.layout);
+        let capacity = source.layout.spans.capacity();
+        let cursors: Vec<_> = source
+            .undo_history
+            .iter()
+            .map(|record| (record.before_cursor, record.after_cursor, record.hex_group))
+            .collect();
+        assert!(
+            source
+                .replace_bytes(0, &[0xfe], cursor(0, 0, true), cursor(1, 0, false), false,)
+                .unwrap_err()
+                .to_string()
+                .contains("130 MiB")
+        );
+        assert_eq!(layout_signature(&source.layout), signature);
+        assert_eq!(source.layout.spans.capacity(), capacity);
+        assert_eq!(source.history_bytes, EDIT_HISTORY_BYTES);
+        assert_eq!(
+            source
+                .undo_history
+                .iter()
+                .map(|record| (record.before_cursor, record.after_cursor, record.hex_group))
+                .collect::<Vec<_>>(),
+            cursors
+        );
+
+        source.end_hex_group();
+        assert!(source.replace_bytes(
+            0,
+            &[0xfe],
+            cursor(0, 0, false),
+            cursor(1, 0, false),
+            false,
+        )?);
+        assert!(source.history_bytes <= EDIT_HISTORY_BYTES);
+        assert_eq!(source.undo_history.len(), 2);
+        assert_eq!(&*source.read_window(0, 1)?.bytes, &[0xfe]);
+        assert!(source.undo()?.is_some());
+        assert_eq!(&*source.read_window(0, 1)?.bytes, &[0x11]);
+        assert!(source.undo()?.is_some());
+        assert_eq!(&*source.read_window(0, 1)?.bytes, &[0x33]);
+        assert!(source.undo()?.is_none());
+        Ok(())
+    }
+
+    /*
+    A sliced memory span and its alternate layout share one 64 MiB allocation.
+    History accounting counts that allocation once across both retained layouts.
+    */
+    #[test]
+    fn shared_allocations_count_once_across_history() -> io::Result<()> {
+        let fixture = Fixture::new("shared-history")?;
+        let path = fixture.file("source.bin");
+        File::create(&path)?;
+        let mut source = PagedFile::open(&path)?;
+        source.begin_edit()?;
+        let replacement = vec![0x5a_u8; BLOCK_BYTES];
+        let position = cursor(0, 0, false);
+        source.splice_bytes(0, 0, &replacement, position, position, false)?;
+        drop(replacement);
+        source.splice_bytes(0, BLOCK_BYTES as u64 - 1, b"", position, position, false)?;
+
+        let calculated = PagedFile::layouts_cost(
+            std::iter::once(&source.layout)
+                .chain(source.undo_history.iter().map(|record| &record.alternate))
+                .chain(source.redo_history.iter().map(|record| &record.alternate)),
+        )?;
+        assert_eq!(source.history_bytes, calculated);
+        assert!(calculated < CHANGED_BYTES_LIMIT);
+        assert_eq!(&*source.read_window(0, 1)?.bytes, &[0x5a]);
+        Ok(())
+    }
+
+    /*
+    Source validation errors occur before undo or redo moves a record.
+    Both failure paths retain layouts, history counts, cursors, groups, and byte cost.
+    Cancellation clears edits but does not accept the changed source as a new baseline.
+    */
+    #[test]
+    fn source_errors_preserve_undo_and_redo_state() -> io::Result<()> {
+        let fixture = Fixture::new("history-source-errors")?;
+        let undo_path = fixture.file("undo.bin");
+        fs::write(&undo_path, b"abc")?;
+        let mut undo_source = PagedFile::open(&undo_path)?;
+        let undo_stamp = undo_source.stamp;
+        undo_source.begin_edit()?;
+        let before = cursor(0, 0, false);
+        let after = cursor(1, 0, true);
+        undo_source.replace_bytes(0, b"x", before, after, true)?;
+        let undo_signature = layout_signature(&undo_source.layout);
+        let undo_cost = undo_source.history_bytes;
+        OpenOptions::new()
+            .write(true)
+            .open(&undo_path)?
+            .set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1)))?;
+        assert!(undo_source.undo().is_err());
+        assert_eq!(layout_signature(&undo_source.layout), undo_signature);
+        assert_eq!(undo_source.undo_history.len(), 1);
+        assert!(undo_source.undo_history.back().unwrap().hex_group);
+        assert!(undo_source.redo_history.is_empty());
+        assert_eq!(undo_source.history_bytes, undo_cost);
+        undo_source.cancel_edit();
+        assert!(!undo_source.editing());
+        assert!(!undo_source.has_changes());
+        assert!(undo_source.undo_history.is_empty());
+        assert!(undo_source.redo_history.is_empty());
+        assert_eq!(undo_source.stamp, undo_stamp);
+        assert!(undo_source.read_window(0, 1).is_err());
+
+        let redo_path = fixture.file("redo.bin");
+        fs::write(&redo_path, b"abc")?;
+        let mut redo_source = PagedFile::open(&redo_path)?;
+        redo_source.begin_edit()?;
+        redo_source.replace_bytes(0, b"x", before, after, false)?;
+        assert_eq!(redo_source.undo()?, Some(before));
+        let redo_signature = layout_signature(&redo_source.layout);
+        let redo_cost = redo_source.history_bytes;
+        OpenOptions::new()
+            .write(true)
+            .open(&redo_path)?
+            .set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1)))?;
+        assert!(redo_source.redo().is_err());
+        assert_eq!(layout_signature(&redo_source.layout), redo_signature);
+        assert!(redo_source.undo_history.is_empty());
+        assert_eq!(redo_source.redo_history.len(), 1);
+        assert_eq!(redo_source.history_bytes, redo_cost);
         Ok(())
     }
 
