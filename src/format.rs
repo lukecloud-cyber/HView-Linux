@@ -8,10 +8,6 @@ const OUTSIDE: &str = "Offset is out of file";
 Architecture identifies the instruction family and the effective code width.
 Each engine validates a directly constructed x86 value before it uses the width.
 */
-#[allow(
-    dead_code,
-    reason = "L07.1 defines ARM architecture domains before L07.2 adds their engines."
-)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Architecture {
     X86(u32),
@@ -44,13 +40,10 @@ impl Architecture {
     }
 
     /*
-    This fact gives the required instruction-start alignment for each architecture family.
+    This fact gives the natural instruction alignment for each architecture family.
     X86 permits each byte, ARM and ARM64 use four bytes, and Thumb uses two bytes.
+    Native inspection entry points can accept unaligned runtime addresses.
     */
-    #[allow(
-        dead_code,
-        reason = "L07.1 defines alignment before L07.2 adds aligned ARM callers."
-    )]
     pub const fn alignment(self) -> u64 {
         match self {
             Self::X86(_) => 1,

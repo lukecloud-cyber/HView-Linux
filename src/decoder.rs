@@ -1,11 +1,31 @@
 /*
-This module decodes one x86 instruction through the pinned Capstone interface.
+This module decodes one x86 or ARM-family instruction through the pinned Capstone interface.
 Typed internal results keep invalid source bytes separate from engine and interface errors.
 */
 use crate::format::Architecture;
 use crate::native::Library;
 use std::ffi::{CStr, c_char, c_void};
 use std::fmt::Write;
+
+/*
+These constants match the pinned Capstone 5.0.9 architecture, mode, option, and branch-group values.
+All selected native modes keep little-endian instruction bytes.
+*/
+const CS_ARCH_ARM: u32 = 0;
+const CS_ARCH_ARM64: u32 = 1;
+const CS_ARCH_X86: u32 = 3;
+const CS_MODE_ARM: u32 = 0;
+const CS_MODE_X86_16: u32 = 2;
+const CS_MODE_X86_32: u32 = 4;
+const CS_MODE_X86_64: u32 = 8;
+const CS_MODE_THUMB: u32 = 0x10;
+const CS_OPT_SYNTAX: i32 = 1;
+const CS_OPT_DETAIL: i32 = 2;
+const CS_OPT_OFF: usize = 0;
+const CS_OPT_SYNTAX_INTEL: usize = 1;
+const CS_OPT_SYNTAX_ATT: usize = 2;
+const CS_OPT_ON: usize = 3;
+const CS_GRP_BRANCH_RELATIVE: u32 = 7;
 
 /*
 Each name has at least one protected-only definition in the pinned Zydis reference.
@@ -145,7 +165,7 @@ The Result error channel contains engine, input-range, and native-interface erro
 */
 enum DecodeOutcome {
     Instruction(Instruction),
-    NoInstruction,
+    NoInstruction(Vec<u8>),
 }
 
 /*
@@ -169,7 +189,8 @@ pub struct Decoder {
 
 /*
 Syntax selects Intel or AT&T output for x86 decoding.
-Intel remains the default and the assembler always accepts Intel input.
+Intel remains the default and the x86 assembler always accepts Intel input.
+ARM-family decoders retain this cache property without applying the x86 option.
 */
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Syntax {
@@ -198,8 +219,8 @@ impl Decoder {
     }
 
     /*
-    This engine boundary validates all Architecture variants before loading Capstone.
-    L07.2 owns non-x86 decoder engines.
+    This engine boundary validates x86 widths and selects each supported Capstone engine.
+    Real16 remains valid only for the 16-bit x86 engine.
     */
     pub fn with_architecture(
         architecture: Architecture,
@@ -209,16 +230,16 @@ impl Decoder {
         if real_mode && architecture != Architecture::X86(16) {
             return Err("Real16 requires a 16-bit decoder.".into());
         }
-        let mode = match architecture {
-            Architecture::X86(16) => 2,
-            Architecture::X86(32) => 4,
-            Architecture::X86(64) => 8,
+        let (native_architecture, mode, name) = match architecture {
+            Architecture::X86(16) => (CS_ARCH_X86, CS_MODE_X86_16, "x86"),
+            Architecture::X86(32) => (CS_ARCH_X86, CS_MODE_X86_32, "x86"),
+            Architecture::X86(64) => (CS_ARCH_X86, CS_MODE_X86_64, "x86"),
             Architecture::X86(_) => {
                 return Err("The decoder supports only 16, 32, or 64 bits.".into());
             }
-            Architecture::Arm => return Err("ARM decoding is unsupported.".into()),
-            Architecture::Thumb => return Err("Thumb decoding is unsupported.".into()),
-            Architecture::Arm64 => return Err("ARM64 decoding is unsupported.".into()),
+            Architecture::Arm => (CS_ARCH_ARM, CS_MODE_ARM, "ARM"),
+            Architecture::Thumb => (CS_ARCH_ARM, CS_MODE_THUMB, "Thumb"),
+            Architecture::Arm64 => (CS_ARCH_ARM64, CS_MODE_ARM, "ARM64"),
         };
 
         /*
@@ -255,17 +276,25 @@ impl Decoder {
             ));
         }
         let mut handle = 0;
-        let status = unsafe { open(3, mode, &mut handle) };
+        let status = unsafe { open(native_architecture, mode, &mut handle) };
         if status != 0 {
             return Err(format!(
-                "Cannot initialize the x86 decoder: Capstone error {status}."
+                "Cannot initialize the {name} decoder: Capstone error {status}."
             ));
         }
-        let syntax_value = match syntax {
-            Syntax::Intel => 1,
-            Syntax::Att => 2,
+        /*
+        X86 applies the requested display syntax through Capstone.
+        ARM-family engines retain the setting only as part of the cache identity.
+        */
+        let status = if matches!(architecture, Architecture::X86(_)) {
+            let syntax_value = match syntax {
+                Syntax::Intel => CS_OPT_SYNTAX_INTEL,
+                Syntax::Att => CS_OPT_SYNTAX_ATT,
+            };
+            unsafe { set_option(handle, CS_OPT_SYNTAX, syntax_value) }
+        } else {
+            0
         };
-        let status = unsafe { set_option(handle, 1, syntax_value) };
         if status != 0 {
             unsafe {
                 close(&mut handle);
@@ -327,6 +356,7 @@ impl Decoder {
 
     /*
     This internal decoder limits input to the selected architecture maximum.
+    ARM-family input must fit through its final runtime byte without overflow.
     Only a zero count, a null pointer, and CS_ERR_OK identify ordinary invalid source bytes.
     */
     fn decode_one(&self, data: &[u8], offset: u64, address: u64) -> Result<DecodeOutcome, String> {
@@ -340,6 +370,11 @@ impl Decoder {
             .filter(|bytes| !bytes.is_empty())
             .ok_or("The decoder reached the end of the file.")?;
         let input_len = bytes.len().min(self.architecture.max_instruction_bytes());
+        if !matches!(self.architecture, Architecture::X86(_)) {
+            address
+                .checked_add(input_len as u64 - 1)
+                .ok_or("The ARM instruction exceeds the runtime address range.")?;
+        }
         /*
         The native section requests one instruction and classifies the result tuple.
         A normal invalid byte requires the exact zero, null, and CS_ERR_OK combination.
@@ -362,7 +397,8 @@ impl Decoder {
                     "Capstone decoding failed at offset {offset:X}: error {status}."
                 ))
             } else if instruction.is_null() {
-                Ok(DecodeOutcome::NoInstruction)
+                let size = input_len.min(self.architecture.alignment() as usize);
+                Ok(DecodeOutcome::NoInstruction(bytes[..size].to_vec()))
             } else {
                 Err("The decoder returned an invalid instruction pointer.".into())
             }
@@ -400,7 +436,8 @@ impl Decoder {
                     && (real16_protected(bytes, size, canonical)
                         || real16_vector(bytes, size, canonical))
                 {
-                    Ok(DecodeOutcome::NoInstruction)
+                    let size = input_len.min(self.architecture.alignment() as usize);
+                    Ok(DecodeOutcome::NoInstruction(bytes[..size].to_vec()))
                 } else {
                     if self.real_mode
                         && RELATIVE_BRANCHES.contains(&canonical)
@@ -430,18 +467,19 @@ impl Decoder {
     }
 
     /*
-    Strict decoding converts an ordinary invalid-byte result into the established x86 error.
+    Strict decoding converts an ordinary invalid-byte result into its architecture-specific error.
     Engine and interface errors pass through unchanged.
     */
     pub fn decode(&self, data: &[u8], offset: u64, address: u64) -> Result<Instruction, String> {
         match self.decode_one(data, offset, address)? {
             DecodeOutcome::Instruction(instruction) => Ok(instruction),
-            DecodeOutcome::NoInstruction => Err(invalid_instruction(offset)),
+            DecodeOutcome::NoInstruction(_) => Err(invalid_instruction(self.architecture, offset)),
         }
     }
 
     /*
-    Optional decoding converts only ordinary invalid x86 input into one visible data byte.
+    Optional decoding converts only ordinary invalid input into one visible architecture unit.
+    A short source tail can produce a smaller final data unit.
     The caller can use this result without catching unrelated decoder errors.
     */
     pub fn decode_or_byte(
@@ -452,30 +490,45 @@ impl Decoder {
     ) -> Result<Instruction, String> {
         match self.decode_one(data, offset, address)? {
             DecodeOutcome::Instruction(instruction) => Ok(instruction),
-            DecodeOutcome::NoInstruction => {
-                let start =
-                    usize::try_from(offset).map_err(|_| "The offset exceeds the address range.")?;
-                let byte = *data
-                    .get(start)
-                    .ok_or("The decoder reached the end of the file.")?;
+            DecodeOutcome::NoInstruction(bytes) => {
+                let mut hex = String::with_capacity(bytes.len() * 2);
+                for byte in &bytes {
+                    write!(hex, "{byte:02X}").unwrap();
+                }
+                let text = if matches!(self.architecture, Architecture::X86(_)) {
+                    format!("db {hex}")
+                } else {
+                    let operands = bytes
+                        .iter()
+                        .map(|byte| format!("0x{byte:02X}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("db           {operands}")
+                };
                 Ok(Instruction {
-                    size: 1,
-                    hex: format!("{byte:02X}"),
-                    text: format!("db {byte:02X}"),
+                    size: bytes.len(),
+                    hex,
+                    text,
                 })
             }
         }
     }
 
     /*
-    Direct-target decoding enables Capstone detail for one request.
+    Direct-target decoding validates ARM-family address range and enables Capstone detail.
     The final option change restores the reusable cached decoder state.
     */
     pub fn direct_target(&self, data: &[u8], address: u64) -> Result<Option<u64>, String> {
-        let status = unsafe { (self.set_option)(self.handle, 2, 3) };
+        let input_len = data.len().min(self.architecture.max_instruction_bytes());
+        if !matches!(self.architecture, Architecture::X86(_)) && input_len != 0 {
+            address
+                .checked_add(input_len as u64 - 1)
+                .ok_or("The ARM instruction exceeds the runtime address range.")?;
+        }
+        let status = unsafe { (self.set_option)(self.handle, CS_OPT_DETAIL, CS_OPT_ON) };
         if status != 0 {
             unsafe {
-                (self.set_option)(self.handle, 2, 0);
+                (self.set_option)(self.handle, CS_OPT_DETAIL, CS_OPT_OFF);
             }
             return Err(format!(
                 "Cannot enable Capstone detail: Capstone error {status}."
@@ -483,7 +536,7 @@ impl Decoder {
         }
 
         let result = self.direct_target_with_detail(data, address);
-        let status = unsafe { (self.set_option)(self.handle, 2, 0) };
+        let status = unsafe { (self.set_option)(self.handle, CS_OPT_DETAIL, CS_OPT_OFF) };
         if status != 0 {
             return Err(format!(
                 "Cannot disable Capstone detail: Capstone error {status}."
@@ -523,7 +576,8 @@ impl Decoder {
                 ))
             } else if instruction.is_null() {
                 Err(format!(
-                    "Invalid or incomplete x86 instruction at address {address:X}."
+                    "Invalid or incomplete {} instruction at address {address:X}.",
+                    architecture_name(self.architecture)
                 ))
             } else {
                 Err("The decoder returned an invalid instruction pointer.".into())
@@ -540,7 +594,7 @@ impl Decoder {
             } else {
                 /*
                 The target section applies Real16 policy and checks Capstone branch-group membership.
-                It returns only a parsed direct target and keeps indirect instructions targetless.
+                ARM-family parsing uses the final immediate, while BLX and indirect transfers remain targetless.
                 */
                 let mnemonic = text(&instruction_ref.mnemonic);
                 let name = unsafe { (self.instruction_name)(self.handle, instruction_ref.id) };
@@ -558,11 +612,21 @@ impl Decoder {
                     Err(format!(
                         "Invalid or incomplete x86 instruction at address {address:X}."
                     ))
-                } else if !unsafe { (self.in_group)(self.handle, instruction_ref, 7) } {
+                } else if mnemonic.eq_ignore_ascii_case("blx")
+                    || !unsafe {
+                        (self.in_group)(self.handle, instruction_ref, CS_GRP_BRANCH_RELATIVE)
+                    }
+                {
                     Ok(None)
                 } else {
                     let operands = text(&instruction_ref.operands);
-                    number(&operands)
+                    let operand = if matches!(self.architecture, Architecture::X86(_)) {
+                        operands.as_str()
+                    } else {
+                        operands.rsplit(',').next().unwrap_or("").trim()
+                    };
+                    let operand = operand.strip_prefix('#').unwrap_or(operand);
+                    number(operand)
                         .map(|target| {
                             Some(if self.real_mode {
                                 target & 0xffff
@@ -571,7 +635,7 @@ impl Decoder {
                             })
                         })
                         .ok_or_else(|| {
-                            format!("Capstone returned an invalid direct target: {operands}.")
+                            format!("Capstone returned an invalid direct target: {operand}.")
                         })
                 }
             }
@@ -590,11 +654,23 @@ impl Decoder {
 }
 
 /*
-These helpers format invalid-input errors, parse direct targets, and enforce Real16 policy.
+These helpers format architecture errors, parse direct targets, and enforce Real16 policy.
 Prefix removal keeps vector and protected-instruction checks independent from display syntax.
 */
-fn invalid_instruction(offset: u64) -> String {
-    format!("Invalid or incomplete x86 instruction at offset {offset:X}.")
+fn architecture_name(architecture: Architecture) -> &'static str {
+    match architecture {
+        Architecture::X86(_) => "x86",
+        Architecture::Arm => "ARM",
+        Architecture::Thumb => "Thumb",
+        Architecture::Arm64 => "ARM64",
+    }
+}
+
+fn invalid_instruction(architecture: Architecture, offset: u64) -> String {
+    format!(
+        "Invalid or incomplete {} instruction at offset {offset:X}.",
+        architecture_name(architecture)
+    )
 }
 
 /*
@@ -840,6 +916,72 @@ mod tests {
 
         assert!(decoder.decode_or_byte(&[], 0, 0).is_err());
         assert!(decoder.decode_or_byte(&[0x90], u64::MAX, 0).is_err());
+
+        /*
+        ARM and ARM64 reject a two-byte native result.
+        Thumb rejects a one-byte native result, and each allocated result reaches cleanup.
+        */
+        for (architecture, kind, valid) in [
+            (Architecture::Arm, 5, &[0x00, 0x00, 0xa0, 0xe1][..]),
+            (Architecture::Arm64, 5, &[0x1f, 0x20, 0x03, 0xd5][..]),
+            (Architecture::Thumb, 7, &[0x01, 0x20][..]),
+        ] {
+            let mut decoder =
+                Decoder::with_architecture(architecture, Syntax::Intel, false).unwrap();
+            let native_disasm = decoder.disasm;
+            let native_error = decoder.error;
+            let native_free = decoder.free;
+            decoder.disasm = stub_disasm;
+            decoder.error = stub_error;
+            decoder.free = stub_free;
+            RETURN_KIND.store(kind, Ordering::SeqCst);
+            let before = FREE_CALLS.load(Ordering::SeqCst);
+            assert_eq!(
+                decoder.decode_or_byte(&[0; 4], 0, 0x1000).unwrap_err(),
+                "The decoder returned an invalid instruction size."
+            );
+            assert_eq!(FREE_CALLS.load(Ordering::SeqCst), before + 1);
+            assert_eq!(
+                decoder.direct_target(&[0; 4], 0x1000).unwrap_err(),
+                "The decoder returned an invalid instruction size."
+            );
+            assert_eq!(FREE_CALLS.load(Ordering::SeqCst), before + 2);
+            decoder.disasm = native_disasm;
+            decoder.error = native_error;
+            decoder.free = native_free;
+            assert_eq!(decoder.decode(valid, 0, 0x1000).unwrap().size, valid.len());
+        }
+
+        /*
+        An injected engine error remains an error for every ARM family.
+        No optional fallback converts the engine error into a data unit.
+        */
+        for (architecture, valid) in [
+            (Architecture::Arm, &[0x00, 0x00, 0xa0, 0xe1][..]),
+            (Architecture::Thumb, &[0x01, 0x20][..]),
+            (Architecture::Arm64, &[0x1f, 0x20, 0x03, 0xd5][..]),
+        ] {
+            let mut decoder =
+                Decoder::with_architecture(architecture, Syntax::Intel, false).unwrap();
+            let native_disasm = decoder.disasm;
+            let native_error = decoder.error;
+            decoder.force_decode_error();
+            assert!(
+                decoder
+                    .decode_or_byte(&[0; 4], 0, 0x1000)
+                    .unwrap_err()
+                    .contains("error 17")
+            );
+            assert!(
+                decoder
+                    .direct_target(&[0; 4], 0x1000)
+                    .unwrap_err()
+                    .contains("error 17")
+            );
+            decoder.disasm = native_disasm;
+            decoder.error = native_error;
+            assert_eq!(decoder.decode(valid, 0, 0x1000).unwrap().size, valid.len());
+        }
     }
 
     /*
@@ -862,15 +1004,238 @@ mod tests {
     }
 
     /*
-    This test checks architecture validation at the decoder boundary.
-    L07.1 returns explicit unsupported errors for non-x86 architectures.
+    This test checks architecture validation and native engine selection.
+    Unsupported Real16 combinations fail before they can replace a usable decoder.
     */
     #[test]
-    fn architecture_boundary_rejects_invalid_and_unsupported_engines() {
+    fn architecture_boundary_selects_supported_engines() {
         assert!(Decoder::with_architecture(Architecture::X86(8), Syntax::Intel, false).is_err());
         for architecture in [Architecture::Arm, Architecture::Thumb, Architecture::Arm64] {
-            assert!(Decoder::with_architecture(architecture, Syntax::Intel, false).is_err());
+            let decoder = Decoder::with_architecture(architecture, Syntax::Att, false).unwrap();
+            assert_eq!(decoder.architecture(), architecture);
+            assert_eq!(decoder.syntax(), Syntax::Att);
+            assert!(!decoder.real_mode());
+            assert!(Decoder::with_architecture(architecture, Syntax::Intel, true).is_err());
         }
+    }
+
+    /*
+    This test checks independent ARM64 NOP, MOV, and RET vectors.
+    Invalid input uses four-byte data units, while a short tail uses its remaining bytes.
+    */
+    #[test]
+    fn arm64_instructions_and_truncated_data() {
+        let decoder =
+            Decoder::with_architecture(Architecture::Arm64, Syntax::Intel, false).unwrap();
+        for (bytes, expected) in [
+            (&[0x1f, 0x20, 0x03, 0xd5][..], "nop"),
+            (&[0x00, 0x00, 0x80, 0xd2][..], "mov          x0, #0"),
+            (&[0xc0, 0x03, 0x5f, 0xd6][..], "ret"),
+        ] {
+            let instruction = decoder.decode(bytes, 0, 0x1000).unwrap();
+            assert_eq!(instruction.size, 4);
+            assert_eq!(instruction.text, expected);
+        }
+        assert_eq!(
+            decoder.decode(&[0x1f, 0x20, 0x03], 0, 0x1000).unwrap_err(),
+            "Invalid or incomplete ARM64 instruction at offset 0."
+        );
+        let bytes = [0xff, 0xff, 0xff, 0xff, 0x1f, 0x20, 0x03, 0xd5];
+        let fallback = decoder.decode_or_byte(&bytes, 0, 0x1000).unwrap();
+        assert_eq!(
+            (fallback.size, fallback.hex.as_str(), fallback.text.as_str()),
+            (4, "FFFFFFFF", "db           0xFF, 0xFF, 0xFF, 0xFF")
+        );
+        assert_eq!(decoder.decode(&bytes, 4, 0x1004).unwrap().text, "nop");
+        let tail = decoder.decode_or_byte(&[0x90], 0, 0x1004).unwrap();
+        assert_eq!(
+            (tail.size, tail.hex.as_str(), tail.text.as_str()),
+            (1, "90", "db           0x90")
+        );
+    }
+
+    /*
+    This test checks independent ARMv6, Thumb-16, and Thumb-32 vectors.
+    Invalid units preserve the natural architecture size and allow the next valid decode.
+    */
+    #[test]
+    fn arm_and_thumb_instructions_use_fixed_decode_units() {
+        let arm = Decoder::with_architecture(Architecture::Arm, Syntax::Intel, false).unwrap();
+        for (bytes, expected) in [
+            (&[0x00, 0x00, 0xa0, 0xe1][..], "mov          r0, r0"),
+            (&[0x01, 0x00, 0xa0, 0xe3][..], "mov          r0, #1"),
+            (&[0x00, 0x00, 0x00, 0xea][..], "b            #0x1008"),
+            (&[0x02, 0x00, 0x00, 0xeb][..], "bl           #0x1010"),
+        ] {
+            let instruction = arm.decode(bytes, 0, 0x1000).unwrap();
+            assert_eq!(instruction.size, 4);
+            assert_eq!(instruction.text, expected);
+        }
+        let arm_bytes = [0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0xa0, 0xe1];
+        let fallback = arm.decode_or_byte(&arm_bytes, 0, 0x1000).unwrap();
+        assert_eq!((fallback.size, fallback.hex.as_str()), (4, "FFFFFFFF"));
+        assert_eq!(
+            arm.decode(&arm_bytes, 4, 0x1004).unwrap().text,
+            "mov          r0, r0"
+        );
+        assert_eq!(
+            arm.decode_or_byte(&[0x00, 0x00, 0xa0], 0, 0x1000)
+                .unwrap()
+                .size,
+            3
+        );
+
+        let thumb = Decoder::with_architecture(Architecture::Thumb, Syntax::Intel, false).unwrap();
+        for (bytes, size, expected) in [
+            (&[0x01, 0x20][..], 2, "movs         r0, #1"),
+            (&[0x00, 0xbf][..], 2, "nop"),
+            (&[0xfe, 0xe7][..], 2, "b            #0x1000"),
+            (&[0x00, 0xf0, 0x00, 0xf8][..], 4, "bl           #0x1004"),
+        ] {
+            let instruction = thumb.decode(bytes, 0, 0x1000).unwrap();
+            assert_eq!(instruction.size, size);
+            assert_eq!(instruction.text, expected);
+        }
+        let thumb_bytes = [0xff, 0xff, 0x01, 0x20];
+        let fallback = thumb.decode_or_byte(&thumb_bytes, 0, 0x1000).unwrap();
+        assert_eq!((fallback.size, fallback.hex.as_str()), (2, "FFFF"));
+        assert_eq!(
+            thumb.decode(&thumb_bytes, 2, 0x1002).unwrap().text,
+            "movs         r0, #1"
+        );
+        assert_eq!(thumb.decode_or_byte(&[0x00], 0, 0x1000).unwrap().size, 1);
+    }
+
+    /*
+    This test documents that native ARM inspection accepts unaligned runtime addresses.
+    Range checks still reject a bounded instruction whose final runtime byte overflows u64.
+    */
+    #[test]
+    fn arm_family_addresses_accept_unaligned_values_and_reject_overflow() {
+        for (architecture, bytes, exact_end, expected) in [
+            (
+                Architecture::Arm,
+                &[0x00, 0x00, 0xa0, 0xe1][..],
+                u64::MAX - 3,
+                "mov          r0, r0",
+            ),
+            (
+                Architecture::Thumb,
+                &[0x01, 0x20][..],
+                u64::MAX - 1,
+                "movs         r0, #1",
+            ),
+            (
+                Architecture::Arm64,
+                &[0x1f, 0x20, 0x03, 0xd5][..],
+                u64::MAX - 3,
+                "nop",
+            ),
+        ] {
+            let decoder = Decoder::with_architecture(architecture, Syntax::Intel, false).unwrap();
+            let aligned = decoder.decode(bytes, 0, 0x1000).unwrap();
+            let unaligned = decoder.decode(bytes, 0, 0x1001).unwrap();
+            assert_eq!(
+                (unaligned.size, unaligned.text),
+                (aligned.size, aligned.text)
+            );
+            let boundary = decoder.decode(bytes, 0, exact_end).unwrap();
+            assert_eq!(
+                (boundary.size, boundary.text.as_str()),
+                (bytes.len(), expected)
+            );
+            assert_eq!(decoder.direct_target(bytes, exact_end), Ok(None));
+            for error in [
+                decoder.decode(bytes, 0, u64::MAX).unwrap_err(),
+                decoder.decode_or_byte(bytes, 0, u64::MAX).unwrap_err(),
+                decoder.direct_target(bytes, u64::MAX).unwrap_err(),
+            ] {
+                assert_eq!(
+                    error,
+                    "The ARM instruction exceeds the runtime address range."
+                );
+            }
+            assert!(decoder.decode(&[], 0, 0x1000).is_err());
+            assert!(decoder.direct_target(&[], 0x1000).is_err());
+            assert_eq!(decoder.decode(bytes, 0, 0x1000).unwrap().size, bytes.len());
+        }
+    }
+
+    /*
+    This test checks ARM64 B, CBZ, and TBZ targets through the final immediate operand.
+    An indirect RET remains targetless, and later decoding proves reusable detail state.
+    */
+    #[test]
+    fn arm64_direct_relative_targets_use_the_final_immediate_operand() {
+        let decoder =
+            Decoder::with_architecture(Architecture::Arm64, Syntax::Intel, false).unwrap();
+        assert_eq!(
+            decoder.direct_target(&[0, 0, 0, 0x14], 0x1000),
+            Ok(Some(0x1000))
+        );
+        assert_eq!(
+            decoder.direct_target(&[0x20, 0, 0, 0xb4], 0x1000),
+            Ok(Some(0x1004))
+        );
+        assert_eq!(
+            decoder.direct_target(&[0x20, 0, 0, 0x36], 0x1000),
+            Ok(Some(0x1004))
+        );
+        assert_eq!(
+            decoder.direct_target(&[0xc0, 0x03, 0x5f, 0xd6], 0x1000),
+            Ok(None)
+        );
+        assert_eq!(
+            decoder
+                .decode(&[0x1f, 0x20, 0x03, 0xd5], 0, 0x1000)
+                .unwrap()
+                .text,
+            "nop"
+        );
+    }
+
+    /*
+    This test checks ARM and Thumb B or BL targets through the native relative-branch group.
+    BLX and indirect transfers remain targetless because this helper cannot change execution state.
+    */
+    #[test]
+    fn arm_and_thumb_direct_targets_preserve_execution_state() {
+        let arm = Decoder::with_architecture(Architecture::Arm, Syntax::Intel, false).unwrap();
+        assert_eq!(
+            arm.direct_target(&[0x00, 0x00, 0x00, 0xea], 0x1000),
+            Ok(Some(0x1008))
+        );
+        assert_eq!(
+            arm.direct_target(&[0x02, 0x00, 0x00, 0xeb], 0x1000),
+            Ok(Some(0x1010))
+        );
+        assert_eq!(
+            arm.direct_target(&[0x02, 0x00, 0x00, 0xfa], 0x1000),
+            Ok(None)
+        );
+        assert_eq!(
+            arm.direct_target(&[0x10, 0xff, 0x2f, 0xe1], 0x1000),
+            Ok(None)
+        );
+        assert_eq!(
+            arm.decode(&[0x00, 0x00, 0xa0, 0xe1], 0, 0x1000)
+                .unwrap()
+                .size,
+            4
+        );
+
+        let thumb = Decoder::with_architecture(Architecture::Thumb, Syntax::Intel, false).unwrap();
+        assert_eq!(thumb.direct_target(&[0xfe, 0xe7], 0x1000), Ok(Some(0x1000)));
+        assert_eq!(
+            thumb.direct_target(&[0x00, 0xf0, 0x06, 0xf8], 0x1000),
+            Ok(Some(0x1010))
+        );
+        assert_eq!(
+            thumb.direct_target(&[0x00, 0xf0, 0x06, 0xe8], 0x1000),
+            Ok(None)
+        );
+        assert_eq!(thumb.direct_target(&[0x00, 0x47], 0x1000), Ok(None));
+        assert_eq!(thumb.decode(&[0x01, 0x20], 0, 0x1000).unwrap().size, 2);
     }
 
     /*

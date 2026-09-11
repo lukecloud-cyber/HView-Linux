@@ -2699,18 +2699,60 @@ fn run() -> io::Result<()> {
     */
     let raw_args: Vec<_> = std::env::args_os().skip(1).collect();
     if raw_args == [std::ffi::OsString::from("--self-test")] {
-        for (bits, text, bytes) in [
-            (16, "ret", &[0xc3][..]),
-            (32, "nop", &[0x90][..]),
-            (64, "mov rax,rbx", &[0x48, 0x89, 0xd8][..]),
+        /*
+        These vectors assemble and decode x86, ARM, and Thumb through the bundled engines.
+        Each comparison uses independent expected bytes for the selected architecture.
+        */
+        for (architecture, text, bytes) in [
+            (format::Architecture::X86(16), "ret", &[0xc3][..]),
+            (format::Architecture::X86(32), "nop", &[0x90][..]),
+            (
+                format::Architecture::X86(64),
+                "mov rax,rbx",
+                &[0x48, 0x89, 0xd8][..],
+            ),
+            (
+                format::Architecture::Arm,
+                "mov r0, r0",
+                &[0x00, 0x00, 0xa0, 0xe1][..],
+            ),
+            (
+                format::Architecture::Thumb,
+                "movs r0, #1",
+                &[0x01, 0x20][..],
+            ),
         ] {
-            let architecture = format::Architecture::x86(bits).map_err(io::Error::other)?;
             let output = assembler::assemble_architecture(text, architecture, 0x1000)
                 .map_err(io::Error::other)?;
-            let instruction = decoder::decode(bytes, 0, bits, 0x1000).map_err(io::Error::other)?;
+            let instruction = match architecture {
+                format::Architecture::X86(bits) => {
+                    decoder::decode(bytes, 0, bits, 0x1000).map_err(io::Error::other)?
+                }
+                _ => {
+                    decoder::Decoder::with_architecture(architecture, decoder::Syntax::Intel, false)
+                        .and_then(|decoder| decoder.decode(bytes, 0, 0x1000))
+                        .map_err(io::Error::other)?
+                }
+            };
             if output != bytes || instruction.size != bytes.len() {
                 return Err(io::Error::other("The native instruction check failed."));
             }
+        }
+        /*
+        ARM64 decoding uses the same native library without an assembler request.
+        ARM64 assembly remains an explicit unsupported capability.
+        */
+        let arm64 = decoder::Decoder::with_architecture(
+            format::Architecture::Arm64,
+            decoder::Syntax::Intel,
+            false,
+        )
+        .map_err(io::Error::other)?;
+        let instruction = arm64
+            .decode(&[0x1f, 0x20, 0x03, 0xd5], 0, 0x1000)
+            .map_err(io::Error::other)?;
+        if instruction.size != 4 {
+            return Err(io::Error::other("The native instruction check failed."));
         }
         println!("Native self-test passed.");
         return Ok(());
@@ -3322,8 +3364,8 @@ mod tests {
     }
 
     /*
-    This test checks decoder reuse and replacement across width, syntax, and Real16 changes.
-    Unsupported widths must return an error.
+    This test checks decoder reuse and replacement across architecture, syntax, and Real16 changes.
+    Invalid x86 and Real16 requests must preserve the previous usable native handle.
     */
     #[test]
     fn decoder_for_reuses_and_replaces_decoder() {
@@ -3416,21 +3458,95 @@ mod tests {
             .is_err()
         );
         assert_eq!(decoder.as_ref().unwrap().native_handle(), retained);
-        for architecture in [
-            format::Architecture::Arm,
-            format::Architecture::Thumb,
-            format::Architecture::Arm64,
-        ] {
-            assert!(
-                decoder_for(&mut decoder, architecture, decoder::Syntax::Intel, false).is_err()
-            );
-            assert_eq!(decoder.as_ref().unwrap().native_handle(), retained);
-        }
+        assert!(
+            decoder_for(
+                &mut decoder,
+                format::Architecture::Arm,
+                decoder::Syntax::Intel,
+                true,
+            )
+            .is_err()
+        );
+        assert_eq!(decoder.as_ref().unwrap().native_handle(), retained);
         assert_eq!(
             decoder
                 .as_ref()
                 .unwrap()
                 .decode(&[0x90], 0, 0)
+                .unwrap()
+                .text,
+            "nop"
+        );
+
+        /*
+        Each architecture change creates a new native handle while the prior handle remains live.
+        An identical request reuses that handle and decodes through the selected engine.
+        */
+        for (architecture, bytes) in [
+            (format::Architecture::Arm, &[0x00, 0x00, 0xa0, 0xe1][..]),
+            (format::Architecture::Thumb, &[0x01, 0x20][..]),
+            (format::Architecture::Arm64, &[0x1f, 0x20, 0x03, 0xd5][..]),
+        ] {
+            let previous = decoder.as_ref().unwrap().native_handle();
+            let selected =
+                decoder_for(&mut decoder, architecture, decoder::Syntax::Intel, false).unwrap();
+            assert_eq!(selected.architecture(), architecture);
+            let handle = selected.native_handle();
+            assert_ne!(handle, previous);
+            decoder_for(&mut decoder, architecture, decoder::Syntax::Intel, false).unwrap();
+            assert_eq!(decoder.as_ref().unwrap().native_handle(), handle);
+            assert_eq!(
+                decoder
+                    .as_ref()
+                    .unwrap()
+                    .decode(bytes, 0, 0x1000)
+                    .unwrap()
+                    .size,
+                bytes.len()
+            );
+        }
+
+        /*
+        ARM64 retains the requested syntax as a cache property without applying an x86 option.
+        A repeated request reuses the replacement handle.
+        */
+        let arm64 = decoder.as_ref().unwrap().native_handle();
+        assert_eq!(
+            decoder_for(
+                &mut decoder,
+                format::Architecture::Arm64,
+                decoder::Syntax::Att,
+                false,
+            )
+            .unwrap()
+            .syntax(),
+            decoder::Syntax::Att
+        );
+        let arm64_att = decoder.as_ref().unwrap().native_handle();
+        assert_ne!(arm64_att, arm64);
+        decoder_for(
+            &mut decoder,
+            format::Architecture::Arm64,
+            decoder::Syntax::Att,
+            false,
+        )
+        .unwrap();
+        assert_eq!(decoder.as_ref().unwrap().native_handle(), arm64_att);
+        assert!(
+            decoder_for(
+                &mut decoder,
+                format::Architecture::Arm64,
+                decoder::Syntax::Att,
+                true,
+            )
+            .is_err()
+        );
+        assert_eq!(decoder.as_ref().unwrap().native_handle(), arm64_att);
+        assert_eq!(
+            decoder
+                .as_ref()
+                .unwrap()
+                .decode(&[0x1f, 0x20, 0x03, 0xd5], 0, 0x1000)
                 .unwrap()
                 .text,
             "nop"
