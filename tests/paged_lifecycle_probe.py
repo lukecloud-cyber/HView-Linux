@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 import tempfile
 
+from analysis_probe import pe_fixture, put32
 from terminal_probe import run_session
 
 
@@ -18,6 +19,7 @@ CTRL_S = b"\x13"
 CTRL_T = b"\x14"
 CTRL_Y = b"\x19"
 CTRL_Z = b"\x1a"
+ENTER = b"\r"
 ESCAPE = b"\x1b"
 ALT_E = b"\x1be"
 ALT_G = b"\x1bg"
@@ -154,6 +156,67 @@ def check_high_offsets(binary: Path, root: Path) -> tuple[Path, int]:
     require(virtual, b"Virtual and entry-point", "A virtual offset did not report its limit.")
     require(virtual, b"00000000", "A rejected virtual offset did not use file offset zero.")
     return source, high
+
+
+# This check selects one sparse PE section through bounded entry and virtual metadata reads.
+# It also applies the same entry request when an inactive paged session record is created.
+def check_paged_pe_startup(binary: Path, root: Path) -> None:
+    """Check sparse PE startup, inactive initialization, and format errors."""
+    length = (1 << 32) + 0x100
+    high = 1 << 32
+    source = root / "sparse-pe.bin"
+    data, _ = pe_fixture(False)
+    fixture = bytearray(data[:0x200])
+    section = 0x98 + 0xE0
+    put32(fixture, 0x98 + 16, 0x1100)
+    put32(fixture, section + 8, 0x200)
+    put32(fixture, section + 16, 0x200)
+    put32(fixture, section + 20, 0xFFFFFF00)
+    sparse_file(source, length, [(0, fixture), (high, b"\xC3PE")])
+
+    # EntryPoint and both compatibility virtual forms must select the same high file byte.
+    for option in [["--entry-point"], ["--virtual", "1100"], ["--virtual", "401100"]]:
+        output = run_session(
+            binary,
+            ["--mode=hex", *option, str(source)],
+            [CTRL_Q],
+            address_limit_bytes=ADDRESS_LIMIT,
+        )
+        require(output, b"100000000", "Sparse PE startup narrowed the selected offset.")
+        require(output, b"C3 50 45", "Sparse PE startup did not show the mapped bytes.")
+
+    # The session constructor keeps its below-4-GiB offset in the unchanged SAV representation.
+    inactive = root / "pe-low.bin"
+    put32(fixture, 0x98 + 16, 0x1000)
+    sparse_file(inactive, length, [(0, fixture), (0xFFFFFF00, b"\xC3PE")])
+    small = root / "pe-session-small.bin"
+    session = root / "pe-startup.sav"
+    small.write_bytes(b"small")
+    output = run_session(
+        binary,
+        ["--mode=hex", "--entry-point", "--session", str(session), str(small), str(inactive)],
+        [ALT_N, CTRL_Q],
+        address_limit_bytes=ADDRESS_LIMIT,
+    )
+    returned = after_last(output, inactive.name.encode())
+    require(returned, b"FFFFFF00", "The inactive PE entry offset was not retained.")
+    require(returned, b"C3 50 45", "The inactive PE view did not show mapped bytes.")
+
+    # A recognized unsupported signature must show its format error and use the zero fallback.
+    rejected = root / "sparse-ne.bin"
+    prefix = bytearray(132)
+    prefix[:2] = b"MZ"
+    put32(prefix, 60, 128)
+    prefix[128:130] = b"NE"
+    sparse_file(rejected, 64 * 1024 * 1024 + 1, [(0, prefix)])
+    output = run_session(
+        binary,
+        ["--mode=hex", "--entry-point", str(rejected)],
+        [ENTER, CTRL_Q],
+        address_limit_bytes=ADDRESS_LIMIT,
+    )
+    require(output, b"NE, LE, and LX executable formats are unsupported.", "Paged startup lost the format error.")
+    require(output, b"00000000", "A rejected paged entry did not use offset zero.")
 
 
 # This check edits one large source through grouped nibbles and the complete history controls.
@@ -688,6 +751,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="hview-paged-lifecycle-") as temporary:
         root = Path(temporary)
         large, high = check_high_offsets(binary, root)
+        check_paged_pe_startup(binary, root)
         check_paged_edits(binary, large, high)
         check_switch_and_restart(binary, root, large, high)
         check_paged_saves(binary, root)

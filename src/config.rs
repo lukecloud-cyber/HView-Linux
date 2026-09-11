@@ -1178,7 +1178,7 @@ fn initial_session_view(
 ) -> Result<SessionView, String> {
     /*
     The common source selector classifies one opened descriptor before initialization.
-    Buffered files use their bytes, while paged files use only captured length.
+    Buffered and paged files resolve startup offsets from their current logical bytes.
     */
     match crate::paged::open_source(path)
         .map_err(|error| format!("Cannot read {}: {error}", path.display()))?
@@ -1197,7 +1197,7 @@ fn initial_session_view(
             text_path,
             config,
             startup_mode,
-            session_offset_for_len(file.len(), startup_offset),
+            session_offset_for_paged(&file, startup_offset),
         )),
     }
 }
@@ -1222,16 +1222,24 @@ fn session_offset(data: &[u8], offset: Option<&crate::cli::Offset>) -> u64 {
 }
 
 /*
-Large inactive sources cannot parse virtual or entry-point offsets without later format integration.
-File and End offsets use the captured u64 length and the existing out-of-range fallback.
+This helper resolves one inactive paged startup offset without reading complete source contents.
+File and End requests use only length, while virtual and entry requests parse bounded metadata.
 */
-fn session_offset_for_len(len: u64, offset: Option<&crate::cli::Offset>) -> u64 {
+fn session_offset_for_paged(
+    file: &crate::paged::PagedFile,
+    offset: Option<&crate::cli::Offset>,
+) -> u64 {
     let requested = offset.and_then(|offset| match offset.target {
         crate::cli::OffsetTarget::File(value) => Some(value),
-        crate::cli::OffsetTarget::End => Some(len.saturating_sub(1)),
-        crate::cli::OffsetTarget::Virtual(_) | crate::cli::OffsetTarget::EntryPoint => None,
+        crate::cli::OffsetTarget::End => Some(file.len().saturating_sub(1)),
+        crate::cli::OffsetTarget::Virtual(value) => crate::format::Metadata::read_from(file)
+            .and_then(|metadata| metadata.legacy_virtual_offset(value))
+            .ok(),
+        crate::cli::OffsetTarget::EntryPoint => crate::format::Metadata::read_from(file)
+            .and_then(|metadata| metadata.entry_offset())
+            .ok(),
     });
-    requested.filter(|value| *value < len).unwrap_or(0)
+    requested.filter(|value| *value < file.len()).unwrap_or(0)
 }
 
 /*

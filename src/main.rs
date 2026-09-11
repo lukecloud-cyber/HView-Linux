@@ -117,6 +117,51 @@ fn display_path(path: &std::ffi::OsStr) -> String {
 }
 
 /*
+This helper adds the Code architecture, format domain, and displayed address to one header.
+File-domain fields end before the complete file-offset field starts.
+*/
+fn apply_code_header(
+    header: &mut [char],
+    file_offset: u64,
+    location: format::CodeLocation,
+    architecture: format::Architecture,
+    real_mode: bool,
+    format_label: Option<&str>,
+    show_address: bool,
+) {
+    let width = header.len();
+    let architecture_column = if location.domain == format::AddressDomain::File {
+        width.saturating_sub(44)
+    } else {
+        width.saturating_sub(40)
+    };
+    put(
+        header,
+        architecture_column,
+        if real_mode {
+            "Real16"
+        } else {
+            architecture.label()
+        },
+    );
+    if format_label == Some("PE") {
+        let (label_column, label) = if location.domain == format::AddressDomain::File {
+            (width.saturating_sub(38), "FILE")
+        } else {
+            (width.saturating_sub(31), "PE")
+        };
+        put(header, label_column, label);
+    }
+    if show_address || location.address != file_offset {
+        put(
+            header,
+            width.saturating_sub(28),
+            &format!(".{:08X}", location.address),
+        );
+    }
+}
+
+/*
 This renderer converts one buffered Editor state into a complete terminal frame.
 The header shows file state and position before the body and active key bar.
 */
@@ -178,28 +223,23 @@ fn frame(
             .map_err(Clone::clone)
             .and_then(|metadata| metadata.decoder_architecture(view.code_bits))
     {
-        let address = location.address;
         let mut code_header: Vec<char> = lines[0].chars().collect();
-        put(
+        apply_code_header(
             &mut code_header,
-            width.saturating_sub(40),
-            if view.decode_real_mode() {
-                "Real16".to_owned()
-            } else {
-                architecture.label().to_owned()
-            }
-            .as_str(),
-        );
-        if view.raw_model.is_some() || address != view.offset {
+            view.offset,
+            location,
+            architecture,
+            effective_real_mode(view, architecture),
             if view.raw_model.is_none() {
-                put(&mut code_header, width.saturating_sub(31), "PE");
-            }
-            put(
-                &mut code_header,
-                width.saturating_sub(28),
-                &format!(".{address:08X}"),
-            );
-        }
+                metadata
+                    .as_ref()
+                    .ok()
+                    .and_then(format::Metadata::format_label)
+            } else {
+                None
+            },
+            view.raw_model.is_some(),
+        );
         lines[0] = code_header.into_iter().collect();
     }
 
@@ -305,6 +345,14 @@ fn decoder_for(
 }
 
 /*
+This helper enables Real16 only for an effective x86 16-bit decoder.
+Automatic ARM-family PE selection cannot receive an x86 execution flag.
+*/
+fn effective_real_mode(view: &Editor, architecture: format::Architecture) -> bool {
+    matches!(architecture, format::Architecture::X86(16)) && view.decode_real_mode()
+}
+
+/*
 PreviewRows carries formatted instructions and the consumed source range.
 The first instruction size supports replacement-length decisions.
 */
@@ -361,8 +409,8 @@ fn preview_rows(
     let mut first_size = None;
     while file_start.saturating_add(relative) < stop {
         let file_offset = file_start.saturating_add(relative);
-        let address = match metadata.code_location(file_offset as u64) {
-            Ok(location) => location.address,
+        let address = match metadata.code_address(file_offset as u64) {
+            Ok((address, _)) => address,
             Err(error) => {
                 rows.push(format!("F:{file_offset:X} <address error: {error}>"));
                 break;
@@ -424,9 +472,14 @@ fn assembly_preview(
         .ok_or("The instruction exceeds the address range.")?;
     let new_len = view.data.len().max(end);
     view.validate_raw_len(new_len)?;
-    let address = metadata.code_location(view.offset)?.address;
+    let address = metadata.code_address(view.offset)?.0;
     let architecture = metadata.decoder_architecture(view.code_bits)?;
-    let decoder = decoder_for(decoder, architecture, view.syntax, view.decode_real_mode())?;
+    let decoder = decoder_for(
+        decoder,
+        architecture,
+        view.syntax,
+        effective_real_mode(view, architecture),
+    )?;
 
     let original_stop = end.min(view.data.len());
     let mut original = preview_rows(
@@ -679,7 +732,12 @@ fn decode_at(
         .as_ref()
         .map_err(Clone::clone)?
         .decoder_architecture(view.code_bits)?;
-    let decoder = decoder_for(decoder, architecture, view.syntax, view.decode_real_mode())?;
+    let decoder = decoder_for(
+        decoder,
+        architecture,
+        view.syntax,
+        effective_real_mode(view, architecture),
+    )?;
     let mut instruction = if view.invalid_code_bytes {
         decoder.decode_or_byte(&view.data, offset, location.address)?
     } else {
@@ -715,8 +773,13 @@ fn direct_target_offset(
     metadata: &Result<format::Metadata, String>,
     decoder: &mut Option<decoder::Decoder>,
 ) -> Result<u64, String> {
+    /*
+    The source section selects one current byte, Code domain, architecture, and native decoder.
+    The decoder reads only bytes that start at the selected source offset.
+    */
     let metadata = metadata.as_ref().map_err(Clone::clone)?;
-    let address = metadata.navigation_address(&view.data, view.offset)?;
+    let location = metadata.code_location(view.offset)?;
+    let address = location.address;
     let start =
         usize::try_from(view.offset).map_err(|_| "The branch source exceeds the address range.")?;
     let bytes = view
@@ -724,15 +787,68 @@ fn direct_target_offset(
         .get(start..)
         .filter(|bytes| !bytes.is_empty())
         .ok_or("The branch source is outside the current buffer.")?;
-    let target = decoder_for(
+    let architecture = metadata.decoder_architecture(view.code_bits)?;
+    let decoder = decoder_for(
         decoder,
-        metadata.decoder_architecture(view.code_bits)?,
+        architecture,
         view.syntax,
-        view.decode_real_mode(),
-    )?
-    .direct_target(bytes, address)?
-    .ok_or("The instruction has no direct relative branch or call target.")?;
-    metadata.navigation_offset(&view.data, target)
+        effective_real_mode(view, architecture),
+    )?;
+    let instruction_size = decoder.decode(bytes, 0, address)?.size;
+    let target = decoder
+        .direct_target(bytes, address)?
+        .ok_or("The instruction has no direct relative branch or call target.")?;
+
+    /*
+    The target section corrects native low 32-bit File-domain results when required.
+    It then maps the result through the same domain as the displayed source.
+    */
+    let target = if location.domain == format::AddressDomain::File {
+        file_domain_target(architecture, view.offset, instruction_size, target)?
+    } else {
+        target
+    };
+    let target = metadata.target_offset(location.domain, target)?;
+
+    /*
+    The final section requires one current buffered target byte before navigation can change state.
+    This check also bounds explicit raw Metadata, which does not store a file length.
+    */
+    let index =
+        usize::try_from(target).map_err(|_| "The branch target exceeds the address range.")?;
+    view.data
+        .get(index)
+        .map(|_| target)
+        .ok_or_else(|| "The branch target is outside the current buffer.".into())
+}
+
+/*
+This helper corrects Capstone target truncation for non-64-bit File-domain branches.
+The signed low 32-bit displacement restores high file offsets without parsing instruction bytes.
+*/
+fn file_domain_target(
+    architecture: format::Architecture,
+    source: u64,
+    instruction_size: usize,
+    target: u64,
+) -> Result<u64, String> {
+    if !matches!(
+        architecture,
+        format::Architecture::X86(16 | 32)
+            | format::Architecture::Arm
+            | format::Architecture::Thumb
+    ) {
+        return Ok(target);
+    }
+    if instruction_size == 0 {
+        return Err("The file branch location is invalid.".into());
+    }
+    let next = source
+        .checked_add(instruction_size as u64)
+        .ok_or("The branch target exceeds the address range.")?;
+    let delta = (target as u32).wrapping_sub(next as u32) as i32;
+    next.checked_add_signed(i64::from(delta))
+        .ok_or_else(|| "The branch target exceeds the address range.".into())
 }
 
 /*
@@ -773,7 +889,11 @@ fn assembly_seed(
     view: &Editor,
     metadata: &Result<format::Metadata, String>,
 ) -> Result<String, String> {
-    let location = code_location(metadata, view.offset)?;
+    let address = metadata
+        .as_ref()
+        .map_err(Clone::clone)?
+        .code_address(view.offset)?
+        .0;
     let architecture = metadata
         .as_ref()
         .map_err(Clone::clone)?
@@ -781,9 +901,9 @@ fn assembly_seed(
     decoder::Decoder::with_architecture(
         architecture,
         decoder::Syntax::Intel,
-        view.decode_real_mode(),
+        effective_real_mode(view, architecture),
     )?
-    .decode(&view.data, view.offset, location.address)
+    .decode(&view.data, view.offset, address)
     .map(|instruction| instruction.text)
 }
 
@@ -807,6 +927,12 @@ fn cycle_code_mode(view: &mut Editor) -> Result<(), String> {
             }
         };
         return view.set_raw_model(Some(model));
+    }
+    if !matches!(
+        view.metadata()?.decoder_architecture(view.code_bits)?,
+        format::Architecture::X86(_)
+    ) {
+        return Err("The current ARM architecture does not use x86 code widths.".into());
     }
     if view.real_mode {
         view.real_mode = false;
@@ -1670,20 +1796,25 @@ fn open_paged_editor(
 
     /*
     New views resolve File and End offsets from the captured source length.
-    Unsupported format offsets report their limit and start at file offset zero.
+    Virtual and entry requests read bounded current metadata without reading the complete source.
     */
     let mut initial = 0;
     if saved.is_none()
         && let Some(offset) = &options.offset
     {
-        initial = match offset.target {
-            cli::OffsetTarget::File(value) => value,
-            cli::OffsetTarget::End => source.len().saturating_sub(1),
-            cli::OffsetTarget::Virtual(_) | cli::OffsetTarget::EntryPoint => {
-                console.modal(
-                    &[],
-                    "Virtual and entry-point offsets are unavailable for large files. HView-Linux will use file offset zero.",
-                )?;
+        let requested = match offset.target {
+            cli::OffsetTarget::File(value) => Ok(value),
+            cli::OffsetTarget::End => Ok(source.len().saturating_sub(1)),
+            cli::OffsetTarget::Virtual(value) => format::Metadata::read_from(&source)
+                .and_then(|metadata| metadata.legacy_virtual_offset(value)),
+            cli::OffsetTarget::EntryPoint => {
+                format::Metadata::read_from(&source).and_then(|metadata| metadata.entry_offset())
+            }
+        };
+        initial = match requested {
+            Ok(value) => value,
+            Err(error) => {
+                console.modal(&[], &error)?;
                 0
             }
         };
@@ -2454,7 +2585,7 @@ fn open_editor(
                     };
                     let proposed = (|| {
                         let metadata = metadata.as_ref().map_err(Clone::clone)?;
-                        let address = metadata.code_location(view.offset)?.address;
+                        let address = metadata.code_address(view.offset)?.0;
                         let architecture = metadata.decoder_architecture(view.code_bits)?;
                         let bytes = assembler::assemble_architecture(&text, architecture, address)?;
                         let start = usize::try_from(view.offset)
@@ -3100,6 +3231,47 @@ mod tests {
     use super::*;
 
     /*
+    These writers build one small PE fixture for connected Code caller tests.
+    Each caller test changes only the machine, mapping, or instruction bytes that it needs.
+    */
+    fn put_test_word(data: &mut [u8], offset: usize, value: u16) {
+        data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_test_dword(data: &mut [u8], offset: usize, value: u32) {
+        data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn pe_code_fixture(plus: bool, machine: u16) -> Vec<u8> {
+        let mut data = vec![0; 0x600];
+        data[..2].copy_from_slice(b"MZ");
+        put_test_dword(&mut data, 60, 128);
+        data[128..132].copy_from_slice(b"PE\0\0");
+        put_test_word(&mut data, 132, machine);
+        put_test_word(&mut data, 134, 1);
+        put_test_word(&mut data, 148, if plus { 240 } else { 224 });
+        let optional = 152;
+        put_test_word(&mut data, optional, if plus { 0x20b } else { 0x10b });
+        put_test_dword(&mut data, optional + 16, 0x1000);
+        if plus {
+            put_test_dword(&mut data, optional + 24, 0x4000_0000);
+            put_test_dword(&mut data, optional + 28, 1);
+        } else {
+            put_test_dword(&mut data, optional + 28, 0x40_0000);
+        }
+        put_test_dword(&mut data, optional + 32, 0x1000);
+        put_test_dword(&mut data, optional + 36, 0x200);
+        put_test_dword(&mut data, optional + 56, 0x2000);
+        put_test_dword(&mut data, optional + 60, 0x200);
+        let section = optional + if plus { 240 } else { 224 };
+        put_test_dword(&mut data, section + 8, 0x200);
+        put_test_dword(&mut data, section + 12, 0x1000);
+        put_test_dword(&mut data, section + 16, 0x200);
+        put_test_dword(&mut data, section + 20, 0x200);
+        data
+    }
+
+    /*
     This test moves a paged cursor across low and high u64 boundaries.
     Every key keeps the cursor inside the source and visible page.
     A valid saved top remains unchanged when the selected byte is visible.
@@ -3638,6 +3810,31 @@ mod tests {
     }
 
     /*
+    This test keeps the plain-file EOF assembly path separate from bounded Code locations.
+    A mapped PE gap cannot provide a valid assembly address.
+    */
+    #[test]
+    fn assembly_preview_accepts_plain_eof_and_rejects_pe_gaps() {
+        for (data, offset, replacement, instruction) in [
+            (&[][..], 0, &[0x90][..], "nop"),
+            (&[0x90][..], 1, &[0xc3][..], "ret"),
+        ] {
+            let mut view = Editor::new(data.to_vec(), Mode::Code, offset);
+            view.code_bits = 32;
+            let preview =
+                assembly_preview(&view, &view.metadata().unwrap(), &mut None, replacement).unwrap();
+            assert!(preview.original[0].contains("<end of file>"));
+            assert!(preview.proposed[0].contains(instruction));
+        }
+
+        let mut data = pe_code_fixture(false, 0x014c);
+        put_test_dword(&mut data, 376 + 20, 0x300);
+        let mut gap = Editor::new(data, Mode::Code, 0x250);
+        gap.code_bits = 32;
+        assert!(assembly_preview(&gap, &gap.metadata().unwrap(), &mut None, &[0x90]).is_err());
+    }
+
+    /*
     This test checks strict effective decoding for Real16, raw widths, and display syntax.
     Invalid replacement bytes remain unapplied.
     */
@@ -3774,6 +3971,184 @@ mod tests {
         let metadata = view.metadata();
         assert_eq!(direct_target_offset(&view, &metadata, &mut decoder), Ok(4));
         assert!(!view.decode_real_mode());
+    }
+
+    /*
+    This test keeps a File-domain PE branch inside one readable mapping gap.
+    It also bounds explicit raw targets without changing the caller's cursor.
+    */
+    #[test]
+    fn direct_navigation_preserves_file_domains_and_current_bounds() {
+        let mut data = pe_code_fixture(false, 0x014c);
+        put_test_dword(&mut data, 376 + 20, 0x300);
+        data[0x250..0x252].copy_from_slice(&[0xeb, 0x02]);
+        let mut gap = Editor::new(data, Mode::Code, 0x250);
+        gap.code_bits = 32;
+        let metadata = gap.metadata();
+        assert_eq!(
+            metadata
+                .as_ref()
+                .unwrap()
+                .code_location(0x250)
+                .unwrap()
+                .domain,
+            format::AddressDomain::File
+        );
+        assert_eq!(direct_target_offset(&gap, &metadata, &mut None), Ok(0x254));
+
+        let mut raw = Editor::new(vec![0xeb, 0, 0x90], Mode::Code, 0);
+        raw.code_bits = 32;
+        raw.set_raw_model(Some(editor::RawModel {
+            base: 0x1000,
+            architecture: format::Architecture::X86(32),
+            byte_order: editor::ByteOrder::Little,
+        }))
+        .unwrap();
+        assert_eq!(
+            direct_target_offset(&raw, &raw.metadata(), &mut None),
+            Ok(2)
+        );
+
+        for bytes in [vec![0xeb, 2, 0x90, 0x90], vec![0xeb, 3, 0x90, 0x90]] {
+            raw.data = bytes;
+            raw.offset = 0;
+            raw.top = 0;
+            let before = (raw.offset, raw.top);
+            assert!(direct_target_offset(&raw, &raw.metadata(), &mut None).is_err());
+            assert_eq!((raw.offset, raw.top), before);
+        }
+    }
+
+    /*
+    This test replays the Windows high File-domain target correction for each affected engine.
+    X86-64 keeps its complete target, while invalid source arithmetic returns an error.
+    */
+    #[test]
+    fn file_domain_targets_restore_signed_low32_displacements() {
+        let source = 0x1_0000_0010;
+        for architecture in [
+            format::Architecture::X86(16),
+            format::Architecture::X86(32),
+            format::Architecture::Arm,
+            format::Architecture::Thumb,
+        ] {
+            assert_eq!(
+                file_domain_target(architecture, source, 2, 0x16),
+                Ok(0x1_0000_0016)
+            );
+            assert_eq!(
+                file_domain_target(architecture, source, 2, 0x0c),
+                Ok(0x1_0000_000c)
+            );
+        }
+        assert_eq!(
+            file_domain_target(format::Architecture::X86(64), source, 2, 0x16),
+            Ok(0x16)
+        );
+        assert!(file_domain_target(format::Architecture::Arm, u64::MAX, 1, 0).is_err());
+        assert!(file_domain_target(format::Architecture::Thumb, 0, 0, 0).is_err());
+    }
+
+    /*
+    This test passes both established Real16 wrap positions through current direct navigation.
+    The existing decoder result must map each branch back to file offset zero.
+    */
+    #[test]
+    fn direct_navigation_preserves_real16_wrap_vectors() {
+        let mut data = vec![0x90; 0x10002];
+        data[0xfffe..0x10000].copy_from_slice(&[0xeb, 0]);
+        data[0x10000..0x10002].copy_from_slice(&[0xeb, 0xfe]);
+        let mut view = Editor::new(data, Mode::Code, 0xfffe);
+        view.code_bits = 16;
+        view.real_mode = true;
+        let mut decoder = None;
+        assert_eq!(
+            direct_target_offset(&view, &view.metadata(), &mut decoder),
+            Ok(0)
+        );
+        view.offset = 0x10000;
+        assert_eq!(
+            direct_target_offset(&view, &view.metadata(), &mut decoder),
+            Ok(0)
+        );
+    }
+
+    /*
+    This test ignores stored Real16 state for automatic ARM-family PE decoders.
+    The x86 width control must also preserve each effective ARM architecture.
+    */
+    #[test]
+    fn automatic_pe_arm_decoders_ignore_real16_and_width_changes() {
+        for (plus, machine, architecture, instruction) in [
+            (
+                false,
+                0x01c0,
+                format::Architecture::Arm,
+                &[0x00, 0x00, 0xa0, 0xe1][..],
+            ),
+            (
+                false,
+                0x01c2,
+                format::Architecture::Thumb,
+                &[0x01, 0x20][..],
+            ),
+            (
+                true,
+                0xaa64,
+                format::Architecture::Arm64,
+                &[0x1f, 0x20, 0x03, 0xd5][..],
+            ),
+        ] {
+            let mut data = pe_code_fixture(plus, machine);
+            data[0x200..0x200 + instruction.len()].copy_from_slice(instruction);
+            let mut view = Editor::new(data, Mode::Code, 0x200);
+            view.code_bits = 16;
+            view.real_mode = true;
+            let metadata = view.metadata();
+            let mut decoder = None;
+            decode_at(&view, 0x200, &metadata, &mut decoder).unwrap();
+            assert_eq!(decoder.as_ref().unwrap().architecture(), architecture);
+            assert!(!decoder.as_ref().unwrap().real_mode());
+            let before = (view.code_bits, view.real_mode);
+            assert_eq!(
+                cycle_code_mode(&mut view).unwrap_err(),
+                "The current ARM architecture does not use x86 code widths."
+            );
+            assert_eq!((view.code_bits, view.real_mode), before);
+        }
+    }
+
+    /*
+    This test checks exact x86 and ARM64 PE gap header fields at the standard width.
+    Architecture and FILE labels must not cover each other or the file offset.
+    */
+    #[test]
+    fn pe_file_domain_headers_keep_all_fields_separate() {
+        for (plus, machine, expected) in [
+            (false, 0x014c, "a32   FILE 00000250│"),
+            (true, 0xaa64, "ARM64 FILE 00000250│"),
+        ] {
+            let mut data = pe_code_fixture(plus, machine);
+            let section = 152 + if plus { 240 } else { 224 };
+            put_test_dword(&mut data, section + 20, 0x300);
+            let metadata = format::Metadata::parse(&data).unwrap();
+            let location = metadata.code_location(0x250).unwrap();
+            let architecture = metadata.decoder_architecture(32).unwrap();
+            let width = 80;
+            let mut header = vec![' '; width];
+            put(&mut header, width - 33, "00000250│HView-Linux 0.1.0");
+            apply_code_header(
+                &mut header,
+                0x250,
+                location,
+                architecture,
+                false,
+                metadata.format_label(),
+                false,
+            );
+            let header: String = header.into_iter().collect();
+            assert!(header.contains(expected), "{header}");
+        }
     }
 
     /*

@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 import tempfile
 
-from analysis_probe import pe_fixture
+from analysis_probe import pe_fixture, put16
 from terminal_probe import run_session
 
 
@@ -687,6 +687,38 @@ def check_auto_pe_and_session(binary: Path, root: Path) -> None:
         raise AssertionError("The session stored the transient raw model instead of Real16.")
 
 
+# This check lets PE metadata select each supported ARM-family engine automatically.
+# The x86 width control must report its limit and preserve the selected PE architecture.
+def check_auto_pe_arm_families(binary: Path, root: Path) -> None:
+    """Check automatic PE ARM-family labels, decoding, and width limits."""
+    for name, plus, machine, code, architecture, text in [
+        ("arm", False, 0x01C0, bytes.fromhex("00 00 A0 E1"), b"ARM", b"mov"),
+        ("thumb", False, 0x01C2, bytes.fromhex("00 BF"), b"THUMB", b"nop"),
+        ("arm64", True, 0xAA64, bytes.fromhex("1F 20 03 D5"), b"ARM64", b"nop"),
+    ]:
+        data, _ = pe_fixture(plus)
+        fixture = bytearray(data)
+        put16(fixture, 0x84, machine)
+        fixture[0x200 : 0x200 + len(code)] = code
+        path = root / f"pe-{name}.bin"
+        path.write_bytes(fixture)
+        output = run_session(
+            binary,
+            ["--mode=code", "--offset=200", str(path)],
+            [b"o", ENTER, CTRL_Q],
+        )
+        require(
+            output,
+            b"PE",
+            architecture,
+            text,
+            b"The current ARM architecture does not use x86 code widths.",
+        )
+        final = last_header(output, path.name)
+        if b"PE" not in final or architecture not in final or b"Real16" in final:
+            raise AssertionError("The PE width refusal changed the automatic ARM architecture.")
+
+
 # This entry point runs every raw-model group in one disposable directory.
 def main() -> None:
     """Run the raw model checks."""
@@ -706,6 +738,7 @@ def main() -> None:
         check_history_and_width_cycle(binary, root)
         check_transient_lifetime(binary, root)
         check_auto_pe_and_session(binary, root)
+        check_auto_pe_arm_families(binary, root)
     print("Raw model probe passed.")
 
 

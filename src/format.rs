@@ -2,7 +2,12 @@
 This module maps file offsets and runtime addresses for supported executable formats.
 The shared architecture contract gives decoder and assembler callers one validated source of machine facts.
 */
+use crate::paged::PagedFile;
+
 const OUTSIDE: &str = "Offset is out of file";
+const IMAGE_FILE_MACHINE_ARM: u16 = 0x01c0;
+const IMAGE_FILE_MACHINE_THUMB: u16 = 0x01c2;
+const IMAGE_FILE_MACHINE_ARMNT: u16 = 0x01c4;
 
 /*
 Architecture identifies the instruction family and the effective code width.
@@ -120,8 +125,11 @@ Malformed input produces the existing executable-header error.
 */
 
 fn word(data: &[u8], at: usize) -> Result<u16, String> {
+    let end = at
+        .checked_add(2)
+        .ok_or("The executable header range exceeds the address range.")?;
     Ok(u16::from_le_bytes(
-        data.get(at..at + 2)
+        data.get(at..end)
             .ok_or("The executable header is incomplete.")?
             .try_into()
             .unwrap(),
@@ -129,8 +137,11 @@ fn word(data: &[u8], at: usize) -> Result<u16, String> {
 }
 
 fn dword(data: &[u8], at: usize) -> Result<u32, String> {
+    let end = at
+        .checked_add(4)
+        .ok_or("The executable header range exceeds the address range.")?;
     Ok(u32::from_le_bytes(
-        data.get(at..at + 4)
+        data.get(at..end)
             .ok_or("The executable header is incomplete.")?
             .try_into()
             .unwrap(),
@@ -138,14 +149,14 @@ fn dword(data: &[u8], at: usize) -> Result<u32, String> {
 }
 
 /*
-Section stores one PE section mapping between file bytes and virtual extent.
-Pe combines validated header fields and sections for later address conversion.
+Section stores exact PE file and virtual ranges from one section-table record.
+Pe combines validated header fields, sections, and logical file length for later address conversion.
 */
 struct Section {
     rva: u32,
     raw: u32,
-    available: u32,
-    extent: u32,
+    raw_size: u32,
+    virtual_span: u32,
 }
 
 struct Pe {
@@ -154,10 +165,8 @@ struct Pe {
     bits: u32,
     image_base: u64,
     header_size: u32,
-    upper_rva: u32,
-    direct: bool,
-    first_file_offset: u32,
     sections: Vec<Section>,
+    file_len: u64,
 }
 
 /*
@@ -208,6 +217,8 @@ Callers reuse the value for code addresses, navigation, and address conversion.
 pub struct Metadata {
     pe: Option<Pe>,
     raw: Option<Raw>,
+    file_len: Option<u64>,
+    entry_offset: Option<u64>,
 }
 
 /*
@@ -224,12 +235,60 @@ impl Metadata {
             return Ok(Self {
                 pe: None,
                 raw: None,
+                file_len: Some(data.len() as u64),
+                entry_offset: Some(0),
             });
         }
         let pe = pe_header(data)?
             .map(|header| Pe::read(data, header))
             .transpose()?;
-        Ok(Self { pe, raw: None })
+        let entry_offset = match &pe {
+            Some(pe) => pe.rva_to_file(pe.entry),
+            None if data.starts_with(b"MZ") || data.starts_with(b"ZM") => Some(dos_entry(data)?),
+            None => Some(0),
+        };
+        Ok(Self {
+            pe,
+            raw: None,
+            file_len: Some(data.len() as u64),
+            entry_offset,
+        })
+    }
+
+    /*
+    This parser reads only bounded PE header ranges from current paged logical bytes.
+    A distant header does not allocate or read the bytes between the prefix and that header.
+    */
+    pub(crate) fn read_from(file: &PagedFile) -> Result<Self, String> {
+        let prefix_len = usize::try_from(file.len().min(64)).unwrap();
+        let prefix = file
+            .read_window(0, prefix_len)
+            .map_err(|error| error.to_string())?;
+        let header = paged_pe_header(file, &prefix.bytes)?;
+        if header.is_none() && !prefix.bytes.starts_with(b"MZ") && !prefix.bytes.starts_with(b"ZM")
+        {
+            return Err(
+                "Virtual and entry-point offsets are unavailable for large files. HView-Linux will use file offset zero."
+                    .into(),
+            );
+        }
+        let pe = header
+            .map(|offset| Pe::read_from(file, offset))
+            .transpose()?;
+        let entry_offset = match &pe {
+            Some(pe) => pe.rva_to_file(pe.entry),
+            None if prefix.bytes.starts_with(b"MZ") || prefix.bytes.starts_with(b"ZM") => {
+                Some(dos_entry(&prefix.bytes)?)
+            }
+            None => Some(0),
+        };
+        file.validate().map_err(|error| error.to_string())?;
+        Ok(Self {
+            pe,
+            raw: None,
+            file_len: Some(file.len()),
+            entry_offset,
+        })
     }
 
     /*
@@ -256,14 +315,19 @@ impl Metadata {
         Ok(Self {
             pe: None,
             raw: Some(raw),
+            file_len: None,
+            entry_offset: Some(0),
         })
     }
 
     /*
     This query returns an address, architecture, and domain for one existing code mapping.
-    It preserves PE mapping failures and unsupported machine errors.
+    PE gaps and overlays keep their file address so Code display can show each source byte.
     */
     pub fn code_location(&self, file_offset: u64) -> Result<CodeLocation, String> {
+        if self.file_len.is_some_and(|len| file_offset >= len) {
+            return Err(OUTSIDE.into());
+        }
         if let Some(raw) = self.raw {
             return Ok(CodeLocation {
                 address: raw.address(file_offset)?,
@@ -272,24 +336,29 @@ impl Metadata {
                 domain: AddressDomain::Va,
             });
         }
-        self.validate_code_machine()?;
-        match &self.pe {
-            Some(pe) => pe
-                .file_to_virtual(file_offset)
-                .map(|address| CodeLocation {
+        if let Some(pe) = &self.pe {
+            let architecture = pe.architecture()?;
+            return Ok(match pe.file_to_virtual(file_offset) {
+                Some(address) => CodeLocation {
                     address,
-                    bits: pe.bits,
-                    architecture: Architecture::X86(pe.bits),
+                    bits: architecture.bits(),
+                    architecture,
                     domain: AddressDomain::Va,
-                })
-                .ok_or_else(|| OUTSIDE.into()),
-            None => Ok(CodeLocation {
-                address: file_offset,
-                bits: 16,
-                architecture: Architecture::X86(16),
-                domain: AddressDomain::File,
-            }),
+                },
+                None => CodeLocation {
+                    address: file_offset,
+                    bits: architecture.bits(),
+                    architecture,
+                    domain: AddressDomain::File,
+                },
+            });
         }
+        Ok(CodeLocation {
+            address: file_offset,
+            bits: 16,
+            architecture: Architecture::X86(16),
+            domain: AddressDomain::File,
+        })
     }
 
     /*
@@ -297,8 +366,20 @@ impl Metadata {
     New callers can retain the address domain when their operation requires it.
     */
     pub fn code_address(&self, file_offset: u64) -> Result<(u64, u32), String> {
-        let location = self.code_location(file_offset)?;
-        Ok((location.address, location.bits))
+        if let Some(raw) = self.raw {
+            return raw
+                .address(file_offset)
+                .map(|address| (address, raw.architecture.bits()));
+        }
+        match &self.pe {
+            Some(pe) => {
+                let architecture = pe.architecture()?;
+                pe.file_to_virtual(file_offset)
+                    .map(|address| (address, architecture.bits()))
+                    .ok_or_else(|| OUTSIDE.into())
+            }
+            None => Ok((file_offset, 16)),
+        }
     }
 
     /*
@@ -312,7 +393,14 @@ impl Metadata {
                 architecture => Ok(architecture),
             };
         }
-        self.validate_code_machine()?;
+        if let Some(pe) = &self.pe {
+            return match pe.architecture()? {
+                architecture @ (Architecture::Arm | Architecture::Thumb | Architecture::Arm64) => {
+                    Ok(architecture)
+                }
+                Architecture::X86(_) => Architecture::x86(fallback_bits),
+            };
+        }
         Architecture::x86(fallback_bits)
     }
 
@@ -320,6 +408,7 @@ impl Metadata {
     This navigation query validates a source file byte before returning its runtime address.
     PE sources require a mapped virtual address.
     */
+    #[cfg(test)]
     pub fn navigation_address(&self, data: &[u8], file_offset: u64) -> Result<u64, String> {
         if let Some(raw) = self.raw {
             let offset = usize::try_from(file_offset)
@@ -328,8 +417,17 @@ impl Metadata {
                 .ok_or("The branch source is outside the current buffer.")?;
             return raw.address(file_offset);
         }
-        self.validate_code_machine()?;
-        if self.pe.is_some() || data.starts_with(b"MZ") || data.starts_with(b"ZM") {
+        if let Some(pe) = &self.pe {
+            pe.architecture()?;
+            let offset = usize::try_from(file_offset)
+                .map_err(|_| "The branch source exceeds the address range.")?;
+            data.get(offset)
+                .ok_or("The branch source is outside the current buffer.")?;
+            return pe
+                .file_to_virtual(file_offset)
+                .ok_or_else(|| "The branch source has no virtual address.".into());
+        }
+        if data.starts_with(b"MZ") || data.starts_with(b"ZM") {
             return convert_address(data, AddressKind::File, file_offset)?
                 .va
                 .ok_or_else(|| "The branch source has no virtual address.".into());
@@ -345,6 +443,7 @@ impl Metadata {
     This navigation query maps a runtime address back to one source file byte.
     Raw, PE, and plain sources retain their established bounds.
     */
+    #[cfg(test)]
     pub fn navigation_offset(&self, data: &[u8], address: u64) -> Result<u64, String> {
         if let Some(raw) = self.raw {
             let offset = raw.offset(address)?;
@@ -354,7 +453,18 @@ impl Metadata {
                 .ok_or("The branch target is outside the current buffer.")?;
             return Ok(offset);
         }
-        if self.pe.is_some() || data.starts_with(b"MZ") || data.starts_with(b"ZM") {
+        if let Some(pe) = &self.pe {
+            pe.architecture()?;
+            let offset = pe
+                .va_to_file(address)
+                .ok_or("The branch target has no file byte.")?;
+            let index = usize::try_from(offset)
+                .map_err(|_| "The branch target exceeds the address range.")?;
+            data.get(index)
+                .ok_or("The branch target is outside the current buffer.")?;
+            return Ok(offset);
+        }
+        if data.starts_with(b"MZ") || data.starts_with(b"ZM") {
             let offset = convert_address(data, AddressKind::Va, address)?
                 .file_offset
                 .ok_or("The branch target has no file byte.")?;
@@ -366,6 +476,63 @@ impl Metadata {
         data.get(offset)
             .map(|_| address)
             .ok_or_else(|| "The branch target is outside the current buffer.".into())
+    }
+
+    /*
+    This conversion maps one address through its explicit domain and checks the logical file length.
+    Strict VA users cannot reinterpret the same number as an RVA.
+    */
+    pub(crate) fn target_offset(&self, domain: AddressDomain, target: u64) -> Result<u64, String> {
+        let offset = match domain {
+            AddressDomain::File => target,
+            AddressDomain::Va => {
+                if let Some(raw) = self.raw {
+                    raw.offset(target)?
+                } else if let Some(pe) = &self.pe {
+                    pe.va_to_file(target).ok_or(OUTSIDE)?
+                } else {
+                    return Err("The file has no virtual address mapping.".into());
+                }
+            }
+        };
+        if self.file_len.is_some_and(|len| offset >= len) {
+            return Err(OUTSIDE.into());
+        }
+        Ok(offset)
+    }
+
+    /*
+    This compatibility conversion accepts either an RVA or a preferred-base VA for PE startup input.
+    Two different valid mappings make the input ambiguous and produce an error.
+    */
+    pub(crate) fn legacy_virtual_offset(&self, value: u64) -> Result<u64, String> {
+        if self.raw.is_some() {
+            return self.target_offset(AddressDomain::Va, value);
+        }
+        if let Some(pe) = &self.pe {
+            return pe.legacy_virtual_to_file(value);
+        }
+        self.target_offset(AddressDomain::File, value)
+    }
+
+    /*
+    This query returns the parsed entry file offset after a final logical-length check.
+    Callers can use the result without reading the complete paged source.
+    */
+    pub(crate) fn entry_offset(&self) -> Result<u64, String> {
+        self.entry_offset
+            .filter(|offset| self.file_len.is_none_or(|len| *offset < len))
+            .ok_or_else(|| OUTSIDE.into())
+    }
+
+    /*
+    This label identifies parsed PE metadata for paged startup and focused checks.
+    Raw and plain sources keep their existing display behavior.
+    */
+    pub(crate) fn format_label(&self) -> Option<&'static str> {
+        self.raw
+            .map(|_| "RAW")
+            .or_else(|| self.pe.as_ref().map(|_| "PE"))
     }
 
     /*
@@ -408,209 +575,412 @@ impl Metadata {
             AddressKind::Rva => Err("Raw address mode has no RVA.".into()),
         }
     }
-
-    /*
-    This validation accepts only the existing x86 PE machine identifiers.
-    Later architecture goals own additional executable-machine support.
-    */
-    fn validate_code_machine(&self) -> Result<(), String> {
-        if let Some(pe) = &self.pe
-            && !matches!(pe.machine, 332 | 34404)
-        {
-            return Err("The PE processor is unsupported for code decoding.".into());
-        }
-        Ok(())
-    }
 }
 
 /*
-These PE methods retain the legacy parser and mapping arithmetic for existing code paths.
-The parsed sections remain immutable after construction.
+These PE readers collect bounded header parts before they use one shared validator.
+The resulting map uses exact declared file ranges and checked virtual ranges.
 */
 impl Pe {
     /*
-    This parser reads legacy PE headers and section records from the supplied bytes.
-    It normalizes alignments and rejects incomplete tables or the specific header and first-section overlap.
-    It does not reject all invalid alignments or ambiguous section ranges.
+    This selector validates each supported PE machine and optional-header width pair.
+    ARMNT remains an explicit capability error for Code operations.
+    */
+    fn architecture(&self) -> Result<Architecture, String> {
+        match (self.machine, self.bits) {
+            (0x014c, 32) => Ok(Architecture::X86(32)),
+            (IMAGE_FILE_MACHINE_ARM, 32) => Ok(Architecture::Arm),
+            (IMAGE_FILE_MACHINE_THUMB, 32) => Ok(Architecture::Thumb),
+            (IMAGE_FILE_MACHINE_ARMNT, 32) => Err("PE ARMNT code decoding is unsupported.".into()),
+            (0x8664, 64) => Ok(Architecture::X86(64)),
+            (0xaa64, 64) => Ok(Architecture::Arm64),
+            _ => Err("The PE processor is unsupported for code decoding.".into()),
+        }
+    }
+
+    /*
+    This buffered reader slices only the COFF header, required optional fields, and section table.
+    Checked offsets prevent malformed headers from wrapping a slice range.
     */
     fn read(data: &[u8], header: usize) -> Result<Self, String> {
-        /*
-        The first section validates the COFF and optional headers.
-        It derives image geometry before section-table reads begin.
-        */
-        let file_size =
-            u32::try_from(data.len()).map_err(|_| "PE files above 4 GB are unsupported.")?;
-        let count = usize::from(word(data, header + 6)?);
-        let optional_size = usize::from(word(data, header + 20)?);
-        let optional = header + 24;
-        let magic = word(data, optional)?;
-        let image_base = match magic {
-            0x10b => u64::from(dword(data, optional + 28)?),
-            0x20b => {
-                u64::from(dword(data, optional + 24)?)
-                    | (u64::from(dword(data, optional + 28)?) << 32)
-            }
-            _ => return Err("The PE optional-header type is unsupported.".into()),
-        };
+        let count_at = header
+            .checked_add(6)
+            .ok_or("The COFF header offset exceeds the address range.")?;
+        let count = usize::from(word(data, count_at)?);
+        if count > 96 {
+            return Err("The PE section count exceeds the Windows limit of 96.".into());
+        }
+        let optional_size_at = header
+            .checked_add(20)
+            .ok_or("The COFF header offset exceeds the address range.")?;
+        let optional_size = usize::from(word(data, optional_size_at)?);
+        let optional = header
+            .checked_add(24)
+            .ok_or("The optional-header offset exceeds the address range.")?;
+        let table = optional
+            .checked_add(optional_size)
+            .ok_or("The section-table offset exceeds the address range.")?;
+        let table_size = count
+            .checked_mul(40)
+            .ok_or("The section-table range exceeds the address range.")?;
+        let table_end = table
+            .checked_add(table_size)
+            .ok_or("The section-table range exceeds the address range.")?;
+        let coff = data
+            .get(header..optional)
+            .ok_or("The executable header is incomplete.")?;
+        let optional_prefix_end = optional
+            .checked_add(64)
+            .ok_or("The optional-header range exceeds the address range.")?;
+        let optional_data = data
+            .get(optional..optional_prefix_end)
+            .ok_or("The executable header is incomplete.")?;
+        let sections = data
+            .get(table..table_end)
+            .ok_or("The PE section table is incomplete.")?;
+        Self::from_parts(
+            data.len() as u64,
+            u32::try_from(header)
+                .map_err(|_| "The PE header offset exceeds the PE address range.")?,
+            optional_size,
+            coff,
+            optional_data,
+            sections,
+        )
+    }
+
+    /*
+    This paged reader requests the same three bounded parts through current logical spans.
+    The 96-section limit keeps the largest section-table request below 64 KiB.
+    */
+    fn read_from(file: &PagedFile, header: u32) -> Result<Self, String> {
+        let mut coff = [0; 24];
+        read_paged_exact(file, u64::from(header), &mut coff, "executable header")?;
+        let count = usize::from(word(&coff, 6)?);
+        if count > 96 {
+            return Err("The PE section count exceeds the Windows limit of 96.".into());
+        }
+        let optional_size = usize::from(word(&coff, 20)?);
         if optional_size < 64 {
             return Err("The PE optional header is incomplete.".into());
         }
-        let section_alignment = dword(data, optional + 32)?;
-        let file_alignment = dword(data, optional + 36)?;
-        let direct = count == 0 || section_alignment < 4096 && section_alignment == file_alignment;
-        let section_alignment = if section_alignment == 0 {
-            4096
-        } else {
-            section_alignment
+        let optional_offset = u64::from(header)
+            .checked_add(24)
+            .ok_or("The optional-header offset exceeds the address range.")?;
+        let mut optional = [0; 64];
+        read_paged_exact(file, optional_offset, &mut optional, "executable header")?;
+        let table = optional_offset
+            .checked_add(optional_size as u64)
+            .ok_or("The section-table offset exceeds the address range.")?;
+        let table_size = count
+            .checked_mul(40)
+            .ok_or("The section-table range exceeds the address range.")?;
+        let mut sections = vec![0; table_size];
+        read_paged_exact(file, table, &mut sections, "PE section table")?;
+        Self::from_parts(
+            file.len(),
+            header,
+            optional_size,
+            &coff,
+            &optional,
+            &sections,
+        )
+    }
+
+    /*
+    This shared validator checks header geometry and every exact section range.
+    No alignment rounding or direct-map shortcut changes a declared file position.
+    */
+    fn from_parts(
+        file_len: u64,
+        header: u32,
+        optional_size: usize,
+        coff: &[u8],
+        optional: &[u8],
+        sections: &[u8],
+    ) -> Result<Self, String> {
+        /*
+        The header section checks size limits, class fields, and the complete section table.
+        Validated header facts then initialize the immutable mapping record.
+        */
+        let count = usize::from(word(coff, 6)?);
+        if count > 96 {
+            return Err("The PE section count exceeds the Windows limit of 96.".into());
+        }
+        if optional_size < 64 {
+            return Err("The PE optional header is incomplete.".into());
+        }
+        let magic = word(optional, 0)?;
+        let (bits, image_base) = match magic {
+            0x10b => (32, u64::from(dword(optional, 28)?)),
+            0x20b => (
+                64,
+                u64::from(dword(optional, 24)?) | (u64::from(dword(optional, 28)?) << 32),
+            ),
+            _ => return Err("The PE optional-header type is unsupported.".into()),
         };
-        let file_alignment = if file_alignment == 0 {
-            512
-        } else {
-            file_alignment
-        };
-        let mut pe = Self {
-            entry: dword(data, optional + 16)?,
-            machine: word(data, header + 4)?,
-            bits: if magic == 0x20b { 64 } else { 32 },
-            image_base,
-            header_size: dword(data, optional + 60)?,
-            upper_rva: dword(data, optional + 56)?,
-            direct,
-            first_file_offset: if direct { 0 } else { header as u32 },
-            sections: Vec::with_capacity(count),
-        };
-        let mut first_raw_pointer = u32::MAX;
-        let table = optional + optional_size;
-        if data.get(table..table + count * 40).is_none() {
+        let header_size = dword(optional, 60)?;
+        if header_size == 0 || u64::from(header_size) > file_len {
+            return Err("The PE header range is outside the file.".into());
+        }
+        checked_pe_va(bits, image_base, u64::from(header_size - 1), "PE header")?;
+        let expected_section_bytes = count
+            .checked_mul(40)
+            .ok_or("The section-table range exceeds the address range.")?;
+        if sections.len() != expected_section_bytes {
             return Err("The PE section table is incomplete.".into());
         }
+        let optional_size = u64::try_from(optional_size)
+            .map_err(|_| "The section-table offset exceeds the address range.")?;
+        let table = u64::from(header)
+            .checked_add(24)
+            .and_then(|at| at.checked_add(optional_size))
+            .ok_or("The section-table offset exceeds the address range.")?;
+        let table_end = table
+            .checked_add(expected_section_bytes as u64)
+            .ok_or("The section-table range exceeds the address range.")?;
+        if table_end > u64::from(header_size) {
+            return Err("The section table exceeds the declared PE headers.".into());
+        }
+        let mut pe = Self {
+            entry: dword(optional, 16)?,
+            machine: word(coff, 4)?,
+            bits,
+            image_base,
+            header_size,
+            sections: Vec::with_capacity(count),
+            file_len,
+        };
+
         /*
-        The second section normalizes each section range to the loader alignment.
-        Available source bytes limit the virtual extent used for code mapping.
+        The section loop validates each file range, virtual range, and preferred virtual address.
+        A zero raw size creates a virtual-only range without a source byte.
         */
         for index in 0..count {
-            let at = table + index * 40;
-            let virtual_size = dword(data, at + 8)?;
-            let rva = dword(data, at + 12)?;
-            let raw_size = dword(data, at + 16)?;
-            let raw_pointer = dword(data, at + 20)?;
-            if index == 0 && table > rva as usize {
-                return Err("PE headers that overlap section addresses are unsupported.".into());
+            let at = index * 40;
+            let virtual_size = dword(sections, at + 8)?;
+            let rva = dword(sections, at + 12)?;
+            let raw_size = dword(sections, at + 16)?;
+            let raw = dword(sections, at + 20)?;
+            let virtual_span = virtual_size.max(raw_size);
+            let virtual_end = u64::from(rva)
+                .checked_add(u64::from(virtual_span))
+                .ok_or("A section virtual range exceeds the address range.")?;
+            if virtual_end > u64::from(u32::MAX) + 1 {
+                return Err("A section virtual range exceeds the PE address range.".into());
             }
-            let raw = if direct {
-                raw_pointer
-            } else {
-                raw_pointer & file_alignment.wrapping_neg()
-            };
-            let mut available = 0;
-            if raw_pointer != 0 && raw_size != 0 {
-                available = if direct {
-                    raw_size
-                } else {
-                    raw_size.wrapping_add(file_alignment).wrapping_sub(1)
-                        & file_alignment.wrapping_neg()
-                };
-                if available.wrapping_add(raw) > file_size {
-                    available = file_size.wrapping_sub(raw);
+            if virtual_span != 0 {
+                if rva < header_size {
+                    return Err("A section virtual range overlaps the PE headers.".into());
+                }
+                checked_pe_va(bits, image_base, virtual_end - 1, "section")?;
+            }
+            if raw_size != 0 {
+                if raw == 0 {
+                    return Err("A section with raw bytes has a zero file offset.".into());
+                }
+                if raw < header_size {
+                    return Err("A section raw range overlaps the PE headers.".into());
+                }
+                let raw_end = u64::from(raw)
+                    .checked_add(u64::from(raw_size))
+                    .ok_or("A section raw range exceeds the address range.")?;
+                if raw_end > file_len {
+                    return Err("The section raw data range is outside the file.".into());
                 }
             }
-            let size = if virtual_size == 0 {
-                raw_size
-            } else {
-                virtual_size
-            };
-            let mut extent = if size == 0 {
-                0
-            } else {
-                section_alignment.wrapping_mul(
-                    size.wrapping_add(section_alignment).wrapping_sub(1) / section_alignment,
-                )
-            };
-            if available != 0 && extent > available {
-                extent = available;
-            }
-            if available != 0 && raw_pointer < first_raw_pointer {
-                first_raw_pointer = raw_pointer;
-                pe.first_file_offset = (header as u32).min(raw);
-            }
-            pe.upper_rva = rva.wrapping_add(extent);
             pe.sections.push(Section {
                 rva,
                 raw,
-                available,
-                extent,
+                raw_size,
+                virtual_span,
             });
+        }
+
+        /*
+        The final section rejects aliases that would give one byte two raw or virtual meanings.
+        A valid map then supplies all buffered and paged consumers.
+        */
+        for (index, left) in pe.sections.iter().enumerate() {
+            for right in &pe.sections[index + 1..] {
+                if ranges_overlap(left.raw, left.raw_size, right.raw, right.raw_size) {
+                    return Err("Two section raw ranges overlap.".into());
+                }
+                if ranges_overlap(left.rva, left.virtual_span, right.rva, right.virtual_span) {
+                    return Err("Two section virtual ranges overlap.".into());
+                }
+            }
         }
         Ok(pe)
     }
 
     /*
-    This helper uses a direct mapping shortcut when the legacy layout permits one.
-    Other layouts use the retained section and header mapping arithmetic.
+    This mapping returns only header bytes and declared section raw bytes.
+    A virtual-only tail has no file byte.
     */
-    fn rva_to_file(&self, rva: u32) -> Option<u32> {
-        if self.direct {
-            return Some(rva);
+    fn rva_to_file(&self, rva: u32) -> Option<u64> {
+        if rva < self.header_size {
+            return Some(u64::from(rva));
         }
-        if rva != 0 && rva < self.upper_rva {
-            for section in &self.sections {
-                if section.available != 0
-                    && rva >= section.rva
-                    && rva < section.rva.wrapping_add(section.extent)
-                {
-                    return Some(rva.wrapping_sub(section.rva).wrapping_add(section.raw));
-                }
-            }
-        }
-        (rva < self.header_size).then_some(rva)
-    }
-
-    /*
-    This helper first tries an image-relative candidate, and then it tries the supplied value as an RVA.
-    Each candidate uses the retained legacy RVA mapper.
-    */
-    fn virtual_to_file(&self, address: u64) -> Option<u32> {
-        let rva = if address != u64::MAX && address >= self.image_base {
-            address - self.image_base
-        } else {
-            address
-        };
-        for candidate in [rva, address] {
-            if candidate <= u64::from(self.upper_rva)
-                && let Some(offset) = self
-                    .rva_to_file(candidate as u32)
-                    .filter(|v| *v != u32::MAX)
-            {
-                return Some(offset);
+        for section in &self.sections {
+            let Some(delta) = rva.checked_sub(section.rva) else {
+                continue;
+            };
+            if delta < section.virtual_span && delta < section.raw_size {
+                return u64::from(section.raw).checked_add(u64::from(delta));
             }
         }
         None
     }
 
     /*
-    This helper preserves the legacy direct, section, and header arithmetic for file-to-virtual mapping.
-    The helper uses stored ranges and wrapping address operations.
+    This strict reverse mapping accepts only a preferred-base virtual address.
+    Branch targets use this path and never retry the value as an RVA.
+    */
+    fn va_to_file(&self, address: u64) -> Option<u64> {
+        let rva = address.checked_sub(self.image_base)?;
+        self.rva_to_file(u32::try_from(rva).ok()?)
+    }
+
+    /*
+    This compatibility path accepts an RVA or a preferred-base virtual address.
+    Different valid results make the input ambiguous.
+    */
+    fn legacy_virtual_to_file(&self, address: u64) -> Result<u64, String> {
+        let mut mapped = None;
+        let va_rva = address
+            .checked_sub(self.image_base)
+            .and_then(|value| u32::try_from(value).ok());
+        let bare_rva = u32::try_from(address).ok();
+        for rva in [va_rva, bare_rva].into_iter().flatten() {
+            let Some(offset) = self.rva_to_file(rva) else {
+                continue;
+            };
+            if mapped.is_some_and(|previous| previous != offset) {
+                return Err("The value has ambiguous RVA and VA mappings.".into());
+            }
+            mapped = Some(offset);
+        }
+        mapped.ok_or_else(|| OUTSIDE.into())
+    }
+
+    /*
+    This mapping returns a virtual address only for a declared header or section source byte.
+    File gaps and overlays remain valid File-domain bytes.
     */
     fn file_to_virtual(&self, offset: u64) -> Option<u64> {
-        if self.direct {
-            return (offset < u64::from(self.upper_rva))
-                .then(|| self.image_base.wrapping_add(offset));
+        if offset >= self.file_len {
+            return None;
         }
-        let low = offset as u32;
-        if offset >= u64::from(self.first_file_offset) {
-            for section in &self.sections {
-                if section.available != 0
-                    && low >= section.raw
-                    && low < section.raw.wrapping_add(section.available)
-                    && low.wrapping_sub(section.raw) < section.extent
-                {
-                    let rva = low.wrapping_add(section.rva).wrapping_sub(section.raw);
-                    return Some(self.image_base.wrapping_add(u64::from(rva)));
-                }
+        if offset < u64::from(self.header_size) {
+            return checked_pe_va(self.bits, self.image_base, offset, "header byte").ok();
+        }
+        for section in &self.sections {
+            let Some(delta) = offset.checked_sub(u64::from(section.raw)) else {
+                continue;
+            };
+            if delta >= u64::from(section.raw_size) || delta >= u64::from(section.virtual_span) {
+                continue;
             }
+            let rva = u64::from(section.rva).checked_add(delta)?;
+            return checked_pe_va(self.bits, self.image_base, rva, "section byte").ok();
         }
-        (offset < u64::from(self.header_size)).then(|| self.image_base.wrapping_add(u64::from(low)))
+        None
     }
+}
+
+/*
+This helper adds an RVA to the preferred image base with the selected PE width limit.
+Each mapping caller receives an error before an invalid virtual address becomes visible.
+*/
+fn checked_pe_va(bits: u32, image_base: u64, rva: u64, what: &str) -> Result<u64, String> {
+    let address = image_base
+        .checked_add(rva)
+        .ok_or_else(|| format!("The {what} virtual address exceeds the address range."))?;
+    if bits == 32 && address > u64::from(u32::MAX) {
+        return Err(format!(
+            "The {what} virtual address exceeds the PE32 address range."
+        ));
+    }
+    Ok(address)
+}
+
+/*
+These paged helpers preserve I/O errors and identify incomplete format ranges.
+Each exact read uses one current logical window and verifies its returned length.
+*/
+fn read_paged_exact(
+    file: &PagedFile,
+    offset: u64,
+    output: &mut [u8],
+    name: &str,
+) -> Result<(), String> {
+    let end = offset
+        .checked_add(output.len() as u64)
+        .filter(|end| *end <= file.len())
+        .ok_or_else(|| format!("The {name} is incomplete."))?;
+    debug_assert!(end >= offset);
+    let window = file
+        .read_window(offset, output.len())
+        .map_err(|error| error.to_string())?;
+    if window.bytes.len() != output.len() {
+        return Err(format!("The {name} is incomplete."));
+    }
+    output.copy_from_slice(&window.bytes);
+    Ok(())
+}
+
+/*
+This detector reads a distant executable signature without reading the intervening bytes.
+It preserves recognized unsupported formats and returns no PE header for plain or ELF sources.
+*/
+fn paged_pe_header(file: &PagedFile, prefix: &[u8]) -> Result<Option<u32>, String> {
+    if prefix.starts_with(b"\x7fELF") {
+        return Ok(None);
+    }
+    if prefix.starts_with(b"NetWare Loadable Module\x1a") {
+        return Err("This executable format is unsupported.".into());
+    }
+    if [b"NE", b"LE", b"LX"]
+        .iter()
+        .any(|magic| prefix.starts_with(*magic))
+    {
+        return Err("NE, LE, and LX executable formats are unsupported.".into());
+    }
+    if !prefix.starts_with(b"MZ") && !prefix.starts_with(b"ZM") {
+        return Ok(None);
+    }
+    let Some(header) = prefix
+        .get(60..64)
+        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+    else {
+        return Ok(None);
+    };
+    if u64::from(header) >= file.len() {
+        return Ok(None);
+    }
+    let length = usize::try_from((file.len() - u64::from(header)).min(4)).unwrap();
+    let signature = file
+        .read_window(u64::from(header), length)
+        .map_err(|error| error.to_string())?;
+    if &*signature.bytes == b"PE\0\0" {
+        return Ok(Some(header));
+    }
+    if [b"NE", b"LE", b"LX"]
+        .iter()
+        .any(|magic| signature.bytes.starts_with(*magic))
+    {
+        return Err("NE, LE, and LX executable formats are unsupported.".into());
+    }
+    Ok(None)
+}
+
+/*
+This helper calculates the retained DOS entry file offset from its segment and instruction fields.
+Buffered and paged metadata use the same checked fixed-width readers.
+*/
+fn dos_entry(data: &[u8]) -> Result<u64, String> {
+    Ok(u64::from(word(data, 20)?) + 16 * (u64::from(word(data, 8)?) + u64::from(word(data, 22)?)))
 }
 
 /*
@@ -1661,15 +2031,10 @@ Plain sources retain their existing zero entry, and DOS files retain their legac
 pub fn entry_point(data: &[u8]) -> Result<u64, String> {
     if let Some(header) = pe_header(data)? {
         let pe = Pe::read(data, header)?;
-        return pe
-            .rva_to_file(pe.entry)
-            .filter(|v| *v != u32::MAX)
-            .map(u64::from)
-            .ok_or_else(|| OUTSIDE.into());
+        return pe.rva_to_file(pe.entry).ok_or_else(|| OUTSIDE.into());
     }
     if data.starts_with(b"MZ") || data.starts_with(b"ZM") {
-        return Ok(u64::from(word(data, 20)?)
-            + 16 * (u64::from(word(data, 8)?) + u64::from(word(data, 22)?)));
+        return dos_entry(data);
     }
     Ok(0)
 }
@@ -1680,10 +2045,7 @@ Plain-source behavior and existing mapping errors remain unchanged.
 */
 pub fn virtual_to_file(data: &[u8], address: u64) -> Result<u64, String> {
     match pe_header(data)? {
-        Some(header) => Pe::read(data, header)?
-            .virtual_to_file(address)
-            .map(u64::from)
-            .ok_or_else(|| OUTSIDE.into()),
+        Some(header) => Pe::read(data, header)?.legacy_virtual_to_file(address),
         None => Ok(address),
     }
 }
@@ -1693,14 +2055,14 @@ This standalone tuple wrapper returns one current code address and compatibility
 Callers that need the address domain use code_location instead.
 */
 pub fn code_address(data: &[u8], file_offset: u64) -> Result<(u64, u32), String> {
-    let location = code_location(data, file_offset)?;
-    Ok((location.address, location.bits))
+    Metadata::parse(data)?.code_address(file_offset)
 }
 
 /*
 This standalone helper parses the source and returns its complete CodeLocation.
 Callers that retain the domain can distinguish file offsets from virtual addresses.
 */
+#[cfg(test)]
 pub fn code_location(data: &[u8], file_offset: u64) -> Result<CodeLocation, String> {
     Metadata::parse(data)?.code_location(file_offset)
 }
@@ -1708,6 +2070,22 @@ pub fn code_location(data: &[u8], file_offset: u64) -> Result<CodeLocation, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::FileExt;
+
+    /*
+    This helper returns one unique temporary pathname for native paged metadata checks.
+    Each test removes its file after the owned PagedFile closes.
+    */
+    fn temp_path(label: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "hview-l08-pe-{label}-{}-{unique}.bin",
+            std::process::id()
+        ))
+    }
 
     /*
     These fixture writers place little-endian values into preallocated PE buffers.
@@ -1880,17 +2258,499 @@ mod tests {
                 .is_err()
         );
         let mut data = fixture(false);
+        data.resize(1025, 0);
         put(&mut data, 396, 513);
-        assert_eq!(entry_point(&data), Ok(512));
+        assert_eq!(entry_point(&data), Ok(513));
         put(&mut data, 180, 1024);
-        assert_eq!(virtual_to_file(&data, 4096), Ok(512));
+        assert_eq!(virtual_to_file(&data, 4096), Ok(513));
         put(&mut data, 184, 512);
-        assert_eq!(entry_point(&data), Ok(4096));
+        assert_eq!(entry_point(&data), Ok(513));
         put(&mut data, 184, 4096);
         put(&mut data, 396, 0);
         assert!(entry_point(&data).is_err());
         data[134] = 0;
-        assert_eq!(entry_point(&data), Ok(4096));
+        assert!(entry_point(&data).is_err());
+    }
+
+    /*
+    This test rejects PE section aliases, out-of-file ranges, and preferred-address overflow.
+    Each failure occurs while shared metadata is built for buffered or paged consumers.
+    */
+    #[test]
+    fn product_pe_mapping_rejects_invalid_ranges() {
+        let mut raw_outside = fixture(false);
+        put(&mut raw_outside, 376 + 16, 513);
+        assert!(
+            Metadata::parse(&raw_outside)
+                .err()
+                .unwrap()
+                .contains("raw data range is outside")
+        );
+
+        let mut raw_overlap = fixture(false);
+        raw_overlap[134] = 2;
+        put(&mut raw_overlap, 416 + 8, 0x100);
+        put(&mut raw_overlap, 416 + 12, 0x2000);
+        put(&mut raw_overlap, 416 + 16, 0x100);
+        put(&mut raw_overlap, 416 + 20, 0x300);
+        assert!(
+            Metadata::parse(&raw_overlap)
+                .err()
+                .unwrap()
+                .contains("raw ranges overlap")
+        );
+
+        let mut virtual_overlap = fixture(false);
+        virtual_overlap[134] = 2;
+        put(&mut virtual_overlap, 416 + 8, 0x100);
+        put(&mut virtual_overlap, 416 + 12, 0x1100);
+        assert!(
+            Metadata::parse(&virtual_overlap)
+                .err()
+                .unwrap()
+                .contains("virtual ranges overlap")
+        );
+
+        let mut address_overflow = fixture(false);
+        put(&mut address_overflow, 152 + 28, 0xffff_f000);
+        assert!(
+            Metadata::parse(&address_overflow)
+                .err()
+                .unwrap()
+                .contains("PE32 address range")
+        );
+    }
+
+    /*
+    This test checks zero sections, table limits, truncation, header overlap, and exact EOF behavior.
+    Plain and raw assembly addresses retain their separate EOF compatibility path.
+    */
+    #[test]
+    fn product_pe_headers_and_eof_use_exact_limits() {
+        let mut zero = fixture(false);
+        put_word(&mut zero, 134, 0);
+        put(&mut zero, 152 + 16, 0);
+        let metadata = Metadata::parse(&zero).unwrap();
+        assert_eq!(metadata.entry_offset(), Ok(0));
+        assert_eq!(
+            metadata.code_location(511).unwrap().domain,
+            AddressDomain::Va
+        );
+        assert_eq!(
+            metadata.code_location(512).unwrap().domain,
+            AddressDomain::File
+        );
+        assert!(metadata.code_location(zero.len() as u64).is_err());
+        assert!(metadata.code_address(zero.len() as u64).is_err());
+        assert_eq!(
+            Metadata::parse(b"raw").unwrap().code_address(3),
+            Ok((3, 16))
+        );
+
+        let mut maximum = fixture(false);
+        maximum.resize(0x2000, 0);
+        put_word(&mut maximum, 134, 96);
+        put(&mut maximum, 152 + 60, 0x2000);
+        put(&mut maximum, 152 + 16, 0);
+        maximum[376..376 + 96 * 40].fill(0);
+        assert!(Metadata::parse(&maximum).is_ok());
+        put_word(&mut maximum, 134, 97);
+        assert_eq!(
+            Metadata::parse(&maximum).err().unwrap(),
+            "The PE section count exceeds the Windows limit of 96."
+        );
+
+        let mut short_optional = fixture(false);
+        put_word(&mut short_optional, 148, 63);
+        assert!(
+            Metadata::parse(&short_optional)
+                .err()
+                .unwrap()
+                .contains("optional header is incomplete")
+        );
+        assert!(Metadata::parse(&fixture(false)[..400]).is_err());
+
+        let mut header_overlap = fixture(false);
+        put(&mut header_overlap, 376 + 20, 0x100);
+        assert!(
+            Metadata::parse(&header_overlap)
+                .err()
+                .unwrap()
+                .contains("raw range overlaps")
+        );
+    }
+
+    /*
+    This test selects supported PE architectures and rejects unsupported machine and class pairs.
+    Metadata remains parseable until a Code operation requests the unsupported architecture.
+    */
+    #[test]
+    fn pe_machine_and_class_pairs_select_code_architectures() {
+        for (plus, machine, architecture) in [
+            (false, 0x014c, Architecture::X86(32)),
+            (false, IMAGE_FILE_MACHINE_ARM, Architecture::Arm),
+            (false, IMAGE_FILE_MACHINE_THUMB, Architecture::Thumb),
+            (true, 0x8664, Architecture::X86(64)),
+            (true, 0xaa64, Architecture::Arm64),
+        ] {
+            let mut data = fixture(plus);
+            put_word(&mut data, 132, machine);
+            let metadata = Metadata::parse(&data).unwrap();
+            assert_eq!(
+                metadata.code_location(0x210).unwrap().architecture,
+                architecture
+            );
+            let decoder = if matches!(architecture, Architecture::X86(_)) {
+                Architecture::X86(16)
+            } else {
+                architecture
+            };
+            assert_eq!(metadata.decoder_architecture(16), Ok(decoder));
+        }
+
+        for (plus, machine, message) in [
+            (
+                false,
+                IMAGE_FILE_MACHINE_ARMNT,
+                "PE ARMNT code decoding is unsupported.",
+            ),
+            (
+                false,
+                0x8664,
+                "The PE processor is unsupported for code decoding.",
+            ),
+            (
+                true,
+                0x014c,
+                "The PE processor is unsupported for code decoding.",
+            ),
+        ] {
+            let mut data = fixture(plus);
+            put_word(&mut data, 132, machine);
+            let metadata = Metadata::parse(&data).unwrap();
+            assert_eq!(metadata.decoder_architecture(32).unwrap_err(), message);
+            assert_eq!(metadata.code_location(0x210).unwrap_err(), message);
+        }
+    }
+
+    /*
+    This test separates strict branch VAs from the legacy RVA-or-VA compatibility input.
+    A low image base can make the compatibility input ambiguous.
+    */
+    #[test]
+    fn strict_pe_targets_do_not_retry_ambiguous_rvas() {
+        let mut data = fixture(false);
+        data.resize(0x600, 0);
+        put(&mut data, 152 + 28, 0x1000);
+        put(&mut data, 376 + 8, 0x200);
+        data[134] = 2;
+        put(&mut data, 416 + 8, 0x200);
+        put(&mut data, 416 + 12, 0x2000);
+        put(&mut data, 416 + 16, 0x200);
+        put(&mut data, 416 + 20, 0x400);
+
+        let metadata = Metadata::parse(&data).unwrap();
+        assert_eq!(metadata.target_offset(AddressDomain::Va, 0x2000), Ok(0x200));
+        assert_eq!(
+            metadata.legacy_virtual_offset(0x2000),
+            Err("The value has ambiguous RVA and VA mappings.".into())
+        );
+    }
+
+    /*
+    This test proves that one declared PE range can cross the 4 GiB file boundary.
+    Checked u64 mapping preserves the exact high file offset and virtual address.
+    */
+    #[test]
+    fn product_pe_mapping_preserves_offsets_above_four_gib() {
+        let mut data = fixture(false);
+        put(&mut data, 376 + 20, 0xffff_ff00);
+        let pe = Pe::from_parts(
+            5 * 1024 * 1024 * 1024,
+            128,
+            224,
+            &data[128..152],
+            &data[152..216],
+            &data[376..416],
+        )
+        .unwrap();
+        assert_eq!(pe.rva_to_file(0x1100), Some(0x1_0000_0000));
+        assert_eq!(pe.file_to_virtual(0x1_0000_0000), Some(0x40_1100));
+    }
+
+    /*
+    This test parses one sparse PE source above 4 GiB without reading its overlay.
+    The paged constructor preserves the exact high mapping from its bounded header parts.
+    */
+    #[test]
+    fn paged_pe_preserves_high_mappings_and_file_domains() {
+        let path = temp_path("high");
+        let mut data = fixture(false);
+        put(&mut data, 152 + 16, 0x1100);
+        put(&mut data, 376 + 20, 0xffff_ff00);
+        let file_len = 5 * 1024 * 1024 * 1024_u64 + 1;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.write_all_at(&data, 0).unwrap();
+        file.set_len(file_len).unwrap();
+        drop(file);
+
+        let source = PagedFile::open(&path).unwrap();
+        let metadata = Metadata::read_from(&source).unwrap();
+        assert_eq!(metadata.format_label(), Some("PE"));
+        assert_eq!(metadata.entry_offset(), Ok(0x1_0000_0000));
+        assert_eq!(
+            metadata.code_location(0x1_0000_0000),
+            Ok(CodeLocation {
+                address: 0x40_1100,
+                bits: 32,
+                architecture: Architecture::X86(32),
+                domain: AddressDomain::Va,
+            })
+        );
+        assert_eq!(
+            metadata.code_location(file_len - 1).unwrap().domain,
+            AddressDomain::File
+        );
+        assert_eq!(
+            metadata.target_offset(AddressDomain::File, file_len - 1),
+            Ok(file_len - 1)
+        );
+        assert!(metadata.code_location(file_len).is_err());
+        drop(source);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /*
+    This test compares buffered and paged metadata for identical PE32 and PE32+ bytes.
+    Both paths must agree on entries, domains, strict targets, and final file bounds.
+    */
+    #[test]
+    fn buffered_and_paged_pe_metadata_agree() {
+        for plus in [false, true] {
+            let path = temp_path(if plus { "agree64" } else { "agree32" });
+            let mut data = fixture(plus);
+            data.resize(0x700, 0);
+            let section = 152 + if plus { 240 } else { 224 };
+            put(&mut data, section + 8, 0x200);
+            put(&mut data, section + 16, 0x200);
+            put(&mut data, section + 20, 0x300);
+            let buffered = Metadata::parse(&data).unwrap();
+            std::fs::write(&path, &data).unwrap();
+            let source = PagedFile::open(&path).unwrap();
+            let paged = Metadata::read_from(&source).unwrap();
+
+            assert_eq!(buffered.entry_offset(), paged.entry_offset());
+            assert_eq!(buffered.code_location(0x310), paged.code_location(0x310));
+            assert_eq!(buffered.code_location(0x250), paged.code_location(0x250));
+            let target = buffered.code_location(0x310).unwrap().address;
+            assert_eq!(
+                buffered.target_offset(AddressDomain::Va, target),
+                paged.target_offset(AddressDomain::Va, target)
+            );
+            assert_eq!(
+                buffered.code_location(data.len() as u64),
+                paged.code_location(data.len() as u64)
+            );
+            assert_eq!(
+                buffered.target_offset(AddressDomain::File, data.len() as u64),
+                paged.target_offset(AddressDomain::File, data.len() as u64)
+            );
+            drop(source);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    /*
+    This test places a valid PE header far from the DOS prefix in one sparse source.
+    Bounded paged reads reach the header and section without allocating the intervening hole.
+    */
+    #[test]
+    fn paged_pe_reads_one_distant_header_with_bounded_windows() {
+        let path = temp_path("distant");
+        let distant = 32 * 1024 * 1024_u64;
+        let mut prefix = [0_u8; 64];
+        prefix[..2].copy_from_slice(b"MZ");
+        prefix[60..64].copy_from_slice(&(distant as u32).to_le_bytes());
+        let mut header = fixture(false)[128..416].to_vec();
+        let header_size = u32::try_from(distant + 512).unwrap();
+        put(&mut header, 24 + 60, header_size);
+        put(&mut header, 24 + 16, header_size);
+        put(&mut header, 24 + 224 + 12, header_size);
+        put(&mut header, 24 + 224 + 20, header_size);
+        let file_len = distant + 1024;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.write_all_at(&prefix, 0).unwrap();
+        file.write_all_at(&header, distant).unwrap();
+        file.set_len(file_len).unwrap();
+        drop(file);
+
+        let source = PagedFile::open(&path).unwrap();
+        let metadata = Metadata::read_from(&source).unwrap();
+        assert_eq!(metadata.entry_offset(), Ok(u64::from(header_size)));
+        assert_eq!(
+            metadata
+                .code_location(u64::from(header_size))
+                .unwrap()
+                .address,
+            0x40_0000 + u64::from(header_size)
+        );
+        drop(source);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /*
+    This test reparses current paged edit spans after edit, Undo, Redo, and logical truncation.
+    A metadata error does not remove the PagedFile owner or its accepted edit history.
+    */
+    #[test]
+    fn paged_pe_reparses_current_edit_spans_and_retains_owner() {
+        let path = temp_path("edits");
+        std::fs::write(&path, fixture(false)).unwrap();
+        let mut source = PagedFile::open(&path).unwrap();
+        source.begin_edit().unwrap();
+        let cursor = crate::paged::PagedEditCursor {
+            offset: 132,
+            top: 0,
+            low_nibble: false,
+        };
+        source
+            .replace_bytes(
+                132,
+                &IMAGE_FILE_MACHINE_ARM.to_le_bytes(),
+                cursor,
+                cursor,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            Metadata::read_from(&source)
+                .unwrap()
+                .decoder_architecture(16),
+            Ok(Architecture::Arm)
+        );
+        source.undo().unwrap();
+        assert_eq!(
+            Metadata::read_from(&source)
+                .unwrap()
+                .decoder_architecture(16),
+            Ok(Architecture::X86(16))
+        );
+        source.redo().unwrap();
+        assert_eq!(
+            Metadata::read_from(&source)
+                .unwrap()
+                .decoder_architecture(16),
+            Ok(Architecture::Arm)
+        );
+
+        let before = crate::paged::PagedEditCursor {
+            offset: 400,
+            top: 0,
+            low_nibble: false,
+        };
+        let after = crate::paged::PagedEditCursor {
+            offset: 400,
+            top: 0,
+            low_nibble: false,
+        };
+        source
+            .splice_bytes(400, source.len() - 400, &[], before, after, false)
+            .unwrap();
+        assert!(Metadata::read_from(&source).is_err());
+        assert_eq!(source.len(), 400);
+        source.undo().unwrap();
+        assert!(Metadata::read_from(&source).is_ok());
+        drop(source);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /*
+    This test preserves a PagedFile source-validation error during one bounded metadata read.
+    The format helper must not replace the owner error with an incomplete-header message.
+    */
+    #[test]
+    fn paged_pe_preserves_source_validation_errors() {
+        let path = temp_path("source-error");
+        let old = path.with_extension("old");
+        std::fs::write(&path, fixture(false)).unwrap();
+        let source = PagedFile::open(&path).unwrap();
+        std::fs::rename(&path, &old).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let mut bytes = [0_u8; 2];
+        assert_eq!(
+            read_paged_exact(&source, 0, &mut bytes, "test header").unwrap_err(),
+            "The source path is not a regular file. Reopen the source."
+        );
+        drop(source);
+        std::fs::remove_dir(path).unwrap();
+        std::fs::remove_file(old).unwrap();
+    }
+
+    /*
+    This test compares buffered and paged rejection for recognized unsupported DOS signatures.
+    The paged EntryPoint path must not construct a DOS fallback for these formats.
+    */
+    #[test]
+    fn paged_pe_rejects_recognized_unsupported_dos_signatures() {
+        for signature in [b"NE", b"LE", b"LX"] {
+            let path = temp_path(std::str::from_utf8(signature).unwrap());
+            let mut data = vec![0_u8; 132];
+            data[..2].copy_from_slice(b"MZ");
+            put(&mut data, 60, 128);
+            data[128..130].copy_from_slice(signature);
+            let buffered = Metadata::parse(&data).err().unwrap();
+            std::fs::write(&path, &data).unwrap();
+            let source = PagedFile::open(&path).unwrap();
+            assert_eq!(Metadata::read_from(&source).err().unwrap(), buffered);
+            drop(source);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    /*
+    This test keeps the established large-file notice for plain data and raw ELF data.
+    A paged DOS source still uses its bounded segment and instruction entry calculation.
+    */
+    #[test]
+    fn paged_metadata_preserves_plain_limits_and_dos_entry() {
+        for (label, data) in [
+            ("plain", b"plain".as_slice()),
+            ("elf", b"\x7fELF".as_slice()),
+        ] {
+            let path = temp_path(label);
+            std::fs::write(&path, data).unwrap();
+            let source = PagedFile::open(&path).unwrap();
+            assert!(
+                Metadata::read_from(&source)
+                    .err()
+                    .unwrap()
+                    .contains("Virtual and entry-point offsets are unavailable")
+            );
+            drop(source);
+            std::fs::remove_file(path).unwrap();
+        }
+
+        let path = temp_path("dos");
+        let mut data = vec![0_u8; 128];
+        data[..2].copy_from_slice(b"MZ");
+        put_word(&mut data, 8, 4);
+        put_word(&mut data, 20, 2);
+        put_word(&mut data, 22, 1);
+        std::fs::write(&path, &data).unwrap();
+        let source = PagedFile::open(&path).unwrap();
+        assert_eq!(Metadata::read_from(&source).unwrap().entry_offset(), Ok(82));
+        drop(source);
+        std::fs::remove_file(path).unwrap();
     }
 
     /*
@@ -1902,15 +2762,7 @@ mod tests {
         assert_eq!(entry_point(b"raw bytes"), Ok(0));
         assert_eq!(virtual_to_file(b"raw bytes", 16), Ok(16));
         assert_eq!(code_address(b"raw bytes", 16), Ok((16, 16)));
-        assert_eq!(
-            code_location(b"raw bytes", 16),
-            Ok(CodeLocation {
-                address: 16,
-                bits: 16,
-                architecture: Architecture::X86(16),
-                domain: AddressDomain::File,
-            })
-        );
+        assert!(code_location(b"raw bytes", 16).is_err());
         assert_eq!(code_address(b"\x7fELF raw x86", 4), Ok((4, 16)));
         assert!(entry_point(b"\x7fELF").is_err());
         assert!(entry_point(b"MZ").is_err());
@@ -2268,7 +3120,7 @@ mod tests {
         let metadata = Metadata::parse(&unsupported).unwrap();
         assert_eq!(
             metadata.navigation_address(&unsupported, 0x210),
-            Err("The PE processor is unsupported for code decoding.".into())
+            Err("PE ARMNT code decoding is unsupported.".into())
         );
     }
 

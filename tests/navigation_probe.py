@@ -228,7 +228,7 @@ def check_raw_refusals(binary: Path, root: Path) -> None:
         ("indirect", b"\xFF\xD0", b"no direct relative branch or call target"),
         ("far", b"\x9A\x08\x00\x00\x00", b"no direct relative branch or call target"),
         ("invalid", b"\x0F", b"Invalid or incomplete x86 instruction"),
-        ("outside", b"\xE8\xFF\x7F", b"branch target is outside the current buffer"),
+        ("outside", b"\xE8\xFF\x7F", b"Offset is out of file"),
     ]
     for name, data, message in cases:
         path = root / f"{name}.bin"
@@ -251,6 +251,19 @@ def check_raw_refusals(binary: Path, root: Path) -> None:
     )
     require(output, b"db 0F", b"Invalid or incomplete x86 instruction", header(0))
 
+    # A failed nested target must keep the actual handler history for Backspace.
+    retained = root / "retained-failure.bin"
+    data = bytearray(b"\x90" * 0x20)
+    data[0:3] = b"\xE8\x0D\x00"
+    data[0x10:0x13] = b"\xE8\xFF\x7F"
+    retained.write_bytes(data)
+    output = run_session(
+        binary,
+        ["--mode=code", str(retained)],
+        [ENTER, ENTER, ENTER, BACKSPACE, CTRL_Q],
+    )
+    require_order(output, header(0), header(0x10), b"Offset is out of file", header(0x10), header(0))
+
 
 # This helper encodes one relative 32-bit call for controlled PE navigation.
 def branch32(source: int, target: int) -> bytes:
@@ -259,9 +272,10 @@ def branch32(source: int, target: int) -> bytes:
     return b"\xE8" + displacement.to_bytes(4, "little")
 
 
-# This check follows mapped PE branches and rejects targets without file bytes.
+# This check follows PE branches in virtual and file domains and rejects missing target bytes.
 def check_pe_navigation(binary: Path, root: Path) -> None:
-    """Check mapped PE navigation and mapping refusals."""
+    """Check PE navigation domains and mapping refusals."""
+    # This section follows one mapped VA branch and returns to the original mapped byte.
     source_data, base = pe_fixture(False)
     mapped = bytearray(source_data)
     mapped[0x210:0x215] = branch32(base + 0x1010, base + 0x1020)
@@ -281,6 +295,7 @@ def check_pe_navigation(binary: Path, root: Path) -> None:
     )
     require(output, b".00401010: E80B000000", b".00401020: C3")
 
+    # This section keeps ARMNT metadata inspectable and refuses its unsupported Code request.
     unsupported = bytearray(mapped)
     unsupported[0x84:0x86] = (0x01C4).to_bytes(2, "little")
     unsupported_path = root / "pe-unsupported-machine.bin"
@@ -292,23 +307,27 @@ def check_pe_navigation(binary: Path, root: Path) -> None:
     )
     require(
         output,
-        b"The PE processor is unsupported for code decoding.",
+        b"PE ARMNT code decoding is unsupported.",
         b"The branch return history is empty.",
     )
     if pe_header(base + 0x1020) in output:
         raise AssertionError("Follow accepted an unsupported PE processor.")
 
+    # This section follows an overlay branch through its File-domain Code location.
     overlay = bytearray(source_data)
     overlay[0x800:0x802] = b"\xEB\x00"
+    overlay[0x802] = 0xC3
     overlay_path = root / "pe-overlay.bin"
     overlay_path.write_bytes(overlay)
     output = run_session(
         binary,
         ["--mode=code", "--offset=800", str(overlay_path)],
-        [ENTER, ENTER, CTRL_Q],
+        [ENTER, BACKSPACE, CTRL_Q],
     )
-    require(output, b"branch source has no virtual address", header(0x800))
+    require_order(output, header(0x800), header(0x802), header(0x800))
+    require(output, b"FILE")
 
+    # This section follows a gap branch after the fixture moves its declared raw section bytes.
     section = 0x98 + 0xE0
     gap_source = bytearray(source_data)
     put32(gap_source, section + 8, 0x300)
@@ -321,10 +340,12 @@ def check_pe_navigation(binary: Path, root: Path) -> None:
     output = run_session(
         binary,
         ["--mode=code", "--offset=250", str(gap_source_path)],
-        [ENTER, ENTER, CTRL_Q],
+        [ENTER, BACKSPACE, CTRL_Q],
     )
-    require(output, b"branch source has no virtual address", pe_header(base + 0x1050))
+    require_order(output, header(0x250), header(0x252), header(0x250))
+    require(output, b"FILE")
 
+    # This section rejects a mapped branch target that enters a virtual-only section tail.
     virtual_target = bytearray(source_data)
     put32(virtual_target, section + 8, 0x300)
     put32(virtual_target, section + 16, 0x100)
@@ -337,8 +358,9 @@ def check_pe_navigation(binary: Path, root: Path) -> None:
         ["--mode=code", "--offset=200", str(virtual_path)],
         [ENTER, ENTER, CTRL_Q],
     )
-    require(output, b"branch target has no file byte", pe_header(base + 0x1000))
+    require(output, b"Offset is out of file", pe_header(base + 0x1000))
 
+    # This section rejects a strict VA target in the unmapped gap before the first section.
     gap_target = bytearray(source_data)
     gap_target[0x200:0x205] = branch32(base + 0x1000, base + 0x800)
     gap_path = root / "pe-gap-target.bin"
@@ -348,7 +370,7 @@ def check_pe_navigation(binary: Path, root: Path) -> None:
         ["--mode=code", "--offset=200", str(gap_path)],
         [ENTER, ENTER, CTRL_Q],
     )
-    require(output, b"outside the PE image", pe_header(base + 0x1000))
+    require(output, b"Offset is out of file", pe_header(base + 0x1000))
 
 
 # This helper writes one deterministic disassembly syntax and width configuration.
