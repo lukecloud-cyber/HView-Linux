@@ -56,7 +56,7 @@ python3 scripts/package.py /tmp/hview-linux-package
 
 Copy the complete package directory to the installation location. Keep both shared libraries beside the executable.
 
-The package contains the executable, shared libraries, native notices, native metadata, this README, and the configuration sample.
+The package contains the executable, shared libraries, dependency notices, native metadata, this README, and the configuration sample.
 
 The package manifest gives the SHA-256 hash and size of each packaged file.
 
@@ -333,6 +333,10 @@ The structure browser and address conversion support PE files. HView-Linux does 
 
 Code display uses Capstone 5.0.9. Assembly uses Keystone 0.9.2.
 
+Bounded Text indexing uses unicode-segmentation 1.13.3 and unicode-width 0.2.2.
+The `licenses` directory contains their copyright notice and Apache 2.0 or MIT license options.
+The release package includes these four Unicode notice files.
+
 The application first loads `libcapstone.so` and `libkeystone.so` beside the executable. Development builds can use the repository `lib` directory as a fallback.
 
 Set `HVIEW_PORTABLE=1` to disable the development fallback. The release package check uses this setting from an isolated working directory.
@@ -343,7 +347,7 @@ The delivered Keystone library has no inherited RPATH. The metadata records the 
 
 The package check verifies all recorded native hashes. The check also rejects native RPATH, RUNPATH, AUDIT, and DEPAUDIT tags.
 
-The HView-Linux Rust source currently has no declared license. The native components keep their separate upstream notice files.
+The HView-Linux Rust source currently has no declared license. Each dependency keeps its applicable upstream notice files.
 
 Review the source license state and all native notice files before redistribution.
 

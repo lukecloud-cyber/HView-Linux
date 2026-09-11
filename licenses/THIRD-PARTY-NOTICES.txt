@@ -1,0 +1,8 @@
+HView-Linux Rust dependency notices
+===================================
+
+unicode-segmentation 1.13.3
+unicode-width 0.2.2
+Copyright (c) 2015 The Rust Project Developers
+Licensed under either Apache License 2.0 or the MIT license, at your option.
+See UNICODE-COPYRIGHT.txt, UNICODE-APACHE-2.0.txt, and UNICODE-MIT.txt.
