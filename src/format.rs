@@ -40,6 +40,22 @@ impl Architecture {
     }
 
     /*
+    This fact supplies the compact Code header label for each checked architecture.
+    Invalid direct x86 variants use a generic label until an engine boundary rejects them.
+    */
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::X86(16) => "a16",
+            Self::X86(32) => "a32",
+            Self::X86(64) => "a64",
+            Self::X86(_) => "x86",
+            Self::Arm => "ARM",
+            Self::Thumb => "THUMB",
+            Self::Arm64 => "ARM64",
+        }
+    }
+
+    /*
     This fact gives the natural instruction alignment for each architecture family.
     X86 permits each byte, ARM and ARM64 use four bytes, and Thumb uses two bytes.
     Native inspection entry points can accept unaligned runtime addresses.
@@ -145,7 +161,7 @@ struct Pe {
 }
 
 /*
-Raw stores the explicit runtime base and validated x86 architecture.
+Raw stores the explicit runtime base and validated architecture.
 Checked conversions protect both the 64-bit range and the selected linear-address range.
 */
 #[derive(Clone, Copy)]
@@ -157,7 +173,8 @@ struct Raw {
 impl Raw {
     /*
     This conversion adds a file offset to the configured runtime base.
-    The selected x86 width limits the resulting linear address.
+    X86(16), X86(32), ARM, and Thumb use the 32-bit linear-address limit.
+    X86(64) and ARM64 use the checked 64-bit address range.
     */
     fn address(self, offset: u64) -> Result<u64, String> {
         let address = self
@@ -185,7 +202,7 @@ impl Raw {
 }
 
 /*
-Metadata selects either parsed PE mapping or an explicit raw x86 mapping.
+Metadata selects either parsed PE mapping or an explicit raw architecture mapping.
 Callers reuse the value for code addresses, navigation, and address conversion.
 */
 pub struct Metadata {
@@ -216,12 +233,24 @@ impl Metadata {
     }
 
     /*
-    This constructor validates an explicit raw x86 base and width.
-    It stores no parsed PE mapping.
+    This compatibility constructor validates an explicit raw x86 base and width.
+    The architecture constructor supplies the shared implementation.
     */
+    #[allow(dead_code, reason = "L07.1 keeps this x86 compatibility entry")]
     pub fn raw(base: u64, bits: u32) -> Result<Self, String> {
         let architecture = Architecture::x86(bits)
             .map_err(|_| "Raw x86 code width must be 16, 32, or 64 bits.".to_owned())?;
+        Self::raw_architecture(base, architecture)
+    }
+
+    /*
+    This constructor validates one explicit raw architecture and its base address.
+    Raw metadata takes priority because the constructor stores no parsed PE mapping.
+    */
+    pub fn raw_architecture(base: u64, architecture: Architecture) -> Result<Self, String> {
+        if let Architecture::X86(bits) = architecture {
+            Architecture::x86(bits)?;
+        }
         let raw = Raw { base, architecture };
         raw.address(0)?;
         Ok(Self {
@@ -270,6 +299,21 @@ impl Metadata {
     pub fn code_address(&self, file_offset: u64) -> Result<(u64, u32), String> {
         let location = self.code_location(file_offset)?;
         Ok((location.address, location.bits))
+    }
+
+    /*
+    This query selects the decoder architecture for current Code consumers.
+    An explicit raw model supplies its architecture, while AUTO keeps the configured x86 width.
+    */
+    pub fn decoder_architecture(&self, fallback_bits: u32) -> Result<Architecture, String> {
+        if let Some(raw) = self.raw {
+            return match raw.architecture {
+                Architecture::X86(bits) => Architecture::x86(bits),
+                architecture => Ok(architecture),
+            };
+        }
+        self.validate_code_machine()?;
+        Architecture::x86(fallback_bits)
     }
 
     /*
@@ -1931,14 +1975,81 @@ mod tests {
     }
 
     /*
-    This test checks shared architecture widths, alignment, and instruction-size limits.
-    These facts do not enable the unsupported ARM decoder and assembler engines.
+    This test applies each ARM-family raw model over bytes that contain a valid PE header.
+    The raw architecture, runtime base, and File/VA conversions must replace parsed PE behavior.
+    */
+    #[test]
+    fn raw_arm_architectures_override_pe_and_keep_checked_domains() {
+        /*
+        The setup confirms that AUTO reads the fixture as the existing x86 PE model.
+        A later explicit raw constructor must not retain that parsed architecture.
+        */
+        let data = fixture(false);
+        assert_eq!(
+            Metadata::parse(&data)
+                .unwrap()
+                .code_location(0x210)
+                .unwrap()
+                .architecture,
+            Architecture::X86(32)
+        );
+        /*
+        This table verifies each raw architecture, mapping domain, and checked reverse conversion.
+        Each raw model rejects a below-base address and the unavailable RVA domain.
+        */
+        for (architecture, base) in [
+            (Architecture::Arm, 0x1000),
+            (Architecture::Thumb, 0x2000),
+            (Architecture::Arm64, 0x1_4000_0000),
+        ] {
+            let metadata = Metadata::raw_architecture(base, architecture).unwrap();
+            assert_eq!(metadata.decoder_architecture(16), Ok(architecture));
+            assert_eq!(
+                metadata.code_location(0x210),
+                Ok(CodeLocation {
+                    address: base + 0x210,
+                    bits: architecture.bits(),
+                    architecture,
+                    domain: AddressDomain::Va,
+                })
+            );
+            assert_eq!(metadata.navigation_address(&data, 0x210), Ok(base + 0x210));
+            assert_eq!(metadata.navigation_offset(&data, base + 0x210), Ok(0x210));
+            assert!(metadata.navigation_offset(&data, base - 1).is_err());
+            assert_eq!(
+                metadata.convert_address(&data, AddressKind::File, 0x210),
+                Ok(PeAddress {
+                    file_offset: Some(0x210),
+                    rva: None,
+                    va: Some(base + 0x210),
+                })
+            );
+            assert_eq!(
+                metadata.convert_address(&data, AddressKind::Va, base + 0x210),
+                Ok(PeAddress {
+                    file_offset: Some(0x210),
+                    rva: None,
+                    va: Some(base + 0x210),
+                })
+            );
+            assert!(
+                metadata
+                    .convert_address(&data, AddressKind::Rva, 0)
+                    .is_err()
+            );
+        }
+    }
+
+    /*
+    This test checks shared architecture labels, widths, alignment, and instruction-size limits.
+    The current native entry points use these facts for all supported architectures.
     */
     #[test]
     fn architecture_contract_validates_widths_alignment_and_lengths() {
         for bits in [16, 32, 64] {
             let architecture = Architecture::x86(bits).unwrap();
             assert_eq!(architecture.bits(), bits);
+            assert_eq!(architecture.label(), format!("a{bits}"));
             assert_eq!(architecture.alignment(), 1);
             assert_eq!(architecture.max_instruction_bytes(), 15);
             assert!(architecture.valid_instruction_bytes(1));
@@ -1951,14 +2062,17 @@ mod tests {
             (Architecture::Arm.bits(), Architecture::Arm.alignment()),
             (32, 4)
         );
+        assert_eq!(Architecture::Arm.label(), "ARM");
         assert_eq!(
             (Architecture::Thumb.bits(), Architecture::Thumb.alignment()),
             (32, 2)
         );
+        assert_eq!(Architecture::Thumb.label(), "THUMB");
         assert_eq!(
             (Architecture::Arm64.bits(), Architecture::Arm64.alignment()),
             (64, 4)
         );
+        assert_eq!(Architecture::Arm64.label(), "ARM64");
         assert!(Architecture::Arm.valid_instruction_bytes(4));
         assert!(!Architecture::Arm.valid_instruction_bytes(2));
         assert!(Architecture::Thumb.valid_instruction_bytes(2));
@@ -1968,22 +2082,46 @@ mod tests {
     }
 
     /*
-    This test checks raw width validation, address overflow, and current file bounds.
+    This test checks raw architecture validation, address overflow, and current file bounds.
     Failed operations return before a caller can use an invalid model.
     */
     #[test]
     fn explicit_raw_metadata_checks_width_overflow_and_file_bounds() {
+        /*
+        The first checks reject invalid direct x86 values at both compatibility boundaries.
+        */
         assert!(Metadata::raw(0, 8).is_err());
-        for bits in [16, 32] {
-            let metadata = Metadata::raw(u64::from(u32::MAX), bits).unwrap();
-            assert_eq!(metadata.code_address(0), Ok((u64::from(u32::MAX), bits)));
+        assert!(Metadata::raw_architecture(0, Architecture::X86(8)).is_err());
+        /*
+        The 32-bit family accepts the exact final address and rejects the next byte or base.
+        */
+        for architecture in [
+            Architecture::X86(16),
+            Architecture::X86(32),
+            Architecture::Arm,
+            Architecture::Thumb,
+        ] {
+            let metadata = Metadata::raw_architecture(u64::from(u32::MAX), architecture).unwrap();
+            assert_eq!(
+                metadata.code_location(0).unwrap().address,
+                u64::from(u32::MAX)
+            );
             assert!(metadata.code_address(1).is_err());
-            assert!(Metadata::raw(u64::from(u32::MAX) + 1, bits).is_err());
+            assert!(Metadata::raw_architecture(u64::from(u32::MAX) + 1, architecture).is_err());
         }
-        let metadata = Metadata::raw(u64::MAX, 64).unwrap();
-        assert_eq!(metadata.code_address(0), Ok((u64::MAX, 64)));
-        assert!(metadata.code_address(1).is_err());
+        /*
+        The 64-bit family accepts the exact u64 end and rejects one added byte.
+        */
+        for architecture in [Architecture::X86(64), Architecture::Arm64] {
+            let metadata = Metadata::raw_architecture(u64::MAX, architecture).unwrap();
+            assert_eq!(metadata.code_location(0).unwrap().address, u64::MAX);
+            assert!(metadata.code_address(1).is_err());
+        }
 
+        /*
+        The final section checks live source bounds, a below-base target, growth, and an empty buffer.
+        Address conversion must not publish a byte outside the current source.
+        */
         let metadata = Metadata::raw(0x1000, 32).unwrap();
         let mut data = vec![0x90];
         assert_eq!(metadata.navigation_address(&data, 0), Ok(0x1000));

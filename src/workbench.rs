@@ -168,7 +168,7 @@ pub fn help(console: &Console) -> io::Result<()> {
         " Editor controls",
         " Alt+E Edit  Ctrl+Z/Y Undo/Redo  Alt+S Save  Esc Cancel",
         " Ctrl+S Save As: save the buffer to a new file",
-        " Alt+M, M, or Enter Mode  O Code size  Ctrl+Q Quit",
+        " Alt+M, M, or Enter Mode  O x86 Code size  Ctrl+Q Quit",
         " H/J/K/L Move  Ctrl+T Analysis tools",
         " Alt+H Help  Alt+W Wrap  Alt+L Line notice  Alt+A Assemble",
         " Alt+G Goto  Alt+M Mode",
@@ -178,7 +178,7 @@ pub fn help(console: &Console) -> io::Result<()> {
         " Code: Enter Follow direct relative branch/call  Backspace Return",
         " Ctrl+T Analysis tools:",
         "   A  Convert a file offset, RVA, or VA",
-        "   R  Set AUTO or an x86 raw dump model",
+        "   R  Set AUTO or an x86, ARM, Thumb, or ARM64 raw model",
         "   S  Browse ASCII and UTF-16 ASCII strings",
         "   P  Browse PE structures and jump to their bytes",
         "   E  Browse the entropy map; Escape cancels its work",
@@ -249,7 +249,7 @@ fn address_input(text: &str) -> Result<(format::AddressKind, u64), String> {
 }
 
 /*
-This parser selects AUTO or one complete x86 raw-memory model.
+This parser selects AUTO or one complete raw architecture model.
 It validates the architecture, width, byte order, and hexadecimal runtime base.
 */
 fn raw_model_input(text: &str) -> Result<Option<RawModel>, String> {
@@ -257,38 +257,39 @@ fn raw_model_input(text: &str) -> Result<Option<RawModel>, String> {
     This section recognizes the exact AUTO value before it splits a manual model.
     The strict field checks reject missing, extra, or partially valid model text.
     */
-    const ERROR: &str = "Enter AUTO or X86 16|32|64 LE|BE HEXBASE.";
+    const ERROR: &str = "Enter AUTO, X86 16|32|64 LE|BE HEXBASE, or ARM|THUMB|ARM64 LE|BE HEXBASE.";
     if text == "AUTO" {
         return Ok(None);
     }
     let fields: Vec<_> = text.split(' ').collect();
-    if fields.len() != 4
-        || fields[0] != "X86"
-        || fields[3].is_empty()
-        || !fields[3].bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(ERROR.into());
-    }
     /*
     This section converts validated fields into bounded numeric and enum values.
     It constructs the model only after all fields pass their complete checks.
     */
-    let bits = match fields[1] {
-        "16" => 16,
-        "32" => 32,
-        "64" => 64,
+    let (architecture, order, base) = match fields.as_slice() {
+        ["X86", bits @ ("16" | "32" | "64"), order, base] => (
+            crate::format::Architecture::x86(bits.parse().unwrap())?,
+            *order,
+            *base,
+        ),
+        ["ARM", order, base] => (crate::format::Architecture::Arm, *order, *base),
+        ["THUMB", order, base] => (crate::format::Architecture::Thumb, *order, *base),
+        ["ARM64", order, base] => (crate::format::Architecture::Arm64, *order, *base),
         _ => return Err(ERROR.into()),
     };
-    let byte_order = match fields[2] {
+    if base.is_empty() || !base.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ERROR.into());
+    }
+    let byte_order = match order {
         "LE" => ByteOrder::Little,
         "BE" => ByteOrder::Big,
         _ => return Err(ERROR.into()),
     };
-    let base = u64::from_str_radix(fields[3], 16)
+    let base = u64::from_str_radix(base, 16)
         .map_err(|_| "The raw runtime base exceeds the 64-bit address range.".to_string())?;
     Ok(Some(RawModel {
         base,
-        bits,
+        architecture,
         byte_order,
     }))
 }
@@ -302,7 +303,11 @@ fn set_raw_model(console: &Console, view: &mut Editor, base: &[String]) -> io::R
     This section collects one model choice and reports parser errors without changing the Editor.
     A canceled prompt leaves the model unchanged and requests no branch-return history invalidation.
     */
-    let Some(input) = console.prompt(base, "Raw model: AUTO or X86 16|32|64 LE|BE HEXBASE")? else {
+    let Some(input) = console.prompt(
+        base,
+        "Raw model: AUTO, X86 16|32|64 LE|BE HEXBASE, or ARM|THUMB|ARM64 LE|BE HEXBASE",
+    )?
+    else {
         return Ok(false);
     };
     let model = match raw_model_input(&input) {
@@ -323,7 +328,7 @@ fn set_raw_model(console: &Console, view: &mut Editor, base: &[String]) -> io::R
     }
     Ok(match (before, model) {
         (None, None) => false,
-        (Some(old), Some(new)) => old.base != new.base || old.bits != new.bits,
+        (Some(old), Some(new)) => old.base != new.base || old.architecture != new.architecture,
         _ => true,
     })
 }
@@ -492,7 +497,7 @@ pub fn tools(console: &Console, view: &mut Editor, base: &[String]) -> io::Resul
         for (line, text) in lines.iter_mut().skip(2).zip([
             " Analysis tools",
             " A  Address: convert a file offset, RVA, or VA",
-            " R  Raw model: AUTO or X86 16|32|64 LE|BE HEXBASE",
+            " R  Raw model: AUTO, X86 16|32|64 LE|BE HEXBASE, or ARM|THUMB|ARM64 LE|BE HEXBASE",
             " S  Strings: ASCII and UTF-16 ASCII, minimum 4 characters",
             " P  PE structures: sections, directories, imports, exports, overlay",
             " E  Entropy map: cancellable bounded analysis",
@@ -700,23 +705,44 @@ mod tests {
     */
     #[test]
     fn raw_model_input_requires_the_complete_strict_grammar() {
+        /*
+        The valid section checks x86 and each ARM-family grammar with exact parsed fields.
+        AUTO returns no explicit model.
+        */
         let model = raw_model_input("X86 32 BE 123456789ABCDEF0")
             .unwrap()
             .unwrap();
         assert_eq!(model.base, 0x123456789abcdef0);
-        assert_eq!(model.bits, 32);
+        assert_eq!(model.architecture, format::Architecture::X86(32));
         assert_eq!(model.byte_order, ByteOrder::Big);
+        let arm = raw_model_input("ARM BE 1000").unwrap().unwrap();
+        assert_eq!(arm.architecture, format::Architecture::Arm);
+        assert_eq!(arm.byte_order, ByteOrder::Big);
+        let thumb = raw_model_input("THUMB LE 2000").unwrap().unwrap();
+        assert_eq!(thumb.architecture, format::Architecture::Thumb);
+        assert_eq!(thumb.base, 0x2000);
+        let arm64 = raw_model_input("ARM64 LE 140000000").unwrap().unwrap();
+        assert_eq!(arm64.architecture, format::Architecture::Arm64);
+        assert_eq!(arm64.base, 0x140000000);
         assert!(raw_model_input("AUTO").unwrap().is_none());
+        /*
+        The invalid table rejects case changes, noncanonical widths, incomplete fields, and bad numeric forms.
+        No partial input can construct a raw model.
+        */
         for input in [
             "auto",
             "AUTO ",
             "X86 8 LE 0",
+            "X86 032 LE 0",
+            "X86 +32 LE 0",
             "X86 16 ME 0",
             "X86 64 LE 0x10",
             "X86 64 LE 10 ",
             "X86  64 LE 10",
             "X86 64 LE 10000000000000000",
             "ARM64 64 LE 10",
+            "ARM 32 LE 10",
+            "THUMB ME 10",
         ] {
             assert!(raw_model_input(input).is_err(), "accepted {input:?}");
         }

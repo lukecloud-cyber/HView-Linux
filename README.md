@@ -89,7 +89,7 @@ For ordinary raw files, `--virtual` uses the value as a file offset. Raw ELF fil
 | --- | --- |
 | `Alt+H` | The key shows or closes help. |
 | `Alt+W` | The key changes Text wrapping. |
-| `Alt+A` or `Enter` | The key opens the Intel assembler during Code editing. |
+| `Alt+A` or `Enter` | The key opens the selected architecture assembler during Code editing. |
 | `Alt+E` | The key starts editing. |
 | `Ctrl+Z` | The key undoes one operation during editing. |
 | `Ctrl+Y` | The key redoes one operation during editing. |
@@ -107,7 +107,7 @@ For ordinary raw files, `--virtual` uses the value as a file offset. Raw ELF fil
 | `Ctrl+T` | The key opens the analysis tools. |
 | `Alt+P` | The key opens the previous input file. |
 | `Alt+N` | The key opens the next input file. |
-| `O` | The key cycles 16-bit, 32-bit, 64-bit, and Real16 Code modes. |
+| `O` | The key cycles automatic Code modes and raw x86 widths. |
 | `H`, `J`, `K`, or `L` | These keys move the cursor outside editing. |
 | `Esc` | The key cancels editing or closes the current screen. |
 | `Ctrl+Q` | The key exits the application or closes the file browser. |
@@ -151,7 +151,7 @@ Copy `hview-linux.ini.example` to an applicable `hview-linux.ini` path. Change o
 | `LineFeed` | `Auto`, `CRLF`, `CR`, or `LF` selects Text line separation. |
 | `AutoCodeSize` | `On` uses a detected PE 32-bit or 64-bit code size. |
 | `DefaultCodeSize` | `16`, `32`, or `64` selects the other default code size. |
-| `DisassemblySyntax` | `Intel` or `ATT` selects the Code display syntax. |
+| `DisassemblySyntax` | `Intel` or `ATT` selects the x86 Code display syntax. |
 | `InvalidCode` | `Error` stops at an invalid instruction. `Byte` shows one `db` byte and continues. |
 | `OpcodeShowBytes` | A value from `0` through `15` sets the displayed opcode byte count. |
 | `HexDelimiterChar` | A numeric value from `1` through `255` selects the Hex delimiter byte. |
@@ -161,13 +161,15 @@ Copy `hview-linux.ini.example` to an applicable `hview-linux.ini` path. Change o
 | `SaveFileAtExit` | `On` or `Off` controls automatic session saving. |
 | `SaveFile` | A quoted path selects the automatic session file. |
 
-The native default is Intel disassembly syntax. Select `DisassemblySyntax=ATT` only when you need AT&T display syntax.
+The native x86 default is Intel disassembly syntax. Select `DisassemblySyntax=ATT` only when you need x86 AT&T display syntax.
 
 The default invalid-instruction behavior is `InvalidCode=Error`. Select `InvalidCode=Byte` to continue with a one-byte `db` row.
 
-Assembly input always uses Intel syntax. The assembler prompt also shows Intel syntax when the Code display uses AT&T syntax.
+X86 assembly input always uses Intel syntax. The x86 assembler prompt also shows Intel syntax with AT&T display.
 
-Press `O` to select Real16 after 64-bit Code mode. The Code header shows `Real16` for this mode.
+ARM and Thumb assembly input uses native syntax.
+
+Without a raw model, press `O` after 64-bit Code mode to select Real16. The Code header shows `Real16` for this mode.
 
 Real16 applies the retained real-mode instruction policy. A native saved session preserves this selection in a versioned Linux extension.
 
@@ -197,29 +199,39 @@ The address tool is separate from retained command-line address selection. The t
 
 PE parsing supports checked PE32 and PE32+ file-backed mappings. The PE browser limits output to 10,000 rows.
 
-Code mode can decode raw x86 bytes in non-PE files. Raw ELF files do not receive ELF headers, symbols, or virtual-address mapping.
+Code mode can decode raw x86, ARM, Thumb, and ARM64 bytes. Raw ELF files do not receive ELF headers, symbols, or virtual-address mapping.
 
 ### Raw address model
 
-Press `Ctrl+T`, and then press `R`. Enter `AUTO` or `X86 16|32|64 LE|BE HEXBASE` with one width and one byte order.
+Press `Ctrl+T`, and then press `R`. Enter one complete raw model:
+
+- `AUTO`
+- `X86 16|32|64 LE|BE HEXBASE`
+- `ARM|THUMB|ARM64 LE|BE HEXBASE`
 
 For example, `X86 64 LE 140000000` maps file offset zero to hexadecimal address `140000000`.
 
-The raw model overrides PE metadata for addresses, x86 width, decoding, assembly, and branch navigation. The address tool converts file offsets and virtual addresses.
+The raw model overrides PE metadata for addresses, architecture, decoding, assembly, and branch navigation. The address tool converts file offsets and virtual addresses.
 
-The raw model rejects RVA conversion. The selected byte order controls integer inspection; x86 decoding and assembly always use little-endian bytes.
+The raw model rejects RVA conversion. The selected byte order controls integer inspection. All instruction engines use little-endian bytes.
+
+ARM and Thumb use generic native backends. The application does not apply a CPU-version gate.
+
+ARM64 supports decoding. ARM64 assembly is not supported.
 
 Raw 16-bit mode uses a linear 32-bit address range. Raw 16-bit mode does not use the Real16 instruction policy or wrapped targets.
 
-With a raw model active, `O` cycles 16-bit, 32-bit, and 64-bit widths. The application checks the address range before changing width.
+With a raw x86 model active, `O` cycles 16-bit, 32-bit, and 64-bit widths. The application checks the address range before changing width.
 
-`AUTO` restores the previous automatic code width and Real16 selection. Changes to the raw base or width clear branch-return history.
+For an ARM-family raw model, use `Ctrl+T`, and then use `R` to select a different architecture.
+
+`AUTO` restores the previous automatic code width and Real16 selection. Changes to the raw base or architecture clear branch-return history.
 
 Changes to byte order alone preserve branch-return history. Invalid, canceled, and unchanged model selections also preserve that history.
 
-Raw settings survive mode changes, Save As, and edit cancellation. File switches and application restarts clear raw settings.
+Raw settings survive mode changes, Save, Save As, and edit cancellation. File switches and application restarts clear raw settings.
 
-Sessions store the underlying automatic width and Real16 selection. Sessions do not store the raw model.
+Sessions store the underlying automatic width and Real16 selection. Sessions do not store the raw model. Modern session persistence remains planned work.
 
 String results use a four-character minimum and a 120-character display limit. String and comparison browsers limit output to 10,000 rows.
 
@@ -238,17 +250,17 @@ Paged Hex overtype cannot extend the file at EOF.
 Paged Save and Save As stream logical bytes through bounded private staging files.
 File switching and quit remain unavailable until paged edits are saved or canceled.
 
-Press `Alt+E` to start editing. Hex mode replaces nibbles, and Code mode assembles one Intel instruction.
+Press `Alt+E` to start editing. Hex mode replaces nibbles. Code mode assembles one instruction for the selected architecture.
 
 Press `Esc` to cancel all active edits.
 Buffered cancellation restores its complete memory baseline.
 Paged cancellation restores the captured logical source layout.
 
-During Code editing, `Alt+A` or `Enter` opens the Intel assembly prompt. A preview shows the proposed patch before buffer changes.
+During Code editing, `Alt+A` or `Enter` opens the selected architecture assembly prompt. A preview shows the proposed patch before buffer changes.
 
 The preview shows exact bytes, mapped addresses, affected instructions, retained bytes, overwritten bytes, and extension beyond EOF.
 
-Preview instruction text uses the selected disassembly syntax. Assembly input and prompt text always use Intel syntax.
+Preview x86 text uses the selected disassembly syntax. X86 assembly input and prompt text use Intel syntax. ARM-family text uses native syntax.
 
 Press `Enter` to apply the exact proposed bytes. Press `Esc` to cancel the preview.
 

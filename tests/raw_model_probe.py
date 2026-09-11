@@ -14,9 +14,12 @@ from terminal_probe import run_session
 BACKSPACE = b"\x7f"
 ALT_N = b"\x1bn"
 ALT_P = b"\x1bp"
+ALT_S = b"\x1bs"
 CTRL_Q = b"\x11"
 CTRL_S = b"\x13"
 CTRL_T = b"\x14"
+CTRL_Y = b"\x19"
+CTRL_Z = b"\x1a"
 ENTER = b"\r"
 ESCAPE = b"\x1b"
 ALT_A = b"\x1ba"
@@ -53,6 +56,23 @@ def last_header(output: bytes, name: str) -> bytes:
     if start < 0 or end < 0:
         raise AssertionError("The terminal output lacks a complete header.")
     return output[start:end]
+
+
+# This assertion finds one complete header with the requested raw model and runtime address.
+def require_raw_header(output: bytes, name: str, model: bytes, address: int) -> None:
+    """Require one complete raw Code header."""
+    marker = b"\x1b[1;1H"
+    position = 0
+    while (start := output.find(marker, position)) >= 0:
+        end = output.find(b"\x1b[2;1H", start)
+        if end < 0:
+            break
+        header = output[start:end]
+        if name.encode() in header and b"RAW" in header and model in header:
+            if raw_header(address) in header:
+                return
+        position = end
+    raise AssertionError(f"The terminal output lacks the {model!r} raw header.")
 
 
 # This formatter builds one raw runtime header at the requested address width.
@@ -179,8 +199,13 @@ def check_atomic_failures_and_growth(binary: Path, root: Path) -> None:
         ["--mode=code", "--offset=1", str(path)],
         [
             *raw_model("X86 32 LE 1000"),
+            *dismissing_raw_model("X86 032 LE 1000"),
+            *dismissing_raw_model("X86 +32 LE 1000"),
             *dismissing_raw_model("X86 32 LE 1000 junk"),
+            *dismissing_raw_model("ARM 32 LE 1000"),
+            *dismissing_raw_model("THUMB LE"),
             *dismissing_raw_model("X86 16 LE FFFFFFFF"),
+            *dismissing_raw_model("ARM LE FFFFFFFF"),
             *dismissing_raw_model("X86 32 LE 100000000"),
             *dismissing_raw_model("X86 64 LE 10000000000000000"),
             CTRL_Q,
@@ -188,7 +213,7 @@ def check_atomic_failures_and_growth(binary: Path, root: Path) -> None:
     )
     require(
         output,
-        b"Enter AUTO or X86 16|32|64 LE|BE HEXBASE.",
+        b"Enter AUTO, X86 16|32|64 LE|BE HEXBASE, or ARM|THUMB|ARM64 LE|BE HEXBASE.",
         b"32-bit linear address range",
         b"64-bit address range",
     )
@@ -217,7 +242,185 @@ def check_atomic_failures_and_growth(binary: Path, root: Path) -> None:
         raise AssertionError("A canceled boundary edit changed the empty file.")
 
 
-# This check clears address history only when model width or base changes.
+# This check selects each ARM-family model and follows one ARM branch through current Code controls.
+def check_arm_code_and_navigation(binary: Path, root: Path) -> None:
+    """Check ARM-family labels, mappings, branches, history, and model selection."""
+    path = root / "arm-code.bin"
+    data = bytearray(b"\x00" * 20)
+    data[0:4] = bytes.fromhex("00 00 00 EA")
+    data[8:10] = bytes.fromhex("00 BF")
+    data[12:16] = bytes.fromhex("1F 20 03 D5")
+    path.write_bytes(data)
+
+    # This session follows and returns from ARM, then changes architecture at the same base.
+    # The architecture change clears history while byte-order-only behavior stays in the x86 check.
+    output = run_session(
+        binary,
+        ["--mode=code", str(path)],
+        [
+            *raw_model("ARM LE 1000"),
+            *address("F 0"),
+            ESCAPE,
+            *address("V 1000"),
+            ESCAPE,
+            ENTER,
+            b"o",
+            ENTER,
+            BACKSPACE,
+            ENTER,
+            *raw_model("THUMB LE 1000"),
+            BACKSPACE,
+            ENTER,
+            *raw_model("ARM64 BE 1000"),
+            ALT_G,
+            b"C",
+            ENTER,
+            CTRL_Q,
+        ],
+    )
+    require(
+        output,
+        b"File=00000000 RVA=- VA=0000000000001000",
+        b"The branch return history is empty.",
+        b"Use Ctrl+T, then R, to select a raw architecture.",
+        b"nop",
+    )
+    require_order(
+        output,
+        raw_header(0x1000),
+        raw_header(0x1008),
+        raw_header(0x1000),
+        raw_header(0x1008),
+    )
+    refusal = output.find(b"Use Ctrl+T, then R, to select a raw architecture.")
+    if refusal < 0:
+        raise AssertionError("The ARM-family O refusal did not appear.")
+    require_order(output[refusal:], raw_header(0x1008), raw_header(0x1000))
+    require_raw_header(output, path.name, b"ARM", 0x1000)
+    require_raw_header(output, path.name, b"THUMB", 0x1008)
+    require_raw_header(output, path.name, b"ARM64", 0x100C)
+
+
+# This check previews ARM and Thumb assembly and keeps one ARM edit transaction in memory.
+def check_arm_assembly_transactions(binary: Path, root: Path) -> None:
+    """Check ARM-family assembly preview, history, refusal, and cancellation."""
+    arm = root / "arm-assembly.bin"
+    arm_original = bytes.fromhex("00 00 A0 E1")
+    arm.write_bytes(arm_original)
+
+    # This session applies ARM bytes, checks Undo and Redo, and cancels the unsaved transaction.
+    output = run_session(
+        binary,
+        ["--mode=code", str(arm)],
+        [
+            *raw_model("ARM LE 8000"),
+            ALT_E,
+            ALT_A,
+            b"mov r0, #1",
+            ENTER,
+            ENTER,
+            ESCAPE,
+            CTRL_Z,
+            CTRL_Y,
+            ESCAPE,
+            CTRL_Q,
+        ],
+    )
+    require(
+        output,
+        b"Assembly patch preview",
+        b"Runtime address: 0000000000008000",
+        b"Replacement bytes (4): 01 00 A0 E3",
+        b"mov          r0, #1",
+    )
+    applied = output.find(b"Enter Apply  Esc Cancel")
+    if applied < 0:
+        raise AssertionError("The ARM assembly preview did not offer Apply.")
+    require_order(
+        output[applied:],
+        b"0100A0E3",
+        b"0000A0E1",
+        b"0100A0E3",
+        b"0000A0E1",
+    )
+    if arm.read_bytes() != arm_original:
+        raise AssertionError("ARM Undo, Redo, or cancellation changed the file.")
+
+    # This session previews Thumb bytes and cancels before the editor receives a replacement.
+    thumb = root / "thumb-assembly.bin"
+    thumb_original = bytes.fromhex("00 BF")
+    thumb.write_bytes(thumb_original)
+    output = run_session(
+        binary,
+        ["--mode=code", str(thumb)],
+        [
+            *raw_model("THUMB LE 9000"),
+            ALT_E,
+            ALT_A,
+            b"movs r0, #1",
+            ENTER,
+            ESCAPE,
+            ESCAPE,
+            CTRL_Q,
+        ],
+    )
+    require(
+        output,
+        b"Assembly patch preview",
+        b"Runtime address: 0000000000009000",
+        b"Replacement bytes (2): 01 20",
+    )
+    if thumb.read_bytes() != thumb_original:
+        raise AssertionError("A canceled Thumb preview changed the file.")
+
+    # This session keeps dirty ARM bytes while ARM64 rejects assembly, then reaches cancellation.
+    arm64 = root / "arm64-assembly.bin"
+    arm64_original = bytes.fromhex("00 00 A0 E1")
+    arm64.write_bytes(arm64_original)
+    output = run_session(
+        binary,
+        ["--mode=code", str(arm64)],
+        [
+            *raw_model("ARM LE A000"),
+            ALT_E,
+            ALT_A,
+            b"mov r0, #1",
+            ENTER,
+            ENTER,
+            ESCAPE,
+            *raw_model("ARM64 LE A000"),
+            ALT_A,
+            b"nop",
+            ENTER,
+            ENTER,
+            ESCAPE,
+            *raw_model("ARM LE A000"),
+            CTRL_Z,
+            CTRL_Y,
+            ESCAPE,
+            CTRL_Q,
+        ],
+    )
+    require(
+        output,
+        b"Replacement bytes (4): 01 00 A0 E3",
+        b"ARM64 assembly is unsupported.",
+    )
+    refusal = output.find(b"ARM64 assembly is unsupported.")
+    if refusal < 0:
+        raise AssertionError("The ARM64 assembly refusal did not appear.")
+    require_order(
+        output[refusal:],
+        b"0100A0E3",
+        b"0000A0E1",
+        b"0100A0E3",
+        b"0000A0E1",
+    )
+    if arm64.read_bytes() != arm64_original:
+        raise AssertionError("ARM64 refusal or cancellation changed the file.")
+
+
+# This check clears address history when model width or base changes.
 def check_history_and_width_cycle(binary: Path, root: Path) -> None:
     """Check raw history rules and width cycling."""
     # This section creates one relative call and verifies history across accepted and rejected model changes.
@@ -226,6 +429,32 @@ def check_history_and_width_cycle(binary: Path, root: Path) -> None:
     data[0:5] = b"\xE8\x03\x00\x00\x00"
     data[8] = 0xC3
     path.write_bytes(data)
+
+    # This session keeps one return entry through a canceled and an unchanged model selection.
+    retained = run_session(
+        binary,
+        ["--mode=code", str(path)],
+        [
+            *raw_model("X86 32 LE 1000"),
+            ENTER,
+            *raw_model(None),
+            BACKSPACE,
+            ENTER,
+            *raw_model("X86 32 LE 1000"),
+            BACKSPACE,
+            CTRL_Q,
+        ],
+    )
+    require_order(
+        retained,
+        raw_header(0x1000),
+        raw_header(0x1008),
+        raw_header(0x1000),
+        raw_header(0x1008),
+        raw_header(0x1000),
+    )
+
+    # This session checks rejected, byte-order-only, architecture, and base changes.
     output = run_session(
         binary,
         ["--mode=code", str(path)],
@@ -322,29 +551,54 @@ def check_transient_lifetime(binary: Path, root: Path) -> None:
     """Check raw state across rebuilds, files, and restarts."""
     source = root / "source.bin"
     copy = root / "copy.bin"
-    source.write_bytes(b"\x90\xC3")
+    source.write_bytes(bytes.fromhex("00 00 A0 E1"))
     output = run_session(
         binary,
         ["--mode=code", str(source)],
         [
-            *raw_model("X86 32 LE 1000"),
+            *raw_model("ARM LE 1000"),
             b"m",
             b"h",
             ENTER,
             ALT_E,
             b"FF",
             ESCAPE,
-            CTRL_S,
-            ESCAPE,
+            ALT_G,
+            b"0",
+            ENTER,
+            ALT_E,
+            b"01",
+            ALT_S,
+            b"m",
+            b"c",
+            ENTER,
+            ALT_G,
+            b"0",
+            ENTER,
+            b"m",
+            b"h",
+            ENTER,
+            ALT_E,
+            b"02",
             CTRL_S,
             str(copy).encode(),
+            ENTER,
+            b"m",
+            b"c",
+            ENTER,
+            ALT_G,
+            b"0",
             ENTER,
             CTRL_Q,
         ],
     )
-    require(last_header(output, copy.name), b"RAW")
-    if source.read_bytes() != b"\x90\xC3" or copy.read_bytes() != b"\x90\xC3":
-        raise AssertionError("Mode changes, cancellation, or Save As changed the bytes.")
+    require_order(output, b"0100A0E1", b"0200A0E1")
+    require_raw_header(output, source.name, b"ARM", 0x1000)
+    require_raw_header(output, copy.name, b"ARM", 0x1000)
+    if source.read_bytes() != bytes.fromhex("01 00 A0 E1"):
+        raise AssertionError("The ARM replacement Save wrote incorrect bytes.")
+    if copy.read_bytes() != bytes.fromhex("02 00 A0 E1"):
+        raise AssertionError("The ARM Save As wrote incorrect bytes.")
 
     output = run_session(binary, ["--mode=code", str(copy)], [CTRL_Q])
     if b"RAW" in last_header(output, copy.name):
@@ -357,7 +611,7 @@ def check_transient_lifetime(binary: Path, root: Path) -> None:
     output = run_session(
         binary,
         ["--mode=code", str(first), str(second)],
-        [*raw_model("X86 32 LE 1000"), ALT_N, ALT_P, CTRL_Q],
+        [*raw_model("THUMB LE 1000"), ALT_N, ALT_P, CTRL_Q],
     )
     if b"RAW" in last_header(output, first.name):
         raise AssertionError("A raw model survived a file switch.")
@@ -375,7 +629,7 @@ def check_auto_pe_and_session(binary: Path, root: Path) -> None:
         binary,
         ["--mode=code", str(pe_path)],
         [
-            *raw_model("X86 32 LE 50000000"),
+            *raw_model("ARM LE 50000000"),
             *address("F 0"),
             ESCAPE,
             *raw_model("AUTO"),
@@ -447,6 +701,8 @@ def main() -> None:
         check_addresses_and_byte_order(binary, root)
         check_decode_and_assembly(binary, root)
         check_atomic_failures_and_growth(binary, root)
+        check_arm_code_and_navigation(binary, root)
+        check_arm_assembly_transactions(binary, root)
         check_history_and_width_cycle(binary, root)
         check_transient_lifetime(binary, root)
         check_auto_pe_and_session(binary, root)

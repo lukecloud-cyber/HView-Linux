@@ -96,13 +96,13 @@ pub enum ByteOrder {
 }
 
 /*
-RawModel supplies an explicit base, machine width, and byte order for unformatted code.
+RawModel supplies an explicit base, architecture, and byte order for unformatted code.
 Validation prevents a configured address range from exceeding the selected architecture width.
 */
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RawModel {
     pub base: u64,
-    pub bits: u32,
+    pub architecture: crate::format::Architecture,
     pub byte_order: ByteOrder,
 }
 
@@ -113,12 +113,13 @@ The format module returns the precise range error before configuration changes.
 impl RawModel {
     /*
     This method checks the final file byte through the proposed raw address mapping.
-    An empty buffer uses address zero so invalid base and width combinations still fail.
+    An empty buffer uses file offset zero, which maps to the configured runtime base.
     */
     fn validate(self, file_len: usize) -> Result<(), String> {
         let last = u64::try_from(file_len.saturating_sub(1))
             .map_err(|_| "The raw file size exceeds the address range.")?;
-        crate::format::Metadata::raw(self.base, self.bits)?.code_address(last)?;
+        crate::format::Metadata::raw_architecture(self.base, self.architecture)?
+            .code_address(last)?;
         Ok(())
     }
 }
@@ -251,14 +252,6 @@ impl Editor {
     }
 
     /*
-    This query selects decoder width from the active raw model or normal Code settings.
-    Decoder setup uses the returned width for the next instruction.
-    */
-    pub fn decode_bits(&self) -> u32 {
-        self.raw_model.map_or(self.code_bits, |model| model.bits)
-    }
-
-    /*
     This query enables Real16 only when no raw model overrides normal Code settings.
     The decoder uses the result with the selected bit width.
     */
@@ -274,7 +267,7 @@ impl Editor {
         match self.raw_model {
             Some(model) => {
                 self.validate_raw_len(self.data.len())?;
-                crate::format::Metadata::raw(model.base, model.bits)
+                crate::format::Metadata::raw_architecture(model.base, model.architecture)
             }
             None => crate::format::Metadata::parse(&self.data),
         }
@@ -1149,12 +1142,18 @@ mod tests {
         editor.real_mode = true;
         let raw = RawModel {
             base: 0x401000,
-            bits: 32,
+            architecture: crate::format::Architecture::X86(32),
             byte_order: ByteOrder::Little,
         };
         editor.set_raw_model(Some(raw)).unwrap();
         assert_eq!(editor.raw_model, Some(raw));
-        assert_eq!(editor.decode_bits(), 32);
+        assert_eq!(
+            editor
+                .metadata()
+                .unwrap()
+                .decoder_architecture(editor.code_bits),
+            Ok(crate::format::Architecture::X86(32))
+        );
         assert!(!editor.decode_real_mode());
         assert_eq!(
             editor.metadata().unwrap().code_address(1),
@@ -1169,7 +1168,7 @@ mod tests {
             editor
                 .set_raw_model(Some(RawModel {
                     base: u64::from(u32::MAX),
-                    bits: 32,
+                    architecture: crate::format::Architecture::X86(32),
                     byte_order: ByteOrder::Big,
                 }))
                 .is_err()
@@ -1181,7 +1180,13 @@ mod tests {
         */
         editor.set_raw_model(None).unwrap();
         assert_eq!(editor.raw_model, None);
-        assert_eq!(editor.decode_bits(), 16);
+        assert_eq!(
+            editor
+                .metadata()
+                .unwrap()
+                .decoder_architecture(editor.code_bits),
+            Ok(crate::format::Architecture::X86(16))
+        );
         assert!(editor.decode_real_mode());
     }
 
@@ -1198,7 +1203,7 @@ mod tests {
         empty
             .set_raw_model(Some(RawModel {
                 base: u64::from(u32::MAX),
-                bits: 16,
+                architecture: crate::format::Architecture::X86(16),
                 byte_order: ByteOrder::Little,
             }))
             .unwrap();
@@ -1212,11 +1217,17 @@ mod tests {
         Next, test 32-bit and 64-bit address overflow during one-byte Hex growth.
         Every rejected input keeps its complete editor state.
         */
-        for (base, bits) in [(u64::from(u32::MAX), 32), (u64::MAX, 64)] {
+        for (base, architecture) in [
+            (u64::from(u32::MAX), crate::format::Architecture::X86(32)),
+            (u64::from(u32::MAX), crate::format::Architecture::Arm),
+            (u64::from(u32::MAX), crate::format::Architecture::Thumb),
+            (u64::MAX, crate::format::Architecture::X86(64)),
+            (u64::MAX, crate::format::Architecture::Arm64),
+        ] {
             let mut editor = Editor::new(vec![0x90], Mode::Hex, 1);
             let raw = RawModel {
                 base,
-                bits,
+                architecture,
                 byte_order: ByteOrder::Little,
             };
             editor.set_raw_model(Some(raw)).unwrap();
@@ -1230,6 +1241,86 @@ mod tests {
             assert!(!editor.low_nibble);
             assert!(!editor.dirty);
         }
+    }
+
+    /*
+    This test rejects invalid architecture selection and raw growth during an unsaved transaction.
+    Each failure preserves bytes, cursor state, dirty state, and available Undo or Redo operations.
+    */
+    #[test]
+    fn raw_architecture_rejection_preserves_the_complete_edit_transaction() {
+        /*
+        The setup creates two edit records and undoes only the second record.
+        The snapshot therefore contains dirty bytes and one available operation in each history direction.
+        */
+        let original = vec![0x90, 0x90];
+        let mut editor = Editor::new(original.clone(), Mode::Code, 0);
+        editor.toggle_edit().unwrap();
+        editor.replace_bytes(0, vec![0x91], (1, 0)).unwrap();
+        editor.replace_bytes(1, vec![0x92], (2, 0)).unwrap();
+        assert!(editor.undo().unwrap());
+        assert_eq!(editor.data, [0x91, 0x90]);
+        assert!(editor.dirty);
+        let raw = RawModel {
+            base: u64::from(u32::MAX) - 1,
+            architecture: crate::format::Architecture::Arm,
+            byte_order: ByteOrder::Big,
+        };
+        editor.set_raw_model(Some(raw)).unwrap();
+        let state = (
+            editor.data.clone(),
+            editor.offset,
+            editor.top,
+            editor.low_nibble,
+            editor.dirty,
+            editor.raw_model,
+            editor.undo_history.len(),
+            editor.redo_history.len(),
+            editor.history_bytes,
+        );
+
+        /*
+        The rejection section requests one invalid architecture and one excessive growth operation.
+        Both errors must preserve the complete snapshot from the active transaction.
+        */
+        assert!(
+            editor
+                .set_raw_model(Some(RawModel {
+                    base: 0,
+                    architecture: crate::format::Architecture::X86(8),
+                    byte_order: ByteOrder::Little,
+                }))
+                .is_err()
+        );
+        assert!(editor.replace_bytes(2, vec![0, 0, 0, 0], (6, 0)).is_err());
+        assert_eq!(
+            (
+                editor.data.clone(),
+                editor.offset,
+                editor.top,
+                editor.low_nibble,
+                editor.dirty,
+                editor.raw_model,
+                editor.undo_history.len(),
+                editor.redo_history.len(),
+                editor.history_bytes,
+            ),
+            state
+        );
+
+        /*
+        The final section proves that Redo and both Undo records remain usable after the errors.
+        Cancellation restores the independent original bytes and retains the valid raw model.
+        */
+        assert!(editor.redo().unwrap());
+        assert_eq!(editor.data, [0x91, 0x92]);
+        assert!(editor.undo().unwrap());
+        assert_eq!(editor.data, [0x91, 0x90]);
+        assert!(editor.undo().unwrap());
+        assert_eq!(editor.data, original);
+        editor.cancel_edit();
+        assert_eq!(editor.data, original);
+        assert_eq!(editor.raw_model, Some(raw));
     }
 
     /*
@@ -1316,7 +1407,7 @@ mod tests {
         editor
             .set_raw_model(Some(RawModel {
                 base: u64::from(u32::MAX),
-                bits: 32,
+                architecture: crate::format::Architecture::X86(32),
                 byte_order: ByteOrder::Little,
             }))
             .unwrap();

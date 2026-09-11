@@ -172,8 +172,13 @@ fn frame(
         lines[0] = header.into_iter().collect();
     }
     if view.mode == Mode::Code
-        && let Ok((address, _bits)) = code_address(metadata, view.offset)
+        && let Ok(location) = code_location(metadata, view.offset)
+        && let Ok(architecture) = metadata
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|metadata| metadata.decoder_architecture(view.code_bits))
     {
+        let address = location.address;
         let mut code_header: Vec<char> = lines[0].chars().collect();
         put(
             &mut code_header,
@@ -181,7 +186,7 @@ fn frame(
             if view.decode_real_mode() {
                 "Real16".to_owned()
             } else {
-                format!("a{}", view.decode_bits())
+                architecture.label().to_owned()
             }
             .as_str(),
         );
@@ -276,18 +281,6 @@ fn code_location(
         Ok(metadata) => metadata.code_location(offset),
         Err(error) => Err(error.clone()),
     }
-}
-
-/*
-This compatibility helper returns the current address and width tuple.
-Header and summary callers retain their established display behavior.
-*/
-fn code_address(
-    metadata: &Result<format::Metadata, String>,
-    offset: u64,
-) -> Result<(u64, u32), String> {
-    let location = code_location(metadata, offset)?;
-    Ok((location.address, location.bits))
 }
 
 /*
@@ -432,7 +425,7 @@ fn assembly_preview(
     let new_len = view.data.len().max(end);
     view.validate_raw_len(new_len)?;
     let address = metadata.code_location(view.offset)?.address;
-    let architecture = format::Architecture::x86(view.decode_bits())?;
+    let architecture = metadata.decoder_architecture(view.code_bits)?;
     let decoder = decoder_for(decoder, architecture, view.syntax, view.decode_real_mode())?;
 
     let original_stop = end.min(view.data.len());
@@ -682,7 +675,10 @@ fn decode_at(
     The fallback produces one data-byte instruction only when configuration permits it.
     */
     let location = code_location(metadata, offset)?;
-    let architecture = format::Architecture::x86(view.decode_bits())?;
+    let architecture = metadata
+        .as_ref()
+        .map_err(Clone::clone)?
+        .decoder_architecture(view.code_bits)?;
     let decoder = decoder_for(decoder, architecture, view.syntax, view.decode_real_mode())?;
     let mut instruction = if view.invalid_code_bytes {
         decoder.decode_or_byte(&view.data, offset, location.address)?
@@ -694,7 +690,8 @@ fn decode_at(
     Packed NOP and INT3 runs become one visible instruction with their combined length.
     The caller advances by the resulting instruction size.
     */
-    if instruction.size == 1
+    if matches!(architecture, format::Architecture::X86(_))
+        && instruction.size == 1
         && let Some(&byte) = view.data.get(offset as usize)
         && ((byte == 0x90 && view.pack_nops) || (byte == 0xCC && view.pack_int3))
     {
@@ -729,7 +726,7 @@ fn direct_target_offset(
         .ok_or("The branch source is outside the current buffer.")?;
     let target = decoder_for(
         decoder,
-        format::Architecture::x86(view.decode_bits())?,
+        metadata.decoder_architecture(view.code_bits)?,
         view.syntax,
         view.decode_real_mode(),
     )?
@@ -770,15 +767,19 @@ fn take_return(
 
 /*
 This helper decodes the selected instruction as the default assembly input.
-Intel syntax remains the required assembly syntax for this edit path.
+X86 seeds use Intel syntax, while ARM-family seeds use their native syntax.
 */
 fn assembly_seed(
     view: &Editor,
     metadata: &Result<format::Metadata, String>,
 ) -> Result<String, String> {
     let location = code_location(metadata, view.offset)?;
+    let architecture = metadata
+        .as_ref()
+        .map_err(Clone::clone)?
+        .decoder_architecture(view.code_bits)?;
     decoder::Decoder::with_architecture(
-        format::Architecture::x86(view.decode_bits())?,
+        architecture,
         decoder::Syntax::Intel,
         view.decode_real_mode(),
     )?
@@ -792,10 +793,18 @@ Standard Code mode includes Real16 after the 64-bit state.
 */
 fn cycle_code_mode(view: &mut Editor) -> Result<(), String> {
     if let Some(mut model) = view.raw_model {
-        model.bits = match model.bits {
-            16 => 32,
-            32 => 64,
-            _ => 16,
+        model.architecture = match model.architecture {
+            format::Architecture::X86(16) => format::Architecture::X86(32),
+            format::Architecture::X86(32) => format::Architecture::X86(64),
+            format::Architecture::X86(64) => format::Architecture::X86(16),
+            format::Architecture::X86(_) => {
+                return Err("The raw x86 code width must be 16, 32, or 64 bits.".into());
+            }
+            format::Architecture::Arm
+            | format::Architecture::Thumb
+            | format::Architecture::Arm64 => {
+                return Err("Use Ctrl+T, then R, to select a raw architecture.".into());
+            }
         };
         return view.set_raw_model(Some(model));
     }
@@ -2446,7 +2455,7 @@ fn open_editor(
                     let proposed = (|| {
                         let metadata = metadata.as_ref().map_err(Clone::clone)?;
                         let address = metadata.code_location(view.offset)?.address;
-                        let architecture = format::Architecture::x86(view.decode_bits())?;
+                        let architecture = metadata.decoder_architecture(view.code_bits)?;
                         let bytes = assembler::assemble_architecture(&text, architecture, address)?;
                         let start = usize::try_from(view.offset)
                             .map_err(|_| "The offset exceeds the address range.")?;
@@ -3573,7 +3582,7 @@ mod tests {
         shorter
             .set_raw_model(Some(editor::RawModel {
                 base: 0x1000,
-                bits: 32,
+                architecture: format::Architecture::X86(32),
                 byte_order: editor::ByteOrder::Little,
             }))
             .unwrap();
@@ -3613,7 +3622,7 @@ mod tests {
         eof.code_bits = 32;
         eof.set_raw_model(Some(editor::RawModel {
             base: 0x2000,
-            bits: 32,
+            architecture: format::Architecture::X86(32),
             byte_order: editor::ByteOrder::Little,
         }))
         .unwrap();
@@ -3644,7 +3653,7 @@ mod tests {
 
             view.set_raw_model(Some(editor::RawModel {
                 base: 0x1000,
-                bits: 16,
+                architecture: format::Architecture::X86(16),
                 byte_order: editor::ByteOrder::Little,
             }))
             .unwrap();
@@ -3653,7 +3662,7 @@ mod tests {
 
             view.set_raw_model(Some(editor::RawModel {
                 base: 0x1000,
-                bits: 32,
+                architecture: format::Architecture::X86(32),
                 byte_order: editor::ByteOrder::Little,
             }))
             .unwrap();
@@ -3679,7 +3688,7 @@ mod tests {
         fallback
             .set_raw_model(Some(editor::RawModel {
                 base: u64::from(u32::MAX),
-                bits: 32,
+                architecture: format::Architecture::X86(32),
                 byte_order: editor::ByteOrder::Little,
             }))
             .unwrap();
@@ -3758,7 +3767,7 @@ mod tests {
         view.real_mode = true;
         view.set_raw_model(Some(editor::RawModel {
             base: 0x10000,
-            bits: 32,
+            architecture: format::Architecture::X86(32),
             byte_order: editor::ByteOrder::Little,
         }))
         .unwrap();
@@ -3808,7 +3817,7 @@ mod tests {
 
     /*
     This test keeps Intel assembly input independent from AT&T disassembly output.
-    The active raw address model supplies the effective decoder width.
+    The active raw address model supplies the effective decoder architecture.
     */
     #[test]
     fn assembly_seed_stays_intel_with_att_display() {
@@ -3818,7 +3827,7 @@ mod tests {
         view.syntax = decoder::Syntax::Att;
         view.set_raw_model(Some(editor::RawModel {
             base: 0x1_0000_0000,
-            bits: 64,
+            architecture: format::Architecture::X86(64),
             byte_order: editor::ByteOrder::Little,
         }))
         .unwrap();
@@ -3840,7 +3849,7 @@ mod tests {
             let mut view = Editor::new(data.clone(), Mode::Code, 0);
             view.set_raw_model(Some(editor::RawModel {
                 base: 0x1000,
-                bits: 32,
+                architecture: format::Architecture::X86(32),
                 byte_order,
             }))
             .unwrap();
@@ -3850,6 +3859,306 @@ mod tests {
         }
         assert_eq!(texts[0], texts[1]);
         assert_ne!(integers[0], integers[1]);
+    }
+
+    /*
+    This test sends each ARM-family raw model through current buffered Code display helpers.
+    Nonzero file offsets and runtime bases prove that address mapping and engine selection stay together.
+    */
+    #[test]
+    fn raw_arm_architectures_reach_buffered_code_consumers() {
+        for (architecture, prefix, bytes, expected) in [
+            (
+                format::Architecture::Arm,
+                4,
+                &[0x00, 0x00, 0xa0, 0xe1][..],
+                "mov          r0, r0",
+            ),
+            (
+                format::Architecture::Thumb,
+                2,
+                &[0x01, 0x20][..],
+                "movs         r0, #1",
+            ),
+            (
+                format::Architecture::Arm64,
+                4,
+                &[0x1f, 0x20, 0x03, 0xd5][..],
+                "nop",
+            ),
+        ] {
+            /*
+            The setup section places one independent instruction after a nonzero source prefix.
+            Both byte-order models must select the same little-endian instruction engine.
+            */
+            let mut data = vec![0xff; prefix];
+            data.extend_from_slice(bytes);
+            let mut decoded = Vec::new();
+            for byte_order in [editor::ByteOrder::Little, editor::ByteOrder::Big] {
+                let mut view = Editor::new(data.clone(), Mode::Code, prefix as u64);
+                view.top = prefix as u64;
+                view.invalid_code_bytes = true;
+                view.set_raw_model(Some(editor::RawModel {
+                    base: 0x4000,
+                    architecture,
+                    byte_order,
+                }))
+                .unwrap();
+                let metadata = view.metadata();
+                let location = code_location(&metadata, prefix as u64).unwrap();
+                assert_eq!(
+                    (location.address, location.architecture, location.domain),
+                    (
+                        0x4000 + prefix as u64,
+                        architecture,
+                        format::AddressDomain::Va,
+                    )
+                );
+
+                /*
+                The decode section checks strict selection, display rows, and assembly seed text.
+                Each result retains the selected runtime address and architecture-specific instruction size.
+                */
+                let instruction = decode_at(&view, prefix as u64, &metadata, &mut None)
+                    .unwrap()
+                    .1;
+                assert_eq!(instruction.size, bytes.len());
+                assert_eq!(instruction.text, expected);
+                let rows = code_rows(&view, 1, &metadata, &mut None);
+                assert!(rows[0].contains(expected.trim()));
+                assert!(rows[0].contains(&format!("{:08X}", 0x4000 + prefix)));
+                assert_eq!(assembly_seed(&view, &metadata).unwrap(), expected);
+                decoded.push(instruction.text);
+            }
+            assert_eq!(decoded[0], decoded[1]);
+        }
+
+        /*
+        The tail section sends one remaining byte through each fixed-width raw engine.
+        The configured fallback clips one architecture unit without enabling x86 byte packing.
+        */
+        for architecture in [
+            format::Architecture::Arm,
+            format::Architecture::Thumb,
+            format::Architecture::Arm64,
+        ] {
+            let mut view = Editor::new(vec![0x90], Mode::Code, 0);
+            view.invalid_code_bytes = true;
+            view.pack_nops = true;
+            view.set_raw_model(Some(editor::RawModel {
+                base: 0x4000,
+                architecture,
+                byte_order: editor::ByteOrder::Little,
+            }))
+            .unwrap();
+            let instruction = decode_at(&view, 0, &view.metadata(), &mut None).unwrap().1;
+            assert_eq!(instruction.size, 1);
+            assert_eq!(instruction.hex, "90");
+            assert!(instruction.text.starts_with("db"));
+        }
+    }
+
+    /*
+    This test applies ARM and Thumb assembly through the current preview transaction path.
+    ARM64 refuses assembly before preview and preserves the active editor state.
+    */
+    #[test]
+    fn raw_arm_assembly_preview_preserves_transactions_and_arm64_refusal() {
+        for (architecture, original, text, replacement) in [
+            (
+                format::Architecture::Arm,
+                &[0x00, 0x00, 0xa0, 0xe1][..],
+                "mov r0, #1",
+                &[0x01, 0x00, 0xa0, 0xe3][..],
+            ),
+            (
+                format::Architecture::Thumb,
+                &[0x00, 0xbf][..],
+                "movs r0, #1",
+                &[0x01, 0x20][..],
+            ),
+        ] {
+            /*
+            The preparation section assembles at a nonzero file offset and runtime address.
+            The preview must show exact bytes without changing the current buffer.
+            */
+            let prefix = architecture.alignment() as usize;
+            let mut data = vec![0xff; prefix];
+            data.extend_from_slice(original);
+            let mut view = Editor::new(data.clone(), Mode::Code, prefix as u64);
+            view.top = prefix as u64;
+            view.set_raw_model(Some(editor::RawModel {
+                base: 0x8000,
+                architecture,
+                byte_order: editor::ByteOrder::Little,
+            }))
+            .unwrap();
+            let address = 0x8000 + prefix as u64;
+            let bytes = assembler::assemble_architecture(text, architecture, address).unwrap();
+            assert_eq!(bytes, replacement);
+            let preview =
+                assembly_preview(&view, &view.metadata().unwrap(), &mut None, &bytes).unwrap();
+            assert_eq!(view.data, data);
+            assert!(preview.summary[1].contains(&format!("Runtime address: {address:016X}")));
+            assert!(preview.proposed[0].contains("mov"));
+
+            /*
+            The transaction section applies the accepted bytes and checks Undo, Redo, and cancellation.
+            Cancellation restores the complete original buffer after both history directions remain usable.
+            */
+            view.toggle_edit().unwrap();
+            let end = prefix + bytes.len();
+            view.replace_bytes(prefix, bytes, (end as u64, prefix as u64))
+                .unwrap();
+            assert_eq!(&view.data[prefix..end], replacement);
+            assert!(view.undo().unwrap());
+            assert_eq!(view.data, data);
+            assert!(view.redo().unwrap());
+            assert_eq!(&view.data[prefix..end], replacement);
+            view.cancel_edit();
+            assert_eq!(view.data, data);
+        }
+
+        /*
+        The final section checks ARM64 refusal with an owned unsaved replacement.
+        The error retains dirty bytes, cursor state, edit history, and the selected raw model.
+        */
+        let original = vec![0x1f, 0x20, 0x03, 0xd5];
+        let edited = vec![0x20, 0x00, 0x80, 0x52];
+        let mut arm64 = Editor::new(original.clone(), Mode::Code, 0);
+        let raw = editor::RawModel {
+            base: 0x1_4000_0000,
+            architecture: format::Architecture::Arm64,
+            byte_order: editor::ByteOrder::Little,
+        };
+        arm64.set_raw_model(Some(raw)).unwrap();
+        arm64.toggle_edit().unwrap();
+        arm64.replace_bytes(0, edited.clone(), (4, 0)).unwrap();
+        let error = assembler::assemble_architecture(
+            "nop",
+            arm64
+                .metadata()
+                .unwrap()
+                .decoder_architecture(arm64.code_bits)
+                .unwrap(),
+            0x1_4000_0000,
+        )
+        .unwrap_err();
+        assert_eq!(error, "ARM64 assembly is unsupported.");
+        assert_eq!(arm64.data, edited);
+        assert_eq!((arm64.offset, arm64.top), (4, 0));
+        assert!(arm64.editing);
+        assert!(arm64.dirty);
+        assert_eq!(arm64.raw_model, Some(raw));
+        assert!(arm64.undo().unwrap());
+        assert_eq!(arm64.data, original);
+        assert!(arm64.redo().unwrap());
+        assert_eq!(arm64.data, edited);
+        arm64.cancel_edit();
+        assert_eq!(arm64.data, original);
+        assert_eq!(arm64.raw_model, Some(raw));
+    }
+
+    /*
+    This test resolves raw ARM-family direct branches through current buffered navigation.
+    BLX and indirect transfers remain targetless and cannot create a file target.
+    */
+    #[test]
+    fn raw_arm_direct_targets_map_back_to_current_file_offsets() {
+        /*
+        The first table maps one direct branch for each ARM-family architecture.
+        Nonzero source offsets prove that runtime targets return to exact file offsets.
+        */
+        for (architecture, prefix, branch, target) in [
+            (
+                format::Architecture::Arm,
+                4,
+                &[0x00, 0x00, 0x00, 0xea][..],
+                12,
+            ),
+            (format::Architecture::Thumb, 2, &[0x01, 0xe0][..], 8),
+            (
+                format::Architecture::Arm64,
+                4,
+                &[0x01, 0x00, 0x00, 0x14][..],
+                8,
+            ),
+        ] {
+            let mut data = vec![0xff; 20];
+            data[prefix..prefix + branch.len()].copy_from_slice(branch);
+            let mut view = Editor::new(data, Mode::Code, prefix as u64);
+            view.set_raw_model(Some(editor::RawModel {
+                base: 0x1000,
+                architecture,
+                byte_order: editor::ByteOrder::Little,
+            }))
+            .unwrap();
+            assert_eq!(
+                direct_target_offset(&view, &view.metadata(), &mut None),
+                Ok(target)
+            );
+        }
+
+        /*
+        The second table sends BLX and an indirect return through the same current helper.
+        None of these instructions can publish one direct file target.
+        */
+        for (architecture, bytes) in [
+            (format::Architecture::Arm, &[0x02, 0x00, 0x00, 0xfa][..]),
+            (format::Architecture::Thumb, &[0x00, 0xf0, 0x06, 0xe8][..]),
+            (format::Architecture::Arm64, &[0xc0, 0x03, 0x5f, 0xd6][..]),
+        ] {
+            let mut view = Editor::new(bytes.to_vec(), Mode::Code, 0);
+            view.set_raw_model(Some(editor::RawModel {
+                base: 0x1000,
+                architecture,
+                byte_order: editor::ByteOrder::Little,
+            }))
+            .unwrap();
+            assert!(direct_target_offset(&view, &view.metadata(), &mut None).is_err());
+        }
+    }
+
+    /*
+    This test changes between three 32-bit raw architectures at one runtime base.
+    The shared decoder cache must refresh Code text and direct targets for each architecture.
+    */
+    #[test]
+    fn same_width_raw_architecture_changes_refresh_code_and_targets() {
+        let mut data = vec![0x90; 20];
+        data[0..2].copy_from_slice(&[0xeb, 0x06]);
+        data[4..8].copy_from_slice(&[0x00, 0x00, 0x00, 0xea]);
+        data[8..10].copy_from_slice(&[0x01, 0xe0]);
+        let mut view = Editor::new(data, Mode::Code, 0);
+        let mut decoder = None;
+
+        /*
+        Each selection keeps base 1000 and changes only the architecture and file offset.
+        Exact target offsets prove that the previous 32-bit engine does not remain cached.
+        */
+        for (architecture, offset, mnemonic, target) in [
+            (format::Architecture::X86(32), 0, "jmp", 8),
+            (format::Architecture::Arm, 4, "b", 12),
+            (format::Architecture::Thumb, 8, "b", 14),
+        ] {
+            view.offset = offset;
+            view.top = offset;
+            view.set_raw_model(Some(editor::RawModel {
+                base: 0x1000,
+                architecture,
+                byte_order: editor::ByteOrder::Little,
+            }))
+            .unwrap();
+            let metadata = view.metadata();
+            let instruction = decode_at(&view, offset, &metadata, &mut decoder).unwrap().1;
+            assert!(instruction.text.starts_with(mnemonic));
+            assert!(code_rows(&view, 1, &metadata, &mut decoder)[0].contains(mnemonic));
+            assert_eq!(
+                direct_target_offset(&view, &metadata, &mut decoder),
+                Ok(target)
+            );
+            assert_eq!(decoder.as_ref().unwrap().architecture(), architecture);
+        }
     }
 
     /*
@@ -3863,29 +4172,59 @@ mod tests {
         view.real_mode = true;
         view.set_raw_model(Some(editor::RawModel {
             base: 0x1000,
-            bits: 32,
+            architecture: format::Architecture::X86(32),
             byte_order: editor::ByteOrder::Big,
         }))
         .unwrap();
 
         cycle_code_mode(&mut view).unwrap();
-        assert_eq!(view.decode_bits(), 64);
+        assert_eq!(
+            view.raw_model.unwrap().architecture,
+            format::Architecture::X86(64)
+        );
         cycle_code_mode(&mut view).unwrap();
-        assert_eq!(view.decode_bits(), 16);
+        assert_eq!(
+            view.raw_model.unwrap().architecture,
+            format::Architecture::X86(16)
+        );
         assert!(!view.decode_real_mode());
         view.set_raw_model(None).unwrap();
-        assert_eq!(view.decode_bits(), 16);
+        assert_eq!(
+            view.metadata()
+                .unwrap()
+                .decoder_architecture(view.code_bits),
+            Ok(format::Architecture::X86(16))
+        );
         assert!(view.decode_real_mode());
 
         view.set_raw_model(Some(editor::RawModel {
             base: u64::from(u32::MAX) + 1,
-            bits: 64,
+            architecture: format::Architecture::X86(64),
             byte_order: editor::ByteOrder::Little,
         }))
         .unwrap();
         let before = view.raw_model;
         assert!(cycle_code_mode(&mut view).is_err());
         assert_eq!(view.raw_model, before);
+
+        for architecture in [
+            format::Architecture::Arm,
+            format::Architecture::Thumb,
+            format::Architecture::Arm64,
+        ] {
+            view.set_raw_model(Some(editor::RawModel {
+                base: 0x1000,
+                architecture,
+                byte_order: editor::ByteOrder::Little,
+            }))
+            .unwrap();
+            let before = view.raw_model;
+            assert_eq!(
+                cycle_code_mode(&mut view).unwrap_err(),
+                "Use Ctrl+T, then R, to select a raw architecture."
+            );
+            assert_eq!(view.raw_model, before);
+        }
     }
 
     /*
