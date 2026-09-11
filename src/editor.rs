@@ -1,9 +1,13 @@
 /*
-This module owns buffered file data, view state, editing, and presentation helpers.
+This module owns buffered file data, view state, editing, presentation helpers, and source revisions.
 The Editor applies range transactions to complete buffered data and preserves exact cursor state in bounded history.
+Each actual byte mutation changes the source revision so analysis callers can reject stale results.
 Paged files use the related logical-layout owner in paged.rs.
 */
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::VecDeque, fmt::Write};
+
+use crate::analysis::SourceStamp;
 
 /*
 Buffered and paged editors share the Windows history limits.
@@ -11,6 +15,12 @@ The record limit bounds operation count, and the byte limit bounds retained byte
 */
 const EDIT_HISTORY_LIMIT: usize = 256;
 const EDIT_HISTORY_BYTES: usize = 130 * 1024 * 1024;
+
+/*
+Each new buffered editor receives one process-local source identity.
+The revision starts at zero and changes after each actual byte mutation.
+*/
+static NEXT_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /*
 One buffered cursor snapshot contains the byte position, viewport, and Hex nibble selection.
@@ -134,7 +144,8 @@ pub enum Key {
 /*
 Editor owns the complete buffered bytes and all active view settings.
 Public fields support the established main loop and session wrappers.
-Private fields preserve the edit baseline, histories, byte accounting, and Hex group state.
+Private fields preserve the edit baseline, histories, byte accounting, Hex group state, and analysis stamp.
+Future direct data replacement must call source_changed before analysis accepts another result.
 */
 pub struct Editor {
     pub data: Vec<u8>,
@@ -164,6 +175,8 @@ pub struct Editor {
     history_bytes: usize,
     changed_bytes: usize,
     hex_start: Option<EditCursor>,
+    source_identity: u64,
+    revision: u64,
 }
 
 /*
@@ -209,6 +222,8 @@ impl Editor {
             history_bytes: 0,
             changed_bytes: 0,
             hex_start: None,
+            source_identity: NEXT_SOURCE_ID.fetch_add(1, Ordering::Relaxed),
+            revision: 0,
         }
     }
 
@@ -345,6 +360,7 @@ impl Editor {
     /*
     This commit helper applies one prepared history side to the owned byte buffer.
     It grows before copying, truncates afterward, updates changed-byte accounting, and restores the cursor.
+    Each caller reaches this helper only for an actual byte mutation, so the helper advances the source revision.
     All fallible allocation and model checks occur before this helper runs.
     */
     fn apply_record_bytes(
@@ -365,6 +381,36 @@ impl Editor {
         self.changed_bytes = self.changed_bytes.saturating_sub(before) + after;
         self.dirty = self.changed_bytes != 0;
         self.set_cursor(cursor);
+        self.bump_revision();
+    }
+
+    /*
+    This helper advances the current buffered byte-state revision after one real mutation.
+    Wrapping preserves the upstream counter behavior without turning a mutation into a fallible operation.
+    */
+    fn bump_revision(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /*
+    This accessor captures the current process-local source identity and byte revision.
+    Analysis results carry this value until the terminal acceptance check.
+    */
+    #[allow(
+        dead_code,
+        reason = "L06.1 creates source stamps before L06.2 connects analysis callers."
+    )]
+    pub(crate) fn buffer_stamp(&self) -> SourceStamp {
+        SourceStamp::new(self.source_identity, self.revision)
+    }
+
+    /*
+    This action assigns a new source identity after successful external source adoption.
+    Save As calls this action before saved clears the accepted edit session.
+    */
+    pub(crate) fn source_changed(&mut self) {
+        self.source_identity = NEXT_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
+        self.revision = 0;
     }
 
     /*
@@ -591,8 +637,10 @@ impl Editor {
     /*
     Cancellation restores the owned baseline and removes all buffered edit history.
     It clamps the cursor to restored data and returns the editor to clean normal mode.
+    A restored byte change advances the revision, while an unchanged cancellation preserves the stamp.
     */
     pub fn cancel_edit(&mut self) {
+        let changed = self.dirty;
         if let Some(data) = self.backup.take() {
             self.data = data;
         }
@@ -602,11 +650,15 @@ impl Editor {
         self.editing = false;
         self.dirty = false;
         self.low_nibble = false;
+        if changed {
+            self.bump_revision();
+        }
     }
 
     /*
     A successful save makes current bytes the new external baseline.
     It removes the old backup and history, then returns the editor to clean normal mode.
+    This state reset does not change source identity or revision by itself.
     */
     pub fn saved(&mut self) {
         self.backup = None;
@@ -665,6 +717,7 @@ impl Editor {
         /*
         Finally, update the open record or create one new transaction.
         A byte-identical input still advances nibble state without a new history record.
+        A changed grouped nibble advances the revision because it bypasses apply_record_bytes.
         */
         if grouped {
             let affected_end = index + 1;
@@ -677,6 +730,7 @@ impl Editor {
                 let after = self.difference_count(index, affected_end);
                 self.changed_bytes = self.changed_bytes.saturating_sub(before) + after;
                 self.dirty = self.changed_bytes != 0;
+                self.bump_revision();
             }
             let record = self.undo_history.back_mut().unwrap();
             record.after[0] = replacement;
@@ -1391,5 +1445,112 @@ mod tests {
         assert!(editor.undo().unwrap());
         assert!(editor.data.iter().all(|&byte| byte == 0));
         assert_eq!((editor.offset, editor.top, editor.dirty), (0, 0, false));
+    }
+
+    /*
+    This test separates source identity from one editor's byte revision.
+    State-only actions, no-ops, failures, and saved preserve the current stamp.
+    */
+    #[test]
+    fn source_stamp_ignores_state_only_and_failed_actions() {
+        let mut editor = Editor::new(vec![0x12], Mode::Hex, 0);
+        let initial = editor.buffer_stamp();
+        let other = Editor::new(vec![0x12], Mode::Hex, 0).buffer_stamp();
+        assert_ne!(initial, other);
+
+        editor.toggle_edit().unwrap();
+        assert_eq!(editor.buffer_stamp(), initial);
+        editor.replace_bytes(0, vec![0x12], (0, 0)).unwrap();
+        assert_eq!(editor.buffer_stamp(), initial);
+        assert!(editor.replace_bytes(2, vec![0], (0, 0)).is_err());
+        assert_eq!(editor.buffer_stamp(), initial);
+        assert!(!editor.undo().unwrap());
+        assert!(!editor.redo().unwrap());
+        editor.goto(1, 4);
+        assert_eq!(editor.buffer_stamp(), initial);
+        editor.cancel_edit();
+        assert_eq!(editor.buffer_stamp(), initial);
+        editor.saved();
+        assert_eq!(editor.buffer_stamp(), initial);
+
+        /*
+        Hex no-ops can move nibble state and can close a changed byte group.
+        Neither form changes the current bytes, so both preserve the source revision.
+        */
+        let mut nibble_noop = Editor::new(vec![0x12], Mode::Hex, 0);
+        nibble_noop.toggle_edit().unwrap();
+        let before_nibbles = nibble_noop.buffer_stamp();
+        nibble_noop.hex_digit('1').unwrap();
+        nibble_noop.hex_digit('2').unwrap();
+        assert_eq!(nibble_noop.buffer_stamp(), before_nibbles);
+
+        let mut grouped_noop = Editor::new(vec![0x12], Mode::Hex, 0);
+        grouped_noop.toggle_edit().unwrap();
+        grouped_noop.hex_digit('f').unwrap();
+        let after_changed_high = grouped_noop.buffer_stamp();
+        grouped_noop.hex_digit('2').unwrap();
+        assert_eq!(grouped_noop.buffer_stamp(), after_changed_high);
+    }
+
+    /*
+    This test covers both Hex nibble paths and shared transaction application.
+    Undo, Redo, growth, and changed cancellation each create a distinct byte revision.
+    */
+    #[test]
+    fn source_stamp_advances_for_each_actual_byte_mutation() {
+        let mut editor = Editor::new(vec![0x12], Mode::Hex, 0);
+        editor.toggle_edit().unwrap();
+
+        let before_high = editor.buffer_stamp();
+        editor.hex_digit('f').unwrap();
+        let after_high = editor.buffer_stamp();
+        assert_ne!(after_high, before_high);
+
+        editor.hex_digit('3').unwrap();
+        let after_low = editor.buffer_stamp();
+        assert_ne!(after_low, after_high);
+        assert_eq!(editor.data, [0xf3]);
+
+        assert!(editor.undo().unwrap());
+        let after_undo = editor.buffer_stamp();
+        assert_ne!(after_undo, after_low);
+        assert_eq!(editor.data, [0x12]);
+
+        assert!(editor.redo().unwrap());
+        let after_redo = editor.buffer_stamp();
+        assert_ne!(after_redo, after_undo);
+        assert_eq!(editor.data, [0xf3]);
+
+        editor.replace_bytes(1, vec![0x44], (2, 0)).unwrap();
+        let after_growth = editor.buffer_stamp();
+        assert_ne!(after_growth, after_redo);
+        assert_eq!(editor.data, [0xf3, 0x44]);
+
+        editor.cancel_edit();
+        assert_ne!(editor.buffer_stamp(), after_growth);
+        assert_eq!(editor.data, [0x12]);
+    }
+
+    /*
+    This test models successful Save As source adoption and an unchanged cancellation.
+    Adoption renews identity before saved, while saved and byte-identical cancellation preserve that stamp.
+    */
+    #[test]
+    fn source_adoption_renews_identity_without_a_saved_revision() {
+        let mut editor = Editor::new(vec![0x12], Mode::Hex, 0);
+        let initial = editor.buffer_stamp();
+        editor.source_changed();
+        let adopted = editor.buffer_stamp();
+        assert_ne!(adopted, initial);
+        editor.saved();
+        assert_eq!(editor.buffer_stamp(), adopted);
+
+        editor.toggle_edit().unwrap();
+        editor.hex_digit('f').unwrap();
+        assert!(editor.undo().unwrap());
+        let restored = editor.buffer_stamp();
+        assert_eq!(editor.data, [0x12]);
+        editor.cancel_edit();
+        assert_eq!(editor.buffer_stamp(), restored);
     }
 }

@@ -2,6 +2,15 @@
 These modules provide terminal I/O, file handling, editing, analysis, persistence, and bounded source access.
 The main lifecycle connects their established interfaces without adding shared global state.
 */
+/*
+L06.1 compiles the scoped analysis worker before L06.2 connects terminal callbacks and application tools.
+The temporary allowance applies only to component entries without a production caller during this child.
+*/
+#[allow(
+    dead_code,
+    reason = "L06.1 builds the analysis worker before application integration."
+)]
+mod analysis;
 mod assembler;
 mod checksum;
 mod cli;
@@ -2211,6 +2220,7 @@ fn open_editor(
 
         /*
         Global commands quit, save under a new native path, or enter the workbench.
+        Successful Save As renews the source identity before it accepts the new baseline.
         Save As updates session publication only after the native save succeeds.
         */
         if ctrl && key.code == 81 && !view.editing {
@@ -2227,6 +2237,7 @@ fn open_editor(
                     Ok(destination) => {
                         path = destination;
                         saved.clone_from(&view.data);
+                        view.source_changed();
                         view.saved();
                         updated = true;
                         if *session_publish
