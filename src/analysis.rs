@@ -1,7 +1,7 @@
 /*
 A scoped worker borrows analysis input while the caller retains console control.
 Separate progress and terminal channels prevent a busy display from losing the final result.
-The component provides a worker contract only. L06.2 will connect terminal input and application tools.
+The buffered Entropy tool uses this contract for cancellable application work.
 */
 use std::io;
 use std::sync::Arc;
@@ -11,7 +11,7 @@ use std::time::Duration;
 
 /*
 Each cooperative worker must check its Reporter between bounded work windows.
-This shared limit prepares future analysis consumers without changing current tools.
+Buffered Entropy uses this limit for histogram counting.
 */
 pub(crate) const WINDOW_BYTES: usize = 64 * 1024;
 

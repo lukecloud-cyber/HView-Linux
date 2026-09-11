@@ -396,10 +396,6 @@ impl Editor {
     This accessor captures the current process-local source identity and byte revision.
     Analysis results carry this value until the terminal acceptance check.
     */
-    #[allow(
-        dead_code,
-        reason = "L06.1 creates source stamps before L06.2 connects analysis callers."
-    )]
     pub(crate) fn buffer_stamp(&self) -> SourceStamp {
         SourceStamp::new(self.source_identity, self.revision)
     }

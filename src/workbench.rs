@@ -3,11 +3,90 @@ This module provides Help and the buffered analysis tools that run from the main
 Each tool uses the active Editor bytes, including accepted edits that are not saved.
 */
 use crate::{
+    analysis::{self, Outcome, Progress},
     console::Console,
     editor::{ByteOrder, Editor, Mode, RawModel},
     format, inspect, operations,
 };
-use std::{fs, io};
+use std::{cell::Cell, fs, io};
+
+/*
+This worker wrapper keeps terminal access on the caller thread and lends stable Editor bytes to one scoped worker.
+It redraws progress only when the value or terminal size changes. An idle resize still receives the latest status.
+The base frame returns before the result browser, cancellation return, or error notice.
+Only a matching source stamp can expose a complete payload to the caller.
+*/
+pub(crate) fn run_analysis<T: Send>(
+    console: &Console,
+    view: &Editor,
+    base: &[String],
+    operation: &str,
+    work: impl FnOnce(analysis::Reporter) -> Result<Outcome<T>, String> + Send,
+) -> io::Result<Option<T>> {
+    let stamp = view.buffer_stamp();
+    let first = Progress::new(0, 0);
+    let last_progress = Cell::new(first);
+    let last_size = Cell::new(console.dimensions());
+    console.analysis_progress(base, operation, first.completed, first.total)?;
+
+    /*
+    The update callback accepts advisory progress while the cancellation callback owns physical input polling.
+    Both callbacks share small copied display state, so neither callback holds Console input or output ownership.
+    */
+    let terminal = analysis::run(
+        stamp,
+        work,
+        |progress| {
+            let size = console.dimensions();
+            if progress != last_progress.get() || size != last_size.get() {
+                console.analysis_progress(base, operation, progress.completed, progress.total)?;
+                last_progress.set(progress);
+                last_size.set(size);
+            }
+            Ok(())
+        },
+        || {
+            let size = console.dimensions();
+            if size != last_size.get() {
+                let progress = last_progress.get();
+                console.analysis_progress(base, operation, progress.completed, progress.total)?;
+                last_size.set(size);
+            }
+            console.cancel_requested()
+        },
+    );
+
+    /*
+    The worker has joined when run returns, so this section can restore the editor frame before any notice.
+    Outer worker or callback I/O errors return unchanged after a best-effort frame restoration.
+    Stale results and inner analysis errors use the existing modal policy.
+    */
+    let terminal = match terminal {
+        Ok(terminal) => {
+            console.draw(base)?;
+            terminal
+        }
+        Err(error) => {
+            let _ = console.draw(base);
+            return Err(error);
+        }
+    };
+    let result = match terminal.accept(view.buffer_stamp()) {
+        Ok(result) => result,
+        Err(error) => {
+            console.modal(base, &error.to_string())?;
+            return Ok(None);
+        }
+    };
+    match result {
+        Ok(Outcome::Completed(value)) => Ok(Some(value)),
+        Ok(Outcome::Canceled) => Ok(None),
+        Err(error) => {
+            console.modal(base, &format!("Analysis failed: {error}"))?;
+            Ok(None)
+        }
+    }
+}
 
 /*
 This helper moves a buffered view to one selected result.
@@ -102,7 +181,7 @@ pub fn help(console: &Console) -> io::Result<()> {
         "   R  Set AUTO or an x86 raw dump model",
         "   S  Browse ASCII and UTF-16 ASCII strings",
         "   P  Browse PE structures and jump to their bytes",
-        "   E  Browse the entropy map",
+        "   E  Browse the entropy map; Escape cancels its work",
         "   D  Compare the current buffer with another file",
         "   I  Inspect integers at the cursor",
         "   X  Apply a repeating XOR mask in edit mode",
@@ -416,7 +495,7 @@ pub fn tools(console: &Console, view: &mut Editor, base: &[String]) -> io::Resul
             " R  Raw model: AUTO or X86 16|32|64 LE|BE HEXBASE",
             " S  Strings: ASCII and UTF-16 ASCII, minimum 4 characters",
             " P  PE structures: sections, directories, imports, exports, overlay",
-            " E  Entropy map: locate compressed or repetitive regions",
+            " E  Entropy map: cancellable bounded analysis",
             " D  Compare: browse changed ranges against another file",
             " I  Integers: signed and unsigned, little and big endian",
             " X  XOR range: repeat a hexadecimal mask (edit mode)",
@@ -492,15 +571,20 @@ pub fn tools(console: &Console, view: &mut Editor, base: &[String]) -> io::Resul
             }
         },
         /*
-        The entropy tool selects blocks of at least 4,096 bytes.
+        The entropy tool selects blocks of at least 4,096 bytes from the current unsaved buffer.
         Large buffers increase the block size so the result remains naturally bounded.
+        A scoped worker reports progress and returns only complete stamped rows.
         */
         'E' => {
             let block = 4096usize.max(view.data.len().div_ceil(4096));
-            Some((
-                "Entropy | bits/byte, not a packer verdict",
-                inspect::entropy_map(&view.data, block),
-            ))
+            run_analysis(console, view, base, "Entropy", |reporter| {
+                Ok(inspect::entropy_map_cancellable(
+                    &view.data,
+                    block,
+                    |progress| reporter.progress(progress),
+                ))
+            })?
+            .map(|items| ("Entropy | bits/byte, not a packer verdict", items))
         }
         /*
         The comparison tool reads one selected file and reports changed ranges from buffer to file.

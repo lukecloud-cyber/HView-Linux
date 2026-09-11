@@ -40,6 +40,13 @@ const VTIME: usize = 5;
 const VMIN: usize = 6;
 
 /*
+These application limits bound decoded keys in one cancellation poll and all retained physical keys.
+The pending limit matches the accepted legacy macro event bound.
+*/
+const INPUT_POLL_LIMIT: usize = 64;
+const PENDING_KEY_LIMIT: usize = 1024;
+
+/*
 These C-compatible records carry terminal settings, dimensions, and poll results across the libc boundary.
 Unit tests verify the host layouts before normal terminal operations depend on them.
 */
@@ -96,7 +103,7 @@ pub fn redirected() -> bool {
 
 /*
 Console owns the original terminal state and cached dimensions for one application run.
-It also keeps macro playback and physical keys that arrive while a macro delay runs.
+It also keeps macro playback and bounded physical keys that arrive during delays or analysis.
 */
 pub struct Console {
     old_termios: Termios,
@@ -154,6 +161,43 @@ fn wait_delay(delay_ms: u32, mut cancelled: impl FnMut() -> io::Result<bool>) ->
         }
         // ponytail: Poll every 20 ms until Linux exposes a suitable input wait here.
         std::thread::sleep(remaining.min(Duration::from_millis(20)));
+    }
+}
+
+/*
+This helper polls complete physical keys without knowing the terminal implementation.
+It retains ordinary keys in FIFO order and consumes the first plain Escape as one cancellation.
+The queue limit applies before the next read, so excess bytes remain in the terminal input queue.
+*/
+fn retain_input(
+    pending: &mut VecDeque<Key>,
+    mut read_key: impl FnMut() -> io::Result<Option<Key>>,
+) -> io::Result<bool> {
+    for _ in 0..INPUT_POLL_LIMIT {
+        if pending.len() >= PENDING_KEY_LIMIT {
+            return Ok(false);
+        }
+        let Some(key) = read_key()? else {
+            return Ok(false);
+        };
+        if key.code == 27 && key.control == 0 {
+            return Ok(true);
+        }
+        pending.push_back(key);
+    }
+    Ok(false)
+}
+
+/*
+This formatter converts bounded progress values into one terminal status row.
+A zero total has no percentage. Other totals use wide arithmetic and cannot exceed 100 percent.
+*/
+fn progress_status(operation: &str, completed: u64, total: u64) -> String {
+    if total == 0 {
+        format!(" {operation}... Working  Esc Cancel")
+    } else {
+        let percent = u128::from(completed.min(total)) * 100 / u128::from(total);
+        format!(" {operation}... {percent}%  Esc Cancel")
     }
 }
 
@@ -503,6 +547,33 @@ impl Console {
     }
 
     /*
+    This renderer overlays one bounded worker status on the current application frame.
+    A zero total shows activity, while measured work uses u128 arithmetic for a safe percentage.
+    Saturating row selection keeps the cancellation text visible on a very small terminal.
+    */
+    pub fn analysis_progress(
+        &self,
+        base: &[String],
+        operation: &str,
+        completed: u64,
+        total: u64,
+    ) -> io::Result<()> {
+        let (_width, height) = self.dimensions();
+        let mut lines = base.to_vec();
+        lines.resize(height, String::new());
+        let status = progress_status(operation, completed, total);
+        if let Some(line) = lines.get_mut(height.saturating_sub(2)) {
+            *line = status;
+        }
+        if height > 1
+            && let Some(line) = lines.last_mut()
+        {
+            *line = " Esc Cancel".into();
+        }
+        self.draw(&lines)
+    }
+
+    /*
     This input controller delivers a macro event, one pending physical key, or a new terminal key.
     Resize events return an empty key so the viewer can redraw without an action.
     */
@@ -511,11 +582,19 @@ impl Console {
         Macro playback uses the legacy scan conversion before physical input parsing.
         Thus, stored function-key records keep their contextual actions after physical function keys retire.
         */
-        if let Some(playback) = self.playback.borrow_mut().as_mut()
-            && let Some(event) = playback.next_event()
-        {
-            if !wait_delay(playback.delay_ms, || self.macro_cancelled())? {
-                playback.cancel();
+        let macro_event = {
+            let mut playback = self.playback.borrow_mut();
+            playback.as_mut().and_then(|playback| {
+                playback
+                    .next_event()
+                    .map(|event| (event, playback.delay_ms))
+            })
+        };
+        if let Some((event, delay_ms)) = macro_event {
+            if !wait_delay(delay_ms, || self.macro_cancelled())? {
+                if let Some(playback) = self.playback.borrow_mut().as_mut() {
+                    playback.cancel();
+                }
                 return Ok(Key {
                     code: 27,
                     character: '\u{1b}',
@@ -690,20 +769,23 @@ impl Console {
     }
 
     /*
-    This poll lets physical Escape cancel macro delay without losing other physical keys.
-    The fixed key count bounds work before the next macro event.
+    This poll lets physical Escape cancel a macro delay without losing other physical keys.
+    It uses the shared queue limit and complete physical parser before the next macro event.
     */
     fn macro_cancelled(&self) -> io::Result<bool> {
-        let mut cancelled = false;
-        for _ in 0..64 {
-            let Some(key) = self.read_key_timeout(0)? else {
-                break;
-            };
-            if key.code == 27 {
-                cancelled = true;
-            } else {
-                self.pending_keys.borrow_mut().push_back(key);
-            }
+        let mut pending = self.pending_keys.borrow_mut();
+        retain_input(&mut pending, || self.read_key_timeout(0))
+    }
+
+    /*
+    This analysis callback polls only physical input and never advances stored macro events.
+    A physical Escape also stops active playback before the caller returns to normal key delivery.
+    A full pending queue delays later terminal input until the normal input controller drains the queue.
+    */
+    pub fn cancel_requested(&self) -> io::Result<bool> {
+        let cancelled = self.macro_cancelled()?;
+        if cancelled && let Some(playback) = self.playback.borrow_mut().as_mut() {
+            playback.cancel();
         }
         Ok(cancelled)
     }
@@ -947,6 +1029,292 @@ mod tests {
         assert_eq!(visible("abcdef", 3), "abc");
         assert_eq!(visible("a中b", 20), "a\\u{4E2D}b");
         assert_eq!(visible("☺Ç", 2), "☺Ç");
+    }
+
+    /*
+    This test drives the bounded retention helper with parsed Key values.
+    It proves FIFO order, one consumed Escape, the 64-key poll limit, and queue backpressure.
+    */
+    #[test]
+    fn cancellation_poll_retains_keys_and_stops_before_full_queue_reads() {
+        let normal = Key {
+            code: u16::from(b'X'),
+            character: 'x',
+            control: 0,
+        };
+        let alt = alt_key(b'h');
+        let escape = Key {
+            code: 27,
+            character: '\u{1b}',
+            control: 0,
+        };
+        let later = Key {
+            code: u16::from(b'Z'),
+            character: 'z',
+            control: 0,
+        };
+        let mut input = VecDeque::from([normal, alt, escape, later]);
+        let mut pending = VecDeque::new();
+        assert!(retain_input(&mut pending, || Ok(input.pop_front())).unwrap());
+        assert_eq!(pending, VecDeque::from([normal, alt]));
+        assert_eq!(input, VecDeque::from([later]));
+        assert!(!retain_input(&mut pending, || Ok(input.pop_front())).unwrap());
+        assert_eq!(pending, VecDeque::from([normal, alt, later]));
+
+        let mut many = VecDeque::from(vec![normal; INPUT_POLL_LIMIT + 1]);
+        let mut bounded = VecDeque::new();
+        assert!(!retain_input(&mut bounded, || Ok(many.pop_front())).unwrap());
+        assert_eq!(bounded.len(), INPUT_POLL_LIMIT);
+        assert_eq!(many.len(), 1);
+
+        let mut full = VecDeque::from(vec![normal; PENDING_KEY_LIMIT]);
+        let mut reads = 0;
+        assert!(
+            !retain_input(&mut full, || {
+                reads += 1;
+                Ok(Some(escape))
+            })
+            .unwrap()
+        );
+        assert_eq!(reads, 0);
+        assert_eq!(full.len(), PENDING_KEY_LIMIT);
+    }
+
+    /*
+    This test preserves an existing queue when the native key reader fails.
+    It also checks unknown-duration and maximum-value progress text without arithmetic overflow.
+    */
+    #[test]
+    fn cancellation_poll_preserves_errors_and_progress_text_is_bounded() {
+        let key = Key {
+            code: u16::from(b'K'),
+            character: 'k',
+            control: 0,
+        };
+        let mut pending = VecDeque::from([key]);
+        let error = retain_input(&mut pending, || {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "controlled input error",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "controlled input error");
+        assert_eq!(pending, VecDeque::from([key]));
+        assert_eq!(
+            progress_status("Entropy", u64::MAX, 0),
+            " Entropy... Working  Esc Cancel"
+        );
+        assert_eq!(
+            progress_status("Entropy", u64::MAX, u64::MAX),
+            " Entropy... 100%  Esc Cancel"
+        );
+    }
+
+    /*
+    This ignored test runs only through the controlled pseudoterminal harness.
+    The harness supplies fragmented Alt input, a retired function key, resize, ordinary keys, and plain Escape.
+    The test also proves macro retention, playback cancellation, frame restoration, and analysis-error notice handling.
+    */
+    #[test]
+    #[ignore = "Run with tests/analysis_worker_terminal.py."]
+    fn analysis_worker_terminal_harness() {
+        use crate::analysis::{Outcome, Progress};
+        use crate::editor::{Editor, Mode};
+        use std::fs::File;
+        use std::io::Read as _;
+        use std::os::fd::FromRawFd;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Instant;
+
+        /*
+        This builder creates one legacy macro event without changing the stored macro format.
+        The completion and cancellation phases use its active state as an input-polling assertion.
+        */
+        fn playback(letter: u8) -> crate::macros::Playback {
+            let mut data = vec![0; 69];
+            data[..10].copy_from_slice(b"HViewMacro");
+            data[14..16].copy_from_slice(&0x9006u16.to_le_bytes());
+            data[16..18].copy_from_slice(&1u16.to_le_bytes());
+            data.push(0);
+            data.extend_from_slice(&u32::from(letter).to_le_bytes());
+            crate::macros::Playback::parse(&data).unwrap()
+        }
+
+        /*
+        This frame puts its restoration marker only in the final row.
+        At the original terminal size, progress replaces the marker row.
+        The Python harness restores that size before checking cancellation restoration.
+        */
+        fn base(console: &Console, marker: &str) -> Vec<String> {
+            let mut lines = vec![String::new(); console.height()];
+            if let Some(line) = lines.last_mut() {
+                *line = marker.into();
+            }
+            lines
+        }
+
+        /*
+        This drop marker proves that an outer input error still joins cooperative worker work.
+        */
+        struct WorkerFinished(Arc<AtomicBool>);
+
+        impl Drop for WorkerFinished {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let console = Console::new().unwrap();
+        let view = Editor::new(vec![0; 2 * crate::analysis::WINDOW_BYTES], Mode::Hex, 0);
+
+        /*
+        The first worker completes without input, so the pending macro event must remain available afterward.
+        The shared application wrapper must restore the base frame before normal key delivery resumes.
+        */
+        let completion_base = base(&console, " COMPLETION RESTORED");
+        console.start_macro(playback(b'M'));
+        assert_eq!(
+            crate::workbench::run_analysis(&console, &view, &completion_base, "Completion", |_| {
+                Ok(Outcome::Completed(7u8))
+            },)
+            .unwrap(),
+            Some(7)
+        );
+        assert_eq!(console.key().unwrap().character, 'M');
+        console
+            .draw(&vec![" CANCEL READY".into(); console.height()])
+            .unwrap();
+
+        /*
+        The second worker reports 50 percent and waits on a test-only pipe before more progress.
+        The Python owner resizes during this quiet interval and then releases cooperative work.
+        Ordinary and Alt keys remain in exact order until physical Escape cancels work and playback.
+        The test process owns the inherited pipe read end.
+        A bounded poll confirms one available gate byte before the worker reads it.
+        */
+        let gate_fd = std::env::var("HVIEW_TEST_GATE_FD")
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        let mut gate = unsafe { File::from_raw_fd(gate_fd) };
+        let cancellation_base = base(&console, " CANCELLATION RESTORED");
+        console.start_macro(playback(b'Q'));
+        let canceled = crate::workbench::run_analysis::<u8>(
+            &console,
+            &view,
+            &cancellation_base,
+            "Entropy",
+            |reporter| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                assert!(reporter.progress(Progress::new(1, 2)));
+                let mut ready = PollFd {
+                    fd: gate_fd,
+                    events: POLLIN,
+                    returned: 0,
+                };
+                assert_eq!(
+                    unsafe { poll(&mut ready, 1, 5000) },
+                    1,
+                    "The terminal harness did not release the quiet worker."
+                );
+                let mut release = [0u8; 1];
+                gate.read_exact(&mut release)
+                    .expect("The terminal harness did not release the quiet worker.");
+                loop {
+                    if !reporter.progress(Progress::new(2, 2)) {
+                        return Ok(Outcome::Canceled);
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "The terminal harness did not receive cancellation."
+                    );
+                    std::thread::yield_now();
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(canceled, None);
+        assert_eq!(
+            console.key().unwrap(),
+            Key {
+                code: u16::from(b'X'),
+                character: 'x',
+                control: 0,
+            }
+        );
+        assert_eq!(console.key().unwrap(), alt_key(b'h'));
+        assert_eq!(
+            console.key().unwrap(),
+            Key {
+                code: u16::from(b'Z'),
+                character: 'z',
+                control: 0,
+            }
+        );
+        console
+            .draw(&vec![" INPUT ERROR READY".into(); console.height()])
+            .unwrap();
+
+        /*
+        The third worker stays cooperative while the parser receives one normal key and one incomplete UTF-8 key.
+        The exact outer I/O error returns after worker join and base restoration. The normal key remains queued.
+        */
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker_finished = Arc::clone(&finished);
+        let input_error_base = base(&console, " INPUT ERROR RESTORED");
+        let error = crate::workbench::run_analysis::<u8>(
+            &console,
+            &view,
+            &input_error_base,
+            "InputError",
+            move |reporter| {
+                let _finished = WorkerFinished(worker_finished);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while reporter.progress(Progress::new(1, 2)) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "The worker did not observe the input callback error."
+                    );
+                    std::thread::yield_now();
+                }
+                Ok(Outcome::Canceled)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "The UTF-8 key is incomplete.");
+        assert!(finished.load(Ordering::Acquire));
+        assert_eq!(
+            console.key().unwrap(),
+            Key {
+                code: u16::from(b'Y'),
+                character: 'y',
+                control: 0,
+            }
+        );
+
+        /*
+        The final worker returns one exact inner analysis error after its scoped lifetime ends.
+        The application wrapper restores the separate base frame and displays the existing modal notice.
+        */
+        console
+            .draw(&vec![" INNER ERROR READY".into(); console.height()])
+            .unwrap();
+        let inner_error_base = base(&console, " INNER ERROR RESTORED");
+        assert_eq!(
+            crate::workbench::run_analysis::<u8>(
+                &console,
+                &view,
+                &inner_error_base,
+                "Failure",
+                |_| Err("controlled analysis error".into()),
+            )
+            .unwrap(),
+            None
+        );
     }
 
     /*

@@ -213,7 +213,8 @@ def check_inspection(binary: Path, root: Path) -> None:
     )
 
 
-# This check supplies controlled low-entropy and high-entropy blocks to the entropy browser.
+# This check supplies controlled low-entropy and high-entropy blocks to the entropy worker and browser.
+# The initial progress frame proves the release application uses the connected worker route.
 def check_entropy(binary: Path, root: Path) -> None:
     """Check entropy values and browser paging."""
     path = root / "entropy.bin"
@@ -227,6 +228,7 @@ def check_entropy(binary: Path, root: Path) -> None:
     )
     require(
         output,
+        "Entropy... Working",
         "4096 bytes  0.000 bits/byte  [................]",
         "4096 bytes  8.000 bits/byte  [################]",
         "> 00014000",

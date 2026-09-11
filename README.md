@@ -185,7 +185,7 @@ Press `Ctrl+T`, and then select one tool:
 | `R` | The tool selects an explicit raw address model or restores `AUTO`. |
 | `S` | The tool finds printable ASCII and ASCII encoded as UTF-16LE or UTF-16BE. |
 | `P` | The tool browses PE sections, directories, imports, exports, security data, and overlay data. |
-| `E` | The tool shows an entropy map in bits per byte. |
+| `E` | The tool shows an entropy map in bits per byte. Press `Escape` to cancel its work. |
 | `D` | The tool compares the current buffer with another file at equal offsets. |
 | `I` | The tool shows signed and unsigned integers at the cursor. |
 | `X` | The tool applies a repeating hexadecimal XOR mask during editing. |
@@ -224,6 +224,10 @@ Sessions store the underlying automatic width and Real16 selection. Sessions do 
 String results use a four-character minimum and a 120-character display limit. String and comparison browsers limit output to 10,000 rows.
 
 The entropy tool uses blocks of at least 4,096 bytes. The tool increases the block size for large files.
+
+Entropy runs as bounded cancellable work and uses the current source stamp. Progress shows on the active editor frame.
+
+The other analysis tools remain synchronous. Their input and result behavior stays unchanged.
 
 ## Editing and saving
 

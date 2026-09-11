@@ -3,13 +3,9 @@ These modules provide terminal I/O, file handling, editing, analysis, persistenc
 The main lifecycle connects their established interfaces without adding shared global state.
 */
 /*
-L06.1 compiles the scoped analysis worker before L06.2 connects terminal callbacks and application tools.
-The temporary allowance applies only to component entries without a production caller during this child.
+The analysis module supplies scoped work, cooperative cancellation, progress, and stamped terminal results.
+The buffered Entropy tool connects these boundaries to Linux terminal input.
 */
-#[allow(
-    dead_code,
-    reason = "L06.1 builds the analysis worker before application integration."
-)]
 mod analysis;
 mod assembler;
 mod checksum;

@@ -1,10 +1,25 @@
+/*
+This module provides bounded byte inspectors for the buffered workbench.
+Each result keeps its source offset so the shared browser can return to the selected bytes.
+*/
+use crate::analysis::{Outcome, Progress, WINDOW_BYTES};
+
+/*
+String rows keep a fixed display prefix while scanning can continue through a longer source run.
+*/
 const TEXT_LIMIT: usize = 120;
 
+/*
+This predicate accepts the printable ASCII range used by both ASCII and UTF-16 string scans.
+*/
 fn printable(byte: u8) -> bool {
     (0x20..=0x7e).contains(&byte)
 }
 
-/// Return printable ASCII and ASCII characters encoded as UTF-16.
+/*
+This inspector finds printable ASCII and ASCII characters stored as UTF-16LE or UTF-16BE.
+The minimum length and result limit bound accepted rows. Final sorting restores source order across encoding passes.
+*/
 pub fn strings(data: &[u8], min_len: usize, limit: usize) -> Vec<(usize, String)> {
     if limit == 0 {
         return Vec::new();
@@ -28,6 +43,10 @@ pub fn strings(data: &[u8], min_len: usize, limit: usize) -> Vec<(usize, String)
         }
     }
 
+    /*
+    The second pass reads complete pairs in either byte order.
+    It counts complete printable characters and stores only the bounded display prefix.
+    */
     let ascii_count = rows.len();
     offset = 0;
     while offset < data.len().saturating_sub(1) && rows.len() - ascii_count < limit {
@@ -63,47 +82,92 @@ pub fn strings(data: &[u8], min_len: usize, limit: usize) -> Vec<(usize, String)
             rows.push((start, format!("{encoding}: {text}")));
         }
     }
+    /*
+    Both encoding passes can find rows in different source regions.
+    Sorting and truncation produce one stable bounded browser result.
+    */
     rows.sort_by_key(|row| row.0);
     rows.truncate(limit);
     rows
 }
 
-/// Return Shannon entropy in bits per byte. A zero block size uses one byte.
+/*
+This test wrapper runs the cancellable entropy implementation to completion.
+It keeps the original synchronous result contract for direct equivalence tests.
+*/
+#[cfg(test)]
 pub fn entropy_map(data: &[u8], block_size: usize) -> Vec<(usize, String)> {
-    let block_size = block_size.max(1);
-    data.chunks(block_size)
-        .enumerate()
-        .map(|(index, block)| {
-            let mut counts = [0usize; 256];
-            for &byte in block {
-                counts[byte as usize] += 1;
-            }
-            let entropy = counts
-                .iter()
-                .filter(|&&count| count != 0)
-                .map(|&count| {
-                    let probability = count as f64 / block.len() as f64;
-                    -probability * probability.log2()
-                })
-                .sum::<f64>()
-                .abs();
-            let filled = (entropy * 2.0).round().clamp(0.0, 16.0) as usize;
-            (
-                index * block_size,
-                format!(
-                    "{} {}  {:.3} bits/byte  [{}{}]",
-                    block.len(),
-                    if block.len() == 1 { "byte" } else { "bytes" },
-                    entropy,
-                    "#".repeat(filled),
-                    ".".repeat(16 - filled)
-                ),
-            )
-        })
-        .collect()
+    match entropy_map_cancellable(data, block_size, |_| true) {
+        Outcome::Completed(rows) => rows,
+        Outcome::Canceled => Vec::new(),
+    }
 }
 
-/// Return integer values that fit at the selected offset and byte order.
+/*
+This inspector calculates Shannon entropy for each selected block.
+Histogram counting uses work windows of at most 64 KiB and reports progress after each window.
+The function returns no partial rows when the caller requests cancellation at any progress boundary.
+*/
+pub(crate) fn entropy_map_cancellable(
+    data: &[u8],
+    block_size: usize,
+    mut progress: impl FnMut(Progress) -> bool,
+) -> Outcome<Vec<(usize, String)>> {
+    let block_size = block_size.max(1);
+    let total = data.len() as u64;
+    if !progress(Progress::new(0, total)) {
+        return Outcome::Canceled;
+    }
+    let mut rows = Vec::with_capacity(data.len().div_ceil(block_size));
+    let mut completed = 0usize;
+    for (index, block) in data.chunks(block_size).enumerate() {
+        /*
+        Each block owns one histogram. Smaller work windows provide cooperative cancellation inside large blocks.
+        */
+        let mut counts = [0usize; 256];
+        for window in block.chunks(WINDOW_BYTES) {
+            for &byte in window {
+                counts[byte as usize] += 1;
+            }
+            completed += window.len();
+            if !progress(Progress::new(completed as u64, total)) {
+                return Outcome::Canceled;
+            }
+        }
+
+        /*
+        This calculation converts the completed histogram into bits per byte and a fixed 16-cell bar.
+        The row enters result storage only after its complete block has passed cancellation checks.
+        */
+        let entropy = counts
+            .iter()
+            .filter(|&&count| count != 0)
+            .map(|&count| {
+                let probability = count as f64 / block.len() as f64;
+                -probability * probability.log2()
+            })
+            .sum::<f64>()
+            .abs();
+        let filled = (entropy * 2.0).round().clamp(0.0, 16.0) as usize;
+        rows.push((
+            index * block_size,
+            format!(
+                "{} {}  {:.3} bits/byte  [{}{}]",
+                block.len(),
+                if block.len() == 1 { "byte" } else { "bytes" },
+                entropy,
+                "#".repeat(filled),
+                ".".repeat(16 - filled)
+            ),
+        ));
+    }
+    Outcome::Completed(rows)
+}
+
+/*
+This inspector interprets complete integer widths at one selected source offset.
+The optional byte order filters multi-byte rows, while the one-byte row stays byte-order independent.
+*/
 pub fn integers(
     data: &[u8],
     offset: usize,
@@ -119,6 +183,10 @@ pub fn integers(
             byte as i8
         ));
     }
+    /*
+    This local generator applies the same complete-slice and byte-order rules to each integer width.
+    Signed display reinterprets the exact unsigned bit pattern without changing source bytes.
+    */
     macro_rules! integer {
         ($size:literal, $unsigned:ty, $signed:ty) => {
             if let Some(bytes) = tail.get(..$size) {
@@ -154,10 +222,17 @@ pub fn integers(
     rows
 }
 
+/*
+These tests verify encoding order, display bounds, cancellable entropy, and integer interpretation.
+Each fixture uses deterministic bytes and exact expected result text.
+*/
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /*
+    This test finds all supported string encodings and keeps their source order.
+    */
     #[test]
     fn strings_detect_encodings_and_keep_file_order() {
         let data = b"\xffA\0B\0C\0\xffplain\xff\0D\0E\0F\xff";
@@ -175,6 +250,9 @@ mod tests {
         assert!(strings(&[], 0, 10).is_empty());
     }
 
+    /*
+    This test scans long runs without duplicate row starts and clips only displayed text.
+    */
     #[test]
     fn strings_consume_long_runs_without_duplicate_starts() {
         let mut data = vec![b'x'; 200];
@@ -197,6 +275,10 @@ mod tests {
         assert_eq!(strings(b"\0A\0B\0C", 3, 10).len(), 1);
     }
 
+    /*
+    This test checks exact entropy rows for empty, constant, uniform, tail, zero-size, and oversized blocks.
+    Independent expected text protects the established result format.
+    */
     #[test]
     fn entropy_matches_constant_and_uniform_data() {
         assert!(entropy_map(&[], 0).is_empty());
@@ -215,8 +297,74 @@ mod tests {
         assert_eq!(rows[2].0, 512);
         assert!(rows[2].1.starts_with("1 byte  0.000"));
         assert_eq!(entropy_map(&[1, 2], 0).len(), 2);
+
+        assert_eq!(
+            entropy_map_cancellable(&[], 0, |_| true),
+            Outcome::Completed(Vec::new())
+        );
+        assert_eq!(
+            entropy_map_cancellable(&[0, 0, 0, 0, 0, 1], 4, |_| true),
+            Outcome::Completed(vec![
+                (0, "4 bytes  0.000 bits/byte  [................]".into()),
+                (4, "2 bytes  1.000 bits/byte  [##..............]".into()),
+            ])
+        );
+        assert_eq!(
+            entropy_map_cancellable(&[1, 2], 0, |_| true),
+            Outcome::Completed(vec![
+                (0, "1 byte  0.000 bits/byte  [................]".into()),
+                (1, "1 byte  0.000 bits/byte  [................]".into()),
+            ])
+        );
+        assert_eq!(
+            entropy_map_cancellable(&[0, 1, 0, 1], usize::MAX, |_| true),
+            Outcome::Completed(vec![(
+                0,
+                "4 bytes  1.000 bits/byte  [##..............]".into(),
+            )])
+        );
     }
 
+    /*
+    This test refuses work before counting, inside a large block, and at its final checkpoint.
+    Every refusal returns Canceled without exposing a partial result vector.
+    */
+    #[test]
+    fn entropy_cancellation_never_returns_partial_rows() {
+        let data = vec![0x55; WINDOW_BYTES + 1];
+        assert_eq!(
+            entropy_map_cancellable(&data, data.len(), |_| false),
+            Outcome::Canceled
+        );
+        let mut updates = Vec::new();
+        assert_eq!(
+            entropy_map_cancellable(&data, data.len(), |progress| {
+                updates.push(progress);
+                progress.completed < WINDOW_BYTES as u64
+            }),
+            Outcome::Canceled
+        );
+        assert_eq!(
+            updates,
+            [
+                Progress::new(0, data.len() as u64),
+                Progress::new(WINDOW_BYTES as u64, data.len() as u64),
+            ]
+        );
+        let mut final_calls = 0;
+        assert_eq!(
+            entropy_map_cancellable(&[1, 2], 2, |progress| {
+                final_calls += 1;
+                progress.completed < progress.total
+            }),
+            Outcome::Canceled
+        );
+        assert_eq!(final_calls, 2);
+    }
+
+    /*
+    This test checks signed, unsigned, endian, and unavailable-width integer rows.
+    */
     #[test]
     fn integers_handle_endianness_signed_values_and_bounds() {
         let data = [0xff, 0x80, 0, 0, 0, 0, 0, 0];
