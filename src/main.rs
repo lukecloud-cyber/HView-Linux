@@ -23,12 +23,12 @@ mod operations;
 mod paged;
 mod save;
 /*
-L05.1 compiles the bounded Text index before a later child connects it to a viewer.
-The temporary allowance applies only to entries that have no application caller during this child.
+L05.2 compiles resumable Text scans and suffix invalidation before L16 connects Text viewer integration.
+The temporary allowance applies only to entries that have no application caller before L16.
 */
 #[allow(
     dead_code,
-    reason = "L05.1 builds the bounded Text index before viewer integration."
+    reason = "L05.2 builds the Text index contract before L16 viewer integration."
 )]
 mod text_index;
 mod workbench;

@@ -1,12 +1,14 @@
 /*
 This component maps source-byte offsets to bounded Text row starts.
 It keeps sparse checkpoints and one fixed read buffer without storing file contents or one entry per row.
-L05.1 compiles this foundation before later work connects Text viewing, cancellation, and edit invalidation.
+L05.2 adds resumable cancellation and suffix invalidation before L16 connects Text viewing and editing.
 
 Each callback must fill its complete supplied slice or return an I/O error.
 The component cannot detect a callback that returns success without filling the slice.
-The caller must reset the index after a same-length source change.
+Callbacks must supply stable bytes throughout one query and each resumed scan sequence.
+The caller must reset the index after an untracked same-length source change.
 */
+use crate::analysis::Outcome;
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io;
@@ -136,8 +138,9 @@ struct ScanState {
 }
 
 /*
-The index retains selected row starts, one scan position, and one reusable read buffer.
-Layout or length changes reset all positions because old checkpoints cannot describe the new source contract.
+The index retains selected row starts, one scan position, one source length, and one reusable read buffer.
+Layout or unexplained length changes reset all positions because old checkpoints cannot describe the new source contract.
+Explicit suffix invalidation adopts an edited length and preserves only the known valid prefix.
 */
 pub(crate) struct TextIndex {
     layout: Option<TextLayout>,
@@ -192,6 +195,49 @@ impl TextIndex {
     }
 
     /*
+    An edit can complete a delimiter or join a preceding grapheme before its first changed byte.
+    Bound the supplied offset by both lengths before applying the codec lookbehind.
+    Retain a fully scanned earlier prefix, or restart at the final strictly earlier checkpoint.
+    */
+    pub(crate) fn invalidate_from(&mut self, change_start: u64, new_len: u64) {
+        let old_len = self.source_len.unwrap_or(new_len);
+        let bounded_start = change_start.min(old_len).min(new_len);
+        let lookbehind = self.layout.map_or(1, |layout| {
+            if layout.codec == TextCodec::Cp437 {
+                1
+            } else {
+                MAX_GRAPHEME_BYTES as u64
+            }
+        });
+        let before = bounded_start.saturating_sub(lookbehind);
+        self.source_len = Some(new_len);
+        if self.layout.is_none() || self.progress.pos < before {
+            return;
+        }
+
+        /*
+        Keep checkpoint zero even when the edit affects the first source byte.
+        Preserve the compacted stride so a rebuilt suffix cannot increase retained index density.
+        */
+        let keep = self
+            .checkpoints
+            .partition_point(|offset| *offset < before)
+            .max(1);
+        self.checkpoints.truncate(keep);
+        let start = *self.checkpoints.last().unwrap();
+        self.progress = ScanState {
+            pos: start,
+            row_start: start,
+            column: 0,
+        };
+        self.next_checkpoint = start
+            .checked_div(self.stride)
+            .and_then(|part| part.checked_add(1))
+            .and_then(|part| part.checked_mul(self.stride))
+            .unwrap_or(u64::MAX);
+    }
+
+    /*
     Each query supplies the stable source length and complete layout contract.
     A changed value resets the index before the query can use an old position.
     */
@@ -222,29 +268,33 @@ impl TextIndex {
 
     /*
     Forward indexing advances the persistent prefix through exact callback reads.
+    Poll cancellation before each bounded read and keep every completed scan chunk for a resumed query.
     CP437 keeps delimiter lookahead inside each 64 KiB read, while Unicode uses bounded row decoding.
     */
-    fn ensure_to<R>(
+    fn ensure_to<R, C>(
         &mut self,
         layout: TextLayout,
         len: u64,
         stop: u64,
         read: &mut R,
-    ) -> io::Result<()>
+        cancel: &mut C,
+    ) -> io::Result<bool>
     where
         R: FnMut(u64, &mut [u8]) -> io::Result<()>,
+        C: FnMut() -> io::Result<bool>,
     {
         let stop = stop.min(len);
         self.reserve_scan(stop)?;
         if layout.codec != TextCodec::Cp437 {
             let mut state = self.progress;
-            scan_unicode_rows(
+            let complete = scan_unicode_rows(
                 &mut state,
                 &mut self.buffer,
                 layout,
                 len,
                 stop,
                 read,
+                cancel,
                 |first| {
                     record_sparse_run(
                         &mut self.checkpoints,
@@ -258,7 +308,7 @@ impl TextIndex {
                 },
             )?;
             self.progress = state;
-            return Ok(());
+            return Ok(complete);
         }
 
         /*
@@ -266,6 +316,9 @@ impl TextIndex {
         State changes occur only after the callback fills the complete requested slice.
         */
         while self.progress.pos < stop {
+            if cancel()? {
+                return Ok(false);
+            }
             let read_start = self.progress.pos;
             let process_end = read_start.saturating_add(READ_BODY_BYTES).min(stop);
             let read_end = process_end
@@ -295,23 +348,25 @@ impl TextIndex {
             );
             self.progress = state;
         }
-        Ok(())
+        Ok(true)
     }
 
     /*
     Local replay starts at one known row and emits later row starts through the same processors.
-    The method never changes the persistent scan position or checkpoint collection.
+    Cancellation hides a partial answer and never changes the persistent scan position or checkpoints.
     */
-    fn scan_from<R, E>(
+    fn scan_from<R, C, E>(
         &mut self,
         layout: TextLayout,
         len: u64,
         range: std::ops::Range<u64>,
         read: &mut R,
+        cancel: &mut C,
         mut emit: E,
-    ) -> io::Result<()>
+    ) -> io::Result<bool>
     where
         R: FnMut(u64, &mut [u8]) -> io::Result<()>,
+        C: FnMut() -> io::Result<bool>,
         E: FnMut(u64, u64, u64),
     {
         let mut state = ScanState {
@@ -328,6 +383,7 @@ impl TextIndex {
                 len,
                 stop,
                 read,
+                cancel,
                 |first| emit(first, 1, 1),
             );
         }
@@ -337,6 +393,9 @@ impl TextIndex {
         The retained column joins consecutive chunks until a delimiter or width boundary ends the row.
         */
         while state.pos < stop {
+            if cancel()? {
+                return Ok(false);
+            }
             let read_start = state.pos;
             let process_end = read_start.saturating_add(READ_BODY_BYTES).min(stop);
             let read_end = process_end
@@ -354,25 +413,28 @@ impl TextIndex {
                 &mut emit,
             );
         }
-        Ok(())
+        Ok(true)
     }
 
     /*
     Row lookup extends the sparse prefix to the selected byte and replays from its nearest earlier checkpoint.
+    Cancellation returns no offset and retains completed persistent chunks for the next query.
     Any callback or allocation error clears the complete index before the error returns.
     */
-    pub(crate) fn row_at<R>(
+    pub(crate) fn row_at<R, C>(
         &mut self,
         layout: TextLayout,
         len: u64,
         offset: u64,
         mut read: R,
-    ) -> io::Result<u64>
+        mut cancel: C,
+    ) -> io::Result<Outcome<u64>>
     where
         R: FnMut(u64, &mut [u8]) -> io::Result<()>,
+        C: FnMut() -> io::Result<bool>,
     {
         self.set_source(layout, len);
-        let result = self.row_at_inner(layout, len, offset, &mut read);
+        let result = self.row_at_inner(layout, len, offset, &mut read, &mut cancel);
         if result.is_err() {
             self.reset();
         }
@@ -383,55 +445,65 @@ impl TextIndex {
     This inner operation contains the normal row lookup without the shared error-reset wrapper.
     The target clamps to the final source byte, and an empty source returns offset zero.
     */
-    fn row_at_inner<R>(
+    fn row_at_inner<R, C>(
         &mut self,
         layout: TextLayout,
         len: u64,
         offset: u64,
         read: &mut R,
-    ) -> io::Result<u64>
+        cancel: &mut C,
+    ) -> io::Result<Outcome<u64>>
     where
         R: FnMut(u64, &mut [u8]) -> io::Result<()>,
+        C: FnMut() -> io::Result<bool>,
     {
         if len == 0 {
-            return Ok(0);
+            return Ok(Outcome::Completed(0));
         }
         let target = offset.min(len - 1);
-        self.ensure_to(layout, len, target + 1, read)?;
+        if !self.ensure_to(layout, len, target + 1, read, cancel)? {
+            return Ok(Outcome::Canceled);
+        }
         let start = self.checkpoint(target);
         let mut answer = start;
-        self.scan_from(
+        if !self.scan_from(
             layout,
             len,
             start..target + 1,
             read,
+            cancel,
             |first, step, count| {
                 if first <= target {
                     let index = ((target - first) / step).min(count - 1);
                     answer = first + index * step;
                 }
             },
-        )?;
-        Ok(answer)
+        )? {
+            return Ok(Outcome::Canceled);
+        }
+        Ok(Outcome::Completed(answer))
     }
 
     /*
     Previous retains at most the requested row count plus one recent position.
+    Cancellation returns no offset and retains completed persistent chunks for the next query.
     Fallible allocation occurs before replay, and an error resets the complete index.
     */
-    pub(crate) fn previous<R>(
+    pub(crate) fn previous<R, C>(
         &mut self,
         layout: TextLayout,
         len: u64,
         top: u64,
         rows: usize,
         mut read: R,
-    ) -> io::Result<u64>
+        mut cancel: C,
+    ) -> io::Result<Outcome<u64>>
     where
         R: FnMut(u64, &mut [u8]) -> io::Result<()>,
+        C: FnMut() -> io::Result<bool>,
     {
         self.set_source(layout, len);
-        let result = self.previous_inner(layout, len, top, rows, &mut read);
+        let result = self.previous_inner(layout, len, top, rows, &mut read, &mut cancel);
         if result.is_err() {
             self.reset();
         }
@@ -442,22 +514,26 @@ impl TextIndex {
     This inner operation builds the needed prefix and replays only a bounded earlier distance.
     The recent queue discards older positions as later row starts approach the selected row.
     */
-    fn previous_inner<R>(
+    fn previous_inner<R, C>(
         &mut self,
         layout: TextLayout,
         len: u64,
         top: u64,
         rows: usize,
         read: &mut R,
-    ) -> io::Result<u64>
+        cancel: &mut C,
+    ) -> io::Result<Outcome<u64>>
     where
         R: FnMut(u64, &mut [u8]) -> io::Result<()>,
+        C: FnMut() -> io::Result<bool>,
     {
         if len == 0 {
-            return Ok(0);
+            return Ok(Outcome::Completed(0));
         }
         let target = top.min(len - 1);
-        self.ensure_to(layout, len, target + 1, read)?;
+        if !self.ensure_to(layout, len, target + 1, read, cancel)? {
+            return Ok(Outcome::Canceled);
+        }
         let row_count = u64::try_from(rows).unwrap_or(u64::MAX);
         let distance = row_count.saturating_mul(layout.max_row_bytes());
         let start = self.checkpoint(target.saturating_sub(distance));
@@ -467,38 +543,53 @@ impl TextIndex {
             .try_reserve_exact(keep)
             .map_err(|_| io::Error::other("Cannot allocate previous Text row positions."))?;
         recent.push_back(start);
-        self.scan_from(
+        if !self.scan_from(
             layout,
             len,
             start..target + 1,
             read,
+            cancel,
             |first, step, count| {
                 append_recent(&mut recent, keep, target, first, step, count);
             },
-        )?;
-        Ok(recent.front().copied().unwrap_or(0))
+        )? {
+            return Ok(Outcome::Canceled);
+        }
+        Ok(Outcome::Completed(recent.front().copied().unwrap_or(0)))
     }
 
     /*
     Last extends the complete index and returns the reference row-start convention.
+    Cancellation retains completed persistent chunks and returns no partial final row.
     CP437 keeps the last nonempty row start, while Unicode records the next position, including EOF.
     */
-    pub(crate) fn last<R>(&mut self, layout: TextLayout, len: u64, mut read: R) -> io::Result<u64>
+    pub(crate) fn last<R, C>(
+        &mut self,
+        layout: TextLayout,
+        len: u64,
+        mut read: R,
+        mut cancel: C,
+    ) -> io::Result<Outcome<u64>>
     where
         R: FnMut(u64, &mut [u8]) -> io::Result<()>,
+        C: FnMut() -> io::Result<bool>,
     {
         self.set_source(layout, len);
-        let result = self.ensure_to(layout, len, len, &mut read);
-        if let Err(error) = result {
-            self.reset();
-            return Err(error);
+        let result = self.ensure_to(layout, len, len, &mut read, &mut cancel);
+        match result {
+            Ok(true) => Ok(Outcome::Completed(self.progress.row_start)),
+            Ok(false) => Ok(Outcome::Canceled),
+            Err(error) => {
+                self.reset();
+                Err(error)
+            }
         }
-        Ok(self.progress.row_start)
     }
 
     /*
     Next scans from a supplied known row start, so a distant source offset needs only local bounded reads.
-    The caller must reset after same-length source changes because this child has no source generation.
+    The noncancellable operation can extend a nearby prefix before its bounded local successor lookup.
+    The caller must reset after untracked same-length source changes.
     */
     pub(crate) fn next<R>(
         &mut self,
@@ -535,6 +626,7 @@ impl TextIndex {
         if len == 0 || start >= len {
             return Ok(len);
         }
+        let mut never_cancel = || Ok(false);
         let stop = start
             .saturating_add(layout.max_row_bytes())
             .saturating_add(1)
@@ -542,14 +634,23 @@ impl TextIndex {
         if self.progress.pos <= start
             && start.saturating_sub(self.progress.pos) <= layout.max_row_bytes()
         {
-            self.ensure_to(layout, len, stop, read)?;
+            let complete = self.ensure_to(layout, len, stop, read, &mut never_cancel)?;
+            debug_assert!(complete);
         }
         let mut answer = len;
-        self.scan_from(layout, len, start..stop, read, |first, _, _| {
-            if answer == len {
-                answer = first;
-            }
-        })?;
+        let complete = self.scan_from(
+            layout,
+            len,
+            start..stop,
+            read,
+            &mut never_cancel,
+            |first, _, _| {
+                if answer == len {
+                    answer = first;
+                }
+            },
+        )?;
+        debug_assert!(complete);
         Ok(answer)
     }
 
@@ -845,22 +946,29 @@ fn walk_decoded_row(
 /*
 Unicode scanning decodes each 64 KiB source window once and walks complete rows inside that mapping.
 Every emitted value is an exact source-byte offset below EOF.
-The scan state can still retain EOF as the reference Unicode last-row result.
+Cancellation occurs before each read and preserves all state from earlier complete windows.
+The scan state can retain EOF as the reference Unicode last-row result.
 */
-fn scan_unicode_rows<R, E>(
+#[allow(clippy::too_many_arguments)]
+fn scan_unicode_rows<R, C, E>(
     state: &mut ScanState,
     buffer: &mut [u8],
     layout: TextLayout,
     len: u64,
     stop: u64,
     read: &mut R,
+    cancel: &mut C,
     mut emit: E,
-) -> io::Result<()>
+) -> io::Result<bool>
 where
     R: FnMut(u64, &mut [u8]) -> io::Result<()>,
+    C: FnMut() -> io::Result<bool>,
     E: FnMut(u64),
 {
     while state.pos < stop && state.pos < len {
+        if cancel()? {
+            return Ok(false);
+        }
         /* Read one bounded source window before the decoder identifies complete scalar and grapheme ranges. */
         let read_start = state.pos;
         let read_len = usize::try_from((len - read_start).min(READ_BYTES as u64)).unwrap();
@@ -894,7 +1002,7 @@ where
             return Err(io::Error::other("Unicode Text indexing made no progress."));
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /*
@@ -1068,7 +1176,7 @@ They verify exact row boundaries, sparse state, Unicode decoding, and error reco
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::paged::PagedFile;
+    use crate::paged::{PagedEditCursor, PagedFile};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1079,6 +1187,11 @@ mod tests {
     */
     fn layout(width: usize, tabs: bool, delimiter: &[u8], codec: TextCodec) -> TextLayout {
         TextLayout::new(width, tabs, delimiter, codec).unwrap()
+    }
+
+    /* Existing row tests use a callback that keeps every bounded scan active. */
+    fn never_cancel() -> io::Result<bool> {
+        Ok(false)
     }
 
     /*
@@ -1160,27 +1273,46 @@ mod tests {
         let mut reads = Vec::new();
         /* CP437 keeps its initial row for empty, single-row, and delimiter-at-EOF sources. */
         assert_eq!(
-            index.row_at(cp437, 0, 0, reader(b"", &mut reads)).unwrap(),
-            0
+            index
+                .row_at(cp437, 0, 0, reader(b"", &mut reads), never_cancel)
+                .unwrap(),
+            Outcome::Completed(0)
         );
-        assert_eq!(index.last(cp437, 3, reader(b"abc", &mut reads)).unwrap(), 0);
         assert_eq!(
             index
-                .row_at(cp437, 3, 3, reader(b"abc", &mut reads))
+                .last(cp437, 3, reader(b"abc", &mut reads), never_cancel)
                 .unwrap(),
-            0
+            Outcome::Completed(0)
+        );
+        assert_eq!(
+            index
+                .row_at(cp437, 3, 3, reader(b"abc", &mut reads), never_cancel)
+                .unwrap(),
+            Outcome::Completed(0)
         );
         assert_eq!(
             index.next(cp437, 3, 0, reader(b"abc", &mut reads)).unwrap(),
             3
         );
         assert_eq!(
-            index.last(cp437, 4, reader(b"abc\n", &mut reads)).unwrap(),
-            0
+            index
+                .last(cp437, 4, reader(b"abc\n", &mut reads), never_cancel)
+                .unwrap(),
+            Outcome::Completed(0)
         );
         /* Unicode advances the final scan state through the complete file, including a trailing delimiter. */
-        assert_eq!(index.last(utf8, 3, reader(b"abc", &mut reads)).unwrap(), 3);
-        assert_eq!(index.last(utf8, 2, reader(b"a\n", &mut reads)).unwrap(), 2);
+        assert_eq!(
+            index
+                .last(utf8, 3, reader(b"abc", &mut reads), never_cancel)
+                .unwrap(),
+            Outcome::Completed(3)
+        );
+        assert_eq!(
+            index
+                .last(utf8, 2, reader(b"a\n", &mut reads), never_cancel)
+                .unwrap(),
+            Outcome::Completed(2)
+        );
         assert!(index.checkpoints.iter().all(|offset| *offset < 2));
     }
 
@@ -1210,9 +1342,15 @@ mod tests {
             let second = 3 + delimiter.len() as u64;
             assert_eq!(
                 index
-                    .row_at(layout, data.len() as u64, second, reader(&data, &mut reads))
+                    .row_at(
+                        layout,
+                        data.len() as u64,
+                        second,
+                        reader(&data, &mut reads),
+                        never_cancel,
+                    )
                     .unwrap(),
-                second
+                Outcome::Completed(second)
             );
             assert_eq!(
                 index
@@ -1227,10 +1365,11 @@ mod tests {
                         data.len() as u64,
                         second + 3,
                         2,
-                        reader(&data, &mut reads)
+                        reader(&data, &mut reads),
+                        never_cancel,
                     )
                     .unwrap(),
-                0
+                Outcome::Completed(0)
             );
         }
 
@@ -1268,9 +1407,15 @@ mod tests {
         );
         assert_eq!(
             index
-                .row_at(wide, data.len() as u64, second, reader(&data, &mut reads))
+                .row_at(
+                    wide,
+                    data.len() as u64,
+                    second,
+                    reader(&data, &mut reads),
+                    never_cancel,
+                )
                 .unwrap(),
-            second
+            Outcome::Completed(second)
         );
         assert!(reads.iter().all(|(_, count)| *count <= READ_BYTES));
 
@@ -1302,9 +1447,15 @@ mod tests {
         /* The cold query builds checkpoints without storing one entry for each 80-byte row. */
         assert_eq!(
             index
-                .row_at(layout, data.len() as u64, target, reader(&data, &mut reads))
+                .row_at(
+                    layout,
+                    data.len() as u64,
+                    target,
+                    reader(&data, &mut reads),
+                    never_cancel,
+                )
                 .unwrap(),
-            target / 80 * 80
+            Outcome::Completed(target / 80 * 80)
         );
         let cold = reads.len();
         assert!(cold > 32 && cold < 96, "cold read count: {cold}");
@@ -1317,10 +1468,11 @@ mod tests {
                     layout,
                     data.len() as u64,
                     warm_target,
-                    reader(&data, &mut reads)
+                    reader(&data, &mut reads),
+                    never_cancel,
                 )
                 .unwrap(),
-            warm_target / 80 * 80
+            Outcome::Completed(warm_target / 80 * 80)
         );
         assert!(reads.len() <= 17);
 
@@ -1349,9 +1501,15 @@ mod tests {
         let mut reads = Vec::new();
         assert_eq!(
             index
-                .row_at(layout, data.len() as u64, 4000, reader(&data, &mut reads))
+                .row_at(
+                    layout,
+                    data.len() as u64,
+                    4000,
+                    reader(&data, &mut reads),
+                    never_cancel,
+                )
                 .unwrap(),
-            3997
+            Outcome::Completed(3997)
         );
         assert!(index.checkpoints.len() <= 4);
         assert!(index.checkpoints.capacity() <= 4);
@@ -1359,9 +1517,15 @@ mod tests {
         for target in [63, 127, 193, 3001] {
             assert_eq!(
                 index
-                    .row_at(layout, data.len() as u64, target, reader(&data, &mut reads))
+                    .row_at(
+                        layout,
+                        data.len() as u64,
+                        target,
+                        reader(&data, &mut reads),
+                        never_cancel,
+                    )
                     .unwrap(),
-                target / 7 * 7
+                Outcome::Completed(target / 7 * 7)
             );
         }
     }
@@ -1380,44 +1544,80 @@ mod tests {
         /* Layout and length changes replace all old checkpoint state automatically. */
         assert_eq!(
             index
-                .row_at(narrow, data.len() as u64, 6, reader(&data, &mut reads))
+                .row_at(
+                    narrow,
+                    data.len() as u64,
+                    6,
+                    reader(&data, &mut reads),
+                    never_cancel,
+                )
                 .unwrap(),
-            6
+            Outcome::Completed(6)
         );
         assert_eq!(
             index
-                .row_at(wide, data.len() as u64, 6, reader(&data, &mut reads))
+                .row_at(
+                    wide,
+                    data.len() as u64,
+                    6,
+                    reader(&data, &mut reads),
+                    never_cancel,
+                )
                 .unwrap(),
-            4
+            Outcome::Completed(4)
         );
         assert_eq!(
             index
-                .row_at(wide, 3, 2, reader(&data[..3], &mut reads))
+                .row_at(wide, 3, 2, reader(&data[..3], &mut reads), never_cancel)
                 .unwrap(),
-            0
+            Outcome::Completed(0)
         );
         assert_eq!(
             index
-                .row_at(wide, data.len() as u64, 6, reader(&data, &mut reads))
+                .row_at(
+                    wide,
+                    data.len() as u64,
+                    6,
+                    reader(&data, &mut reads),
+                    never_cancel,
+                )
                 .unwrap(),
-            4
+            Outcome::Completed(4)
         );
         /* A same-length mutation needs an explicit reset before the index reads new boundaries. */
         data.copy_from_slice(b"abcdefg");
         index.reset();
         assert_eq!(
             index
-                .row_at(wide, data.len() as u64, 6, reader(&data, &mut reads))
+                .row_at(
+                    wide,
+                    data.len() as u64,
+                    6,
+                    reader(&data, &mut reads),
+                    never_cancel,
+                )
                 .unwrap(),
-            0
+            Outcome::Completed(0)
         );
         let mut fresh = TextIndex::default();
         assert_eq!(
             index
-                .row_at(wide, data.len() as u64, 6, reader(&data, &mut reads))
+                .row_at(
+                    wide,
+                    data.len() as u64,
+                    6,
+                    reader(&data, &mut reads),
+                    never_cancel,
+                )
                 .unwrap(),
             fresh
-                .row_at(wide, data.len() as u64, 6, reader(&data, &mut reads))
+                .row_at(
+                    wide,
+                    data.len() as u64,
+                    6,
+                    reader(&data, &mut reads),
+                    never_cancel,
+                )
                 .unwrap()
         );
     }
@@ -1434,17 +1634,27 @@ mod tests {
         let mut reads = Vec::new();
         assert_eq!(
             index
-                .row_at(layout, data.len() as u64, 700, reader(&data, &mut reads))
+                .row_at(
+                    layout,
+                    data.len() as u64,
+                    700,
+                    reader(&data, &mut reads),
+                    never_cancel,
+                )
                 .unwrap(),
-            700
+            Outcome::Completed(700)
         );
         assert!(index.progress.pos > 0);
         assert!(index.checkpoints.len() > 1);
         /* Build Unicode progress first, then fail a later exact read and check the complete reset. */
         let error = index
-            .row_at(layout, data.len() as u64, 900, |_, _| {
-                Err(io::Error::other("Injected read failure."))
-            })
+            .row_at(
+                layout,
+                data.len() as u64,
+                900,
+                |_, _| Err(io::Error::other("Injected read failure.")),
+                never_cancel,
+            )
             .unwrap_err();
         assert_eq!(error.to_string(), "Injected read failure.");
         assert_eq!(index.layout, None);
@@ -1462,7 +1672,7 @@ mod tests {
         fs::write(&path, b"abc").unwrap();
         let paged = PagedFile::open(&path).unwrap();
         let error = index
-            .row_at(layout, 4, 3, paged_reader(&paged))
+            .row_at(layout, 4, 3, paged_reader(&paged), never_cancel)
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
         assert_eq!(index.layout, None);
@@ -1477,6 +1687,7 @@ mod tests {
                 3,
                 usize::MAX,
                 reader(b"abcd", &mut allocation_reads),
+                never_cancel,
             )
             .unwrap_err();
         assert_eq!(
@@ -1489,7 +1700,12 @@ mod tests {
         /* A new exact PagedFile source succeeds after each failed query reset. */
         fs::write(&path, b"abcd").unwrap();
         let paged = PagedFile::open(&path).unwrap();
-        assert_eq!(index.row_at(layout, 4, 3, paged_reader(&paged)).unwrap(), 0);
+        assert_eq!(
+            index
+                .row_at(layout, 4, 3, paged_reader(&paged), never_cancel)
+                .unwrap(),
+            Outcome::Completed(0)
+        );
     }
 
     /*
@@ -1796,10 +2012,11 @@ mod tests {
                         finite,
                         data.len() as u64,
                         expected,
-                        reader(&data, &mut reads)
+                        reader(&data, &mut reads),
+                        never_cancel,
                     )
                     .unwrap(),
-                expected
+                Outcome::Completed(expected)
             );
             assert!(reads.iter().all(|(_, count)| *count <= READ_BYTES));
             assert!(reads.contains(&(0, READ_BYTES)));
@@ -1815,6 +2032,730 @@ mod tests {
                 READ_BYTES as u64
             );
         }
+    }
+
+    /*
+    Persistent cancellation keeps each completed CP437 chunk for a later query.
+    Local replay completes one read before cancellation and never returns its partial offset.
+    Callback failures reset all persistent state and preserve the original error.
+    */
+    #[test]
+    fn cancellation_retains_chunks_hides_local_answers_and_resets_errors() {
+        let data = vec![b'x'; READ_BODY_BYTES as usize * 3 + 137];
+        let layout = layout(80, false, b"\n", TextCodec::Cp437);
+        let target = data.len() as u64 - 1;
+
+        /* Cancellation before the first read retains only the initialized source contract. */
+        let mut index = TextIndex::with_limits(1_024, 256);
+        let mut reads = Vec::new();
+        assert_eq!(
+            index
+                .row_at(
+                    layout,
+                    data.len() as u64,
+                    target,
+                    reader(&data, &mut reads),
+                    || { Ok(true) }
+                )
+                .unwrap(),
+            Outcome::Canceled
+        );
+        assert!(reads.is_empty());
+        assert_eq!(index.progress.pos, 0);
+        assert_eq!(index.checkpoints, [0]);
+
+        /* Two completed chunks remain valid when the third persistent poll cancels the query. */
+        let mut polls = 0;
+        assert_eq!(
+            index
+                .row_at(
+                    layout,
+                    data.len() as u64,
+                    target,
+                    reader(&data, &mut reads),
+                    || {
+                        polls += 1;
+                        Ok(polls == 3)
+                    }
+                )
+                .unwrap(),
+            Outcome::Canceled
+        );
+        assert_eq!(reads.len(), 2);
+        let retained_progress = index.progress.pos;
+        let retained_checkpoints = index.checkpoints.clone();
+        assert_eq!(retained_progress, READ_BODY_BYTES * 2);
+        assert!(retained_checkpoints.iter().any(|offset| *offset != 0));
+
+        /* The next query starts its persistent work at the retained position and returns the exact row. */
+        reads.clear();
+        assert_eq!(
+            index
+                .row_at(
+                    layout,
+                    data.len() as u64,
+                    target,
+                    reader(&data, &mut reads),
+                    never_cancel,
+                )
+                .unwrap(),
+            Outcome::Completed(target / 80 * 80)
+        );
+        assert_eq!(reads.first().map(|read| read.0), Some(retained_progress));
+        assert!(index.checkpoints.starts_with(&retained_checkpoints));
+        assert!(reads.iter().all(|(_, count)| *count <= READ_BYTES));
+
+        /* Previous also cancels before reading and preserves completed persistent chunks for resume. */
+        let mut previous_index = TextIndex::with_limits(1_024, 256);
+        reads.clear();
+        assert_eq!(
+            previous_index
+                .previous(
+                    layout,
+                    data.len() as u64,
+                    target,
+                    5,
+                    reader(&data, &mut reads),
+                    || Ok(true),
+                )
+                .unwrap(),
+            Outcome::Canceled
+        );
+        assert!(reads.is_empty());
+        polls = 0;
+        assert_eq!(
+            previous_index
+                .previous(
+                    layout,
+                    data.len() as u64,
+                    target,
+                    5,
+                    reader(&data, &mut reads),
+                    || {
+                        polls += 1;
+                        Ok(polls == 3)
+                    },
+                )
+                .unwrap(),
+            Outcome::Canceled
+        );
+        let previous_restart = previous_index.progress.pos;
+        assert_eq!(previous_restart, READ_BODY_BYTES * 2);
+        let previous_checkpoints = previous_index.checkpoints.clone();
+        assert!(previous_checkpoints.iter().any(|offset| *offset != 0));
+        reads.clear();
+        let expected_previous = target / 80 * 80 - 5 * 80;
+        assert_eq!(
+            previous_index
+                .previous(
+                    layout,
+                    data.len() as u64,
+                    target,
+                    5,
+                    reader(&data, &mut reads),
+                    never_cancel,
+                )
+                .unwrap(),
+            Outcome::Completed(expected_previous)
+        );
+        assert_eq!(reads.first().map(|read| read.0), Some(previous_restart));
+        assert!(
+            previous_index
+                .checkpoints
+                .starts_with(&previous_checkpoints)
+        );
+
+        /* Row lookup reads one replay chunk before cancellation hides its provisional answer. */
+        let mut local_index = TextIndex::default();
+        reads.clear();
+        assert_eq!(
+            local_index
+                .row_at(
+                    layout,
+                    data.len() as u64,
+                    target,
+                    reader(&data, &mut reads),
+                    never_cancel,
+                )
+                .unwrap(),
+            Outcome::Completed(target / 80 * 80)
+        );
+        let saved_progress = local_index.progress;
+        let saved_stride = local_index.stride;
+        let saved_next_checkpoint = local_index.next_checkpoint;
+        let saved_checkpoints = local_index.checkpoints.clone();
+        reads.clear();
+        polls = 0;
+        assert_eq!(
+            local_index
+                .row_at(
+                    layout,
+                    data.len() as u64,
+                    target,
+                    reader(&data, &mut reads),
+                    || {
+                        polls += 1;
+                        Ok(polls == 2)
+                    }
+                )
+                .unwrap(),
+            Outcome::Canceled
+        );
+        assert_eq!(reads.len(), 1);
+        assert_eq!(local_index.progress.pos, saved_progress.pos);
+        assert_eq!(local_index.progress.row_start, saved_progress.row_start);
+        assert_eq!(local_index.progress.column, saved_progress.column);
+        assert_eq!(local_index.stride, saved_stride);
+        assert_eq!(local_index.next_checkpoint, saved_next_checkpoint);
+        assert_eq!(local_index.checkpoints, saved_checkpoints);
+
+        /* Previous also reads one local chunk before cancellation hides the partial recent-row queue. */
+        reads.clear();
+        polls = 0;
+        assert_eq!(
+            local_index
+                .previous(
+                    layout,
+                    data.len() as u64,
+                    target,
+                    1_000,
+                    reader(&data, &mut reads),
+                    || {
+                        polls += 1;
+                        Ok(polls == 2)
+                    },
+                )
+                .unwrap(),
+            Outcome::Canceled
+        );
+        assert_eq!(reads.len(), 1);
+        assert_eq!(local_index.progress.pos, saved_progress.pos);
+        assert_eq!(local_index.progress.row_start, saved_progress.row_start);
+        assert_eq!(local_index.progress.column, saved_progress.column);
+        assert_eq!(local_index.stride, saved_stride);
+        assert_eq!(local_index.next_checkpoint, saved_next_checkpoint);
+        assert_eq!(local_index.checkpoints, saved_checkpoints);
+
+        /* A cancellation callback error after one chunk clears the complete index. */
+        let mut failing = TextIndex::default();
+        let mut error_reads = Vec::new();
+        polls = 0;
+        let error = failing
+            .row_at(
+                layout,
+                data.len() as u64,
+                target,
+                reader(&data, &mut error_reads),
+                || {
+                    polls += 1;
+                    if polls == 2 {
+                        Err(io::Error::other("Injected cancellation failure."))
+                    } else {
+                        Ok(false)
+                    }
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Injected cancellation failure.");
+        assert_eq!(error_reads.len(), 1);
+        assert_eq!(failing.layout, None);
+        assert_eq!(failing.source_len, None);
+        assert_eq!(failing.checkpoints, [0]);
+        assert_eq!(failing.progress.pos, 0);
+
+        /* A read error after one completed chunk follows the same complete reset contract. */
+        let mut failing = TextIndex::default();
+        let mut read_count = 0;
+        let error = failing
+            .row_at(
+                layout,
+                data.len() as u64,
+                target,
+                |_, output| {
+                    read_count += 1;
+                    if read_count == 2 {
+                        Err(io::Error::other("Injected resumed read failure."))
+                    } else {
+                        output.fill(b'x');
+                        Ok(())
+                    }
+                },
+                never_cancel,
+            )
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Injected resumed read failure.");
+        assert_eq!(read_count, 2);
+        assert_eq!(failing.layout, None);
+        assert_eq!(failing.source_len, None);
+        assert_eq!(failing.checkpoints, [0]);
+        assert_eq!(failing.progress.pos, 0);
+    }
+
+    /*
+    Last keeps completed chunks and resumes for every supported codec.
+    A completed index performs no read or cancellation poll during a repeated last query.
+    */
+    #[test]
+    fn last_cancellation_resumes_all_codecs_without_final_poll() {
+        for codec in [
+            TextCodec::Cp437,
+            TextCodec::Utf8,
+            TextCodec::Utf16Le,
+            TextCodec::Utf16Be,
+        ] {
+            let data = if matches!(codec, TextCodec::Utf16Le | TextCodec::Utf16Be) {
+                codec.encode(&"x".repeat(READ_BYTES + 17))
+            } else {
+                vec![b'x'; READ_BYTES * 2 + 17]
+            };
+            let layout = layout(80, false, b"\n", codec);
+            let mut index = TextIndex::with_limits(1_024, 256);
+            let mut reads = Vec::new();
+            let mut polls = 0;
+
+            /* Cancel before the second read and retain the first complete scan window. */
+            assert_eq!(
+                index
+                    .last(layout, data.len() as u64, reader(&data, &mut reads), || {
+                        polls += 1;
+                        Ok(polls == 2)
+                    })
+                    .unwrap(),
+                Outcome::Canceled
+            );
+            let restart = index.progress.pos;
+            let retained_checkpoints = index.checkpoints.clone();
+            assert!(restart > 0 && restart < data.len() as u64);
+            assert_eq!(reads.len(), 1);
+            assert!(retained_checkpoints.iter().any(|offset| *offset != 0));
+
+            /* Resume at the retained position and return the codec-specific final-row convention. */
+            reads.clear();
+            let expected = if codec == TextCodec::Cp437 {
+                (data.len() as u64 - 1) / 80 * 80
+            } else {
+                data.len() as u64
+            };
+            assert_eq!(
+                index
+                    .last(
+                        layout,
+                        data.len() as u64,
+                        reader(&data, &mut reads),
+                        never_cancel,
+                    )
+                    .unwrap(),
+                Outcome::Completed(expected)
+            );
+            assert_eq!(reads.first().map(|read| read.0), Some(restart));
+            assert!(index.checkpoints.starts_with(&retained_checkpoints));
+            assert!(reads.iter().all(|(_, count)| *count <= READ_BYTES));
+
+            /* A repeated completed query must not call either callback. */
+            let mut final_polls = 0;
+            assert_eq!(
+                index
+                    .last(
+                        layout,
+                        data.len() as u64,
+                        |_, _| panic!("A completed last query must not read."),
+                        || {
+                            final_polls += 1;
+                            Ok(false)
+                        },
+                    )
+                    .unwrap(),
+                Outcome::Completed(expected)
+            );
+            assert_eq!(final_polls, 0);
+        }
+    }
+
+    /*
+    This helper builds one old CP437 index and applies one successful logical edit.
+    The invalidated result must match both an independent offset and a fresh index.
+    */
+    fn check_cp437_edit(
+        before: &[u8],
+        after: &[u8],
+        change_start: u64,
+        target: u64,
+        expected: u64,
+    ) {
+        let layout = layout(8, false, b"\r\n", TextCodec::Cp437);
+        let mut index = TextIndex::with_limits(8, 8);
+        let mut reads = Vec::new();
+        assert!(matches!(
+            index
+                .last(
+                    layout,
+                    before.len() as u64,
+                    reader(before, &mut reads),
+                    never_cancel,
+                )
+                .unwrap(),
+            Outcome::Completed(_)
+        ));
+        index.invalidate_from(change_start, after.len() as u64);
+        assert_eq!(index.source_len, Some(after.len() as u64));
+
+        /* Compare the retained-index answer with both independent and rebuilt answers. */
+        reads.clear();
+        let result = index
+            .row_at(
+                layout,
+                after.len() as u64,
+                target,
+                reader(after, &mut reads),
+                never_cancel,
+            )
+            .unwrap();
+        assert_eq!(result, Outcome::Completed(expected));
+        let mut fresh = TextIndex::with_limits(8, 8);
+        let mut fresh_reads = Vec::new();
+        assert_eq!(
+            result,
+            fresh
+                .row_at(
+                    layout,
+                    after.len() as u64,
+                    target,
+                    reader(after, &mut fresh_reads),
+                    never_cancel,
+                )
+                .unwrap()
+        );
+        assert!(reads.iter().all(|(_, count)| *count <= READ_BYTES));
+    }
+
+    /*
+    CP437 invalidation covers replacement, insertion, deletion, append, truncate, and offset zero.
+    CRLF creation and removal at a wrap checkpoint rebuild the affected boundary.
+    */
+    #[test]
+    fn cp437_invalidation_adopts_edit_lengths_and_preserves_earlier_progress() {
+        check_cp437_edit(b"abcdefghij", b"abcdefg\r\nj", 7, 9, 9);
+        check_cp437_edit(b"abcdefg\r\nj", b"abcdefghij", 7, 9, 8);
+        check_cp437_edit(b"abcdefgh", b"ab\r\ncdefgh", 2, 9, 4);
+        check_cp437_edit(b"ab\r\ncdefgh", b"abcdefgh", 2, 7, 0);
+        check_cp437_edit(b"abc", b"abc\r\nxy", 3, 6, 5);
+        check_cp437_edit(b"abc\r\nxy", b"abc", 3, 2, 0);
+        check_cp437_edit(b"abcdefgh", b"\r\nabcdef", 0, 7, 2);
+
+        /* An edit beyond indexed progress leaves the complete known prefix unchanged. */
+        let mut data = vec![b'x'; 10_000];
+        let layout = layout(8, false, b"\r\n", TextCodec::Cp437);
+        let mut index = TextIndex::with_limits(64, 8);
+        let mut reads = Vec::new();
+        assert_eq!(
+            index
+                .row_at(
+                    layout,
+                    data.len() as u64,
+                    100,
+                    reader(&data, &mut reads),
+                    never_cancel
+                )
+                .unwrap(),
+            Outcome::Completed(96)
+        );
+        let progress = index.progress;
+        let checkpoints = index.checkpoints.clone();
+        data[9_000] = b'\n';
+        index.invalidate_from(9_000, data.len() as u64);
+        assert_eq!(index.progress.pos, progress.pos);
+        assert_eq!(index.checkpoints, checkpoints);
+        assert_eq!(
+            index
+                .row_at(
+                    layout,
+                    data.len() as u64,
+                    100,
+                    reader(&data, &mut reads),
+                    never_cancel
+                )
+                .unwrap(),
+            Outcome::Completed(96)
+        );
+
+        /* An unexplained query-length change resets compacted state before the new query. */
+        let old = vec![b'x'; 4_096];
+        let mut changed = old.clone();
+        changed.push(b'x');
+        let mut index = TextIndex::with_limits(64, 4);
+        assert_eq!(
+            index
+                .row_at(
+                    layout,
+                    old.len() as u64,
+                    4_000,
+                    reader(&old, &mut reads),
+                    never_cancel
+                )
+                .unwrap(),
+            Outcome::Completed(4_000)
+        );
+        assert!(index.stride > 64);
+        assert_eq!(
+            index
+                .row_at(
+                    layout,
+                    changed.len() as u64,
+                    0,
+                    reader(&changed, &mut reads),
+                    never_cancel
+                )
+                .unwrap(),
+            Outcome::Completed(0)
+        );
+        assert_eq!(index.stride, 64);
+        assert_eq!(index.checkpoints, [0]);
+        assert_eq!(index.progress.pos, 1);
+    }
+
+    /*
+    A compacted multi-megabyte index keeps its stride and valid checkpoints before one suffix edit.
+    Rebuilding reads only from the retained restart point and returns an independent exact offset.
+    */
+    #[test]
+    fn compacted_suffix_invalidation_reuses_prefix_and_reads_only_suffix() {
+        let mut data = vec![b'x'; 5 * 1024 * 1024 + 37];
+        let layout = layout(80, false, b"\n", TextCodec::Cp437);
+        let mut index = TextIndex::with_limits(64 * 1024, 8);
+        let mut reads = Vec::new();
+        assert!(matches!(
+            index
+                .last(
+                    layout,
+                    data.len() as u64,
+                    reader(&data, &mut reads),
+                    never_cancel,
+                )
+                .unwrap(),
+            Outcome::Completed(_)
+        ));
+        let compacted_stride = index.stride;
+        let old_checkpoints = index.checkpoints.clone();
+        assert!(compacted_stride > 64 * 1024);
+
+        /* Insert one delimiter after the retained prefix and adopt the longer source length. */
+        let change = 4 * 1024 * 1024 + 17;
+        let affected = change as u64 - 1;
+        let expected_retained: Vec<u64> = old_checkpoints
+            .iter()
+            .copied()
+            .filter(|offset| *offset < affected)
+            .collect();
+        data.insert(change, b'\n');
+        index.invalidate_from(change as u64, data.len() as u64);
+        let restart = index.progress.pos;
+        let retained = index.checkpoints.clone();
+        assert!(retained.len() > 1);
+        assert!(retained.len() < old_checkpoints.len());
+        assert_eq!(retained, expected_retained);
+        assert!(restart > 0);
+        assert_eq!(index.stride, compacted_stride);
+        assert_eq!(retained.last().copied(), Some(restart));
+        assert_eq!(index.source_len, Some(data.len() as u64));
+
+        /* Rebuild the suffix and compare it with one fresh scan. */
+        reads.clear();
+        let target = data.len() as u64 - 1;
+        let row_after_delimiter = change as u64 + 1;
+        let expected = row_after_delimiter + (target - row_after_delimiter) / 80 * 80;
+        let result = index
+            .row_at(
+                layout,
+                data.len() as u64,
+                target,
+                reader(&data, &mut reads),
+                never_cancel,
+            )
+            .unwrap();
+        assert_eq!(result, Outcome::Completed(expected));
+        assert_eq!(reads.first().map(|read| read.0), Some(restart));
+        assert!(
+            reads
+                .iter()
+                .all(|(start, count)| { *start >= restart && *count <= READ_BYTES })
+        );
+        let suffix_chunks = (data.len() as u64 - restart).div_ceil(READ_BODY_BYTES);
+        let replay_chunks = index
+            .stride
+            .saturating_add(layout.max_row_bytes())
+            .div_ceil(READ_BODY_BYTES);
+        let read_ceiling = suffix_chunks.saturating_add(replay_chunks);
+        assert!(u64::try_from(reads.len()).unwrap() <= read_ceiling);
+        let mut fresh = TextIndex::default();
+        let mut fresh_reads = Vec::new();
+        assert_eq!(
+            result,
+            fresh
+                .row_at(
+                    layout,
+                    data.len() as u64,
+                    target,
+                    reader(&data, &mut fresh_reads),
+                    never_cancel,
+                )
+                .unwrap()
+        );
+    }
+
+    /*
+    Unicode invalidation keeps checkpoints only before its 4 KiB grapheme carry area.
+    A combining mark inserted near a read boundary rebuilds from the retained earlier row.
+    */
+    #[test]
+    fn unicode_invalidation_uses_grapheme_lookbehind_near_read_boundary() {
+        let mut data = vec![b'x'; READ_BYTES * 2 + 101];
+        let layout = layout(80, false, b"\n", TextCodec::Utf8);
+        let mut index = TextIndex::with_limits(1_024, 256);
+        let mut reads = Vec::new();
+        assert!(matches!(
+            index
+                .last(
+                    layout,
+                    data.len() as u64,
+                    reader(&data, &mut reads),
+                    never_cancel,
+                )
+                .unwrap(),
+            Outcome::Completed(_)
+        ));
+
+        /* Insert one combining scalar immediately before the first read boundary. */
+        let change = READ_BYTES - 1;
+        data.splice(change..change, [0xcc, 0x81]);
+        index.invalidate_from(change as u64, data.len() as u64);
+        let affected = change as u64 - MAX_GRAPHEME_BYTES as u64;
+        let restart = index.progress.pos;
+        assert!(restart > 0 && restart < affected);
+        assert!(index.checkpoints.iter().all(|offset| *offset < affected));
+        assert_eq!(index.source_len, Some(data.len() as u64));
+
+        /* The retained index and a fresh index must return the same exact row. */
+        reads.clear();
+        let target = change as u64 + 1_000;
+        let result = index
+            .row_at(
+                layout,
+                data.len() as u64,
+                target,
+                reader(&data, &mut reads),
+                never_cancel,
+            )
+            .unwrap();
+        assert_eq!(result, Outcome::Completed(66_482));
+        assert_eq!(reads.first().map(|read| read.0), Some(restart));
+        assert!(reads.iter().all(|(_, count)| *count <= READ_BYTES));
+        let mut fresh = TextIndex::default();
+        let mut fresh_reads = Vec::new();
+        assert_eq!(
+            result,
+            fresh
+                .row_at(
+                    layout,
+                    data.len() as u64,
+                    target,
+                    reader(&data, &mut fresh_reads),
+                    never_cancel,
+                )
+                .unwrap()
+        );
+    }
+
+    /*
+    PagedFile supplies current logical edit bytes through the existing exact-fill adapter.
+    A later external source replacement returns its original error and resets the index.
+    */
+    #[test]
+    fn paged_logical_edit_and_changed_source_follow_index_contract() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("paged-edit.bin");
+        fs::write(&path, b"abcd\nefgh").unwrap();
+        let mut paged = PagedFile::open(&path).unwrap();
+        let layout = layout(80, false, b"\n", TextCodec::Cp437);
+        let mut index = TextIndex::default();
+        assert_eq!(
+            index
+                .row_at(layout, paged.len(), 8, paged_reader(&paged), never_cancel)
+                .unwrap(),
+            Outcome::Completed(5)
+        );
+
+        /* Delete the delimiter in logical edit state and adopt the new logical length. */
+        let cursor = PagedEditCursor {
+            offset: 4,
+            top: 0,
+            low_nibble: false,
+        };
+        paged.begin_edit().unwrap();
+        assert!(
+            paged
+                .splice_bytes(4, 1, b"", cursor, cursor, false)
+                .unwrap()
+        );
+        index.invalidate_from(4, paged.len());
+        assert_eq!(
+            index
+                .row_at(layout, paged.len(), 7, paged_reader(&paged), never_cancel)
+                .unwrap(),
+            Outcome::Completed(0)
+        );
+
+        /* Replace the pathname source and verify the exact PagedFile validation failure. */
+        let old_path = fixture.0.join("old-paged-edit.bin");
+        fs::rename(&path, &old_path).unwrap();
+        fs::write(&path, b"abcdefgh").unwrap();
+        let error = index
+            .row_at(layout, paged.len(), 7, paged_reader(&paged), never_cancel)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "The source path identifies a different file. Reopen the source."
+        );
+        assert_eq!(index.layout, None);
+        assert_eq!(index.source_len, None);
+        assert_eq!(index.checkpoints, [0]);
+        assert_eq!(index.progress.pos, 0);
+    }
+
+    /*
+    High offsets exercise checked next-checkpoint arithmetic without large files or allocations.
+    Excessive change offsets first clamp to both the old and new source lengths.
+    */
+    #[test]
+    fn invalidation_bounds_offsets_and_saturates_checkpoint_arithmetic() {
+        let layout = layout(80, false, b"\n", TextCodec::Cp437);
+        let mut index = TextIndex::with_limits(u64::MAX - 64, 4);
+        index.layout = Some(layout);
+        index.source_len = Some(u64::MAX);
+        index.stride = u64::MAX - 64;
+        index.checkpoints = vec![0, u64::MAX - 32];
+        index.progress = ScanState {
+            pos: u64::MAX,
+            row_start: u64::MAX - 32,
+            column: 0,
+        };
+        index.invalidate_from(u64::MAX, u64::MAX);
+        assert_eq!(index.progress.pos, u64::MAX - 32);
+        assert_eq!(index.next_checkpoint, u64::MAX);
+
+        /* Clamp an excessive edit offset to the shorter resulting length before lookbehind. */
+        index.source_len = Some(100);
+        index.stride = 64;
+        index.checkpoints = vec![0, 40, 80];
+        index.progress = ScanState {
+            pos: 100,
+            row_start: 80,
+            column: 20,
+        };
+        index.invalidate_from(u64::MAX, 50);
+        assert_eq!(index.source_len, Some(50));
+        assert_eq!(index.checkpoints, [0, 40]);
+        assert_eq!(index.progress.pos, 40);
+        assert_eq!(index.next_checkpoint, 64);
     }
 
     /*
