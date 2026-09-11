@@ -58,7 +58,6 @@ const PAGED_KEYS: &str = " Alt: H Help E Edit G Goto O Files P/N Prev/Next | Ctr
 const PAGED_EDIT_KEYS: &str =
     " Alt+S Save  Ctrl+S Save As  Ctrl+Z/Y Undo/Redo  Alt+G Goto  Esc Cancel ";
 const RETURN_HISTORY_LIMIT: usize = 256;
-const X86_MAX_INSTRUCTION_BYTES: usize = 15;
 
 /*
 This helper writes visible text into a fixed terminal row.
@@ -266,33 +265,48 @@ fn frame(
 }
 
 /*
-This helper converts a file offset into the current format address.
-It preserves the stored format error when metadata is unavailable.
+This helper converts a file offset into the current CodeLocation.
+It preserves the stored format error and the address domain.
 */
-fn code_address(
+fn code_location(
     metadata: &Result<format::Metadata, String>,
     offset: u64,
-) -> Result<(u64, u32), String> {
+) -> Result<format::CodeLocation, String> {
     match metadata {
-        Ok(metadata) => metadata.code_address(offset),
+        Ok(metadata) => metadata.code_location(offset),
         Err(error) => Err(error.clone()),
     }
 }
 
 /*
-This cache returns a decoder for the requested width, syntax, and Real16 state.
+This compatibility helper returns the current address and width tuple.
+Header and summary callers retain their established display behavior.
+*/
+fn code_address(
+    metadata: &Result<format::Metadata, String>,
+    offset: u64,
+) -> Result<(u64, u32), String> {
+    let location = code_location(metadata, offset)?;
+    Ok((location.address, location.bits))
+}
+
+/*
+This cache returns a decoder for the requested architecture, syntax, and Real16 state.
 It replaces the cached decoder only when one requested property changes.
 */
 fn decoder_for(
     decoder: &mut Option<decoder::Decoder>,
-    bits: u32,
+    architecture: format::Architecture,
     syntax: decoder::Syntax,
     real_mode: bool,
 ) -> Result<&decoder::Decoder, String> {
     if decoder.as_ref().is_none_or(|decoder| {
-        decoder.bits() != bits || decoder.syntax() != syntax || decoder.real_mode() != real_mode
+        decoder.architecture() != architecture
+            || decoder.syntax() != syntax
+            || decoder.real_mode() != real_mode
     }) {
-        *decoder = Some(decoder::Decoder::with_mode(bits, syntax, real_mode)?);
+        let replacement = decoder::Decoder::with_architecture(architecture, syntax, real_mode)?;
+        *decoder = Some(replacement);
     }
     Ok(decoder.as_ref().unwrap())
 }
@@ -354,26 +368,19 @@ fn preview_rows(
     let mut first_size = None;
     while file_start.saturating_add(relative) < stop {
         let file_offset = file_start.saturating_add(relative);
-        let address = match metadata.code_address(file_offset as u64) {
-            Ok((address, _)) => address,
+        let address = match metadata.code_location(file_offset as u64) {
+            Ok(location) => location.address,
             Err(error) => {
                 rows.push(format!("F:{file_offset:X} <address error: {error}>"));
                 break;
             }
         };
-        let instruction = match decoder.decode(data, relative as u64, address) {
+        let instruction = match if byte_fallback {
+            decoder.decode_or_byte(data, relative as u64, address)
+        } else {
+            decoder.decode(data, relative as u64, address)
+        } {
             Ok(instruction) => instruction,
-            Err(_) if byte_fallback => {
-                let Some(&byte) = data.get(relative) else {
-                    rows.push(format!("F:{file_offset:X} <end of file> A:{address:X}"));
-                    break;
-                };
-                decoder::Instruction {
-                    size: 1,
-                    hex: format!("{byte:02X}"),
-                    text: format!("db {byte:02X}"),
-                }
-            }
             Err(error) => {
                 rows.push(format!(
                     "F:{file_offset:X} <decode error: {error}> A:{address:X}"
@@ -424,13 +431,9 @@ fn assembly_preview(
         .ok_or("The instruction exceeds the address range.")?;
     let new_len = view.data.len().max(end);
     view.validate_raw_len(new_len)?;
-    let address = metadata.code_address(view.offset)?.0;
-    let decoder = decoder_for(
-        decoder,
-        view.decode_bits(),
-        view.syntax,
-        view.decode_real_mode(),
-    )?;
+    let address = metadata.code_location(view.offset)?.address;
+    let architecture = format::Architecture::x86(view.decode_bits())?;
+    let decoder = decoder_for(decoder, architecture, view.syntax, view.decode_real_mode())?;
 
     let original_stop = end.min(view.data.len());
     let mut original = preview_rows(
@@ -454,7 +457,7 @@ fn assembly_preview(
     let original_end = original.end.max(original_stop);
     let proposed_stop = end.max(original_end);
     let tail_end = proposed_stop
-        .saturating_add(X86_MAX_INSTRUCTION_BYTES - 1)
+        .saturating_add(architecture.max_instruction_bytes() - 1)
         .min(view.data.len());
     let mut proposed_data = view.data[start..tail_end].to_vec();
     proposed_data.resize(proposed_data.len().max(replacement.len()), 0);
@@ -678,28 +681,13 @@ fn decode_at(
     Address conversion and decoder selection happen before byte fallback.
     The fallback produces one data-byte instruction only when configuration permits it.
     */
-    let (address, _) = code_address(metadata, offset)?;
-    let decoded = decoder_for(
-        decoder,
-        view.decode_bits(),
-        view.syntax,
-        view.decode_real_mode(),
-    )?
-    .decode(&view.data, offset, address);
-    let mut instruction = match decoded {
-        Ok(instruction) => instruction,
-        Err(_) if view.invalid_code_bytes => {
-            let byte = *view
-                .data
-                .get(offset as usize)
-                .ok_or("The decoder reached the end of the file.")?;
-            decoder::Instruction {
-                size: 1,
-                hex: format!("{byte:02X}"),
-                text: format!("db {byte:02X}"),
-            }
-        }
-        Err(error) => return Err(error),
+    let location = code_location(metadata, offset)?;
+    let architecture = format::Architecture::x86(view.decode_bits())?;
+    let decoder = decoder_for(decoder, architecture, view.syntax, view.decode_real_mode())?;
+    let mut instruction = if view.invalid_code_bytes {
+        decoder.decode_or_byte(&view.data, offset, location.address)?
+    } else {
+        decoder.decode(&view.data, offset, location.address)?
     };
 
     /*
@@ -712,13 +700,13 @@ fn decode_at(
     {
         let count = view.data[offset as usize..]
             .iter()
-            .take(15)
+            .take(architecture.max_instruction_bytes())
             .take_while(|&&value| value == byte)
             .count();
         instruction.size = count;
         instruction.hex = format!("{byte:02X}").repeat(count);
     }
-    Ok((address, instruction))
+    Ok((location.address, instruction))
 }
 
 /*
@@ -741,7 +729,7 @@ fn direct_target_offset(
         .ok_or("The branch source is outside the current buffer.")?;
     let target = decoder_for(
         decoder,
-        view.decode_bits(),
+        format::Architecture::x86(view.decode_bits())?,
         view.syntax,
         view.decode_real_mode(),
     )?
@@ -788,13 +776,13 @@ fn assembly_seed(
     view: &Editor,
     metadata: &Result<format::Metadata, String>,
 ) -> Result<String, String> {
-    let (address, _) = code_address(metadata, view.offset)?;
-    decoder::Decoder::with_mode(
-        view.decode_bits(),
+    let location = code_location(metadata, view.offset)?;
+    decoder::Decoder::with_architecture(
+        format::Architecture::x86(view.decode_bits())?,
         decoder::Syntax::Intel,
         view.decode_real_mode(),
     )?
-    .decode(&view.data, view.offset, address)
+    .decode(&view.data, view.offset, location.address)
     .map(|instruction| instruction.text)
 }
 
@@ -2457,8 +2445,9 @@ fn open_editor(
                     };
                     let proposed = (|| {
                         let metadata = metadata.as_ref().map_err(Clone::clone)?;
-                        let address = metadata.code_address(view.offset)?.0;
-                        let bytes = assembler::assemble(&text, view.decode_bits(), address)?;
+                        let address = metadata.code_location(view.offset)?.address;
+                        let architecture = format::Architecture::x86(view.decode_bits())?;
+                        let bytes = assembler::assemble_architecture(&text, architecture, address)?;
                         let start = usize::try_from(view.offset)
                             .map_err(|_| "The offset exceeds the address range.")?;
                         let end = start
@@ -2715,7 +2704,9 @@ fn run() -> io::Result<()> {
             (32, "nop", &[0x90][..]),
             (64, "mov rax,rbx", &[0x48, 0x89, 0xd8][..]),
         ] {
-            let output = assembler::assemble(text, bits, 0x1000).map_err(io::Error::other)?;
+            let architecture = format::Architecture::x86(bits).map_err(io::Error::other)?;
+            let output = assembler::assemble_architecture(text, architecture, 0x1000)
+                .map_err(io::Error::other)?;
             let instruction = decoder::decode(bytes, 0, bits, 0x1000).map_err(io::Error::other)?;
             if output != bytes || instruction.size != bytes.len() {
                 return Err(io::Error::other("The native instruction check failed."));
@@ -3338,34 +3329,111 @@ mod tests {
     fn decoder_for_reuses_and_replaces_decoder() {
         let mut decoder = None;
         assert_eq!(
-            decoder_for(&mut decoder, 32, decoder::Syntax::Intel, false)
-                .unwrap()
-                .bits(),
+            decoder_for(
+                &mut decoder,
+                format::Architecture::X86(32),
+                decoder::Syntax::Intel,
+                false,
+            )
+            .unwrap()
+            .bits(),
             32
         );
+        let first = decoder.as_ref().unwrap().native_handle();
+        decoder_for(
+            &mut decoder,
+            format::Architecture::X86(32),
+            decoder::Syntax::Intel,
+            false,
+        )
+        .unwrap();
+        assert_eq!(decoder.as_ref().unwrap().native_handle(), first);
         assert_eq!(
-            decoder_for(&mut decoder, 32, decoder::Syntax::Att, false)
-                .unwrap()
-                .syntax(),
+            decoder_for(
+                &mut decoder,
+                format::Architecture::X86(32),
+                decoder::Syntax::Att,
+                false,
+            )
+            .unwrap()
+            .syntax(),
             decoder::Syntax::Att
         );
+        let att = decoder.as_ref().unwrap().native_handle();
+        assert_ne!(att, first);
         assert_eq!(
-            decoder_for(&mut decoder, 16, decoder::Syntax::Intel, false)
-                .unwrap()
-                .bits(),
+            decoder_for(
+                &mut decoder,
+                format::Architecture::X86(16),
+                decoder::Syntax::Intel,
+                false,
+            )
+            .unwrap()
+            .bits(),
             16
         );
+        let width16 = decoder.as_ref().unwrap().native_handle();
+        assert_ne!(width16, att);
+        assert!(
+            decoder_for(
+                &mut decoder,
+                format::Architecture::X86(16),
+                decoder::Syntax::Intel,
+                true,
+            )
+            .unwrap()
+            .real_mode()
+        );
+        let real16 = decoder.as_ref().unwrap().native_handle();
+        assert_ne!(real16, width16);
+        decoder_for(
+            &mut decoder,
+            format::Architecture::X86(16),
+            decoder::Syntax::Intel,
+            true,
+        )
+        .unwrap();
+        assert_eq!(decoder.as_ref().unwrap().native_handle(), real16);
         assert_eq!(
-            decoder_for(&mut decoder, 64, decoder::Syntax::Intel, false)
-                .unwrap()
-                .bits(),
+            decoder_for(
+                &mut decoder,
+                format::Architecture::X86(64),
+                decoder::Syntax::Intel,
+                false,
+            )
+            .unwrap()
+            .bits(),
             64
         );
-        assert!(decoder_for(&mut decoder, 8, decoder::Syntax::Intel, false).is_err());
+        let retained = decoder.as_ref().unwrap().native_handle();
         assert!(
-            decoder_for(&mut decoder, 16, decoder::Syntax::Intel, true)
+            decoder_for(
+                &mut decoder,
+                format::Architecture::X86(8),
+                decoder::Syntax::Intel,
+                false,
+            )
+            .is_err()
+        );
+        assert_eq!(decoder.as_ref().unwrap().native_handle(), retained);
+        for architecture in [
+            format::Architecture::Arm,
+            format::Architecture::Thumb,
+            format::Architecture::Arm64,
+        ] {
+            assert!(
+                decoder_for(&mut decoder, architecture, decoder::Syntax::Intel, false).is_err()
+            );
+            assert_eq!(decoder.as_ref().unwrap().native_handle(), retained);
+        }
+        assert_eq!(
+            decoder
+                .as_ref()
                 .unwrap()
-                .real_mode()
+                .decode(&[0x90], 0, 0)
+                .unwrap()
+                .text,
+            "nop"
         );
     }
 
@@ -3644,6 +3712,31 @@ mod tests {
     }
 
     /*
+    This test keeps raw integer byte order separate from x86 instruction decoding.
+    Both raw models decode identical bytes, while the integer inspector uses the selected order.
+    */
+    #[test]
+    fn raw_byte_order_does_not_change_x86_decoding() {
+        let data = vec![0x89, 0xd8, 0x01, 0x02];
+        let mut texts = Vec::new();
+        let mut integers = Vec::new();
+        for byte_order in [editor::ByteOrder::Little, editor::ByteOrder::Big] {
+            let mut view = Editor::new(data.clone(), Mode::Code, 0);
+            view.set_raw_model(Some(editor::RawModel {
+                base: 0x1000,
+                bits: 32,
+                byte_order,
+            }))
+            .unwrap();
+            let instruction = decode_at(&view, 0, &view.metadata(), &mut None).unwrap().1;
+            texts.push((instruction.size, instruction.text));
+            integers.push(inspect::integers(&view.data, 0, Some(byte_order))[1].clone());
+        }
+        assert_eq!(texts[0], texts[1]);
+        assert_ne!(integers[0], integers[1]);
+    }
+
+    /*
     This test cycles raw widths without changing the underlying Real16 setting.
     An invalid high raw base preserves the previous model.
     */
@@ -3692,6 +3785,72 @@ mod tests {
         view.invalid_code_bytes = true;
         let (_, instruction) = decode_at(&view, 0, &metadata, &mut decoder).unwrap();
         assert_eq!((instruction.size, instruction.text.as_str()), (1, "db 0F"));
+    }
+
+    /*
+    This test verifies that decoder errors cannot change or close an unsaved edit transaction.
+    Code display and both preview paths must expose the original Capstone status.
+    */
+    #[test]
+    fn invalid_byte_fallback_preserves_decoder_errors() {
+        /*
+        The setup section starts a real Code edit and records its unsaved state.
+        The injected decoder keeps the real native handle but returns one deterministic error.
+        */
+        let original = vec![0x90, 0xc3];
+        let mut view = Editor::new(original.clone(), Mode::Code, 0);
+        view.code_bits = 32;
+        view.invalid_code_bytes = true;
+        view.toggle_edit().unwrap();
+        view.replace_bytes(0, vec![0x0f], (1, 0)).unwrap();
+        let edited = view.data.clone();
+        let metadata = view.metadata();
+        let mut cached = Some(decoder::Decoder::new(32).unwrap());
+        cached.as_mut().unwrap().force_decode_error();
+        /*
+        The error section exercises selected decoding, Code rows, comparison rows, and assembly preview.
+        Each call keeps error 17 and refuses the configured byte fallback.
+        */
+        let error = decode_at(&view, 0, &metadata, &mut cached).unwrap_err();
+        assert!(error.contains("error 17"));
+
+        let code = code_rows(&view, 1, &metadata, &mut cached);
+        assert!(code[0].contains("error 17"));
+
+        let metadata = metadata.unwrap();
+        let rows = preview_rows(&view.data, 0, 1, &metadata, cached.as_ref().unwrap(), true);
+        assert_eq!(rows.first_size, None);
+        assert!(rows.rows[0].contains("error 17"));
+        assert!(!rows.rows[0].contains("db"));
+        let error = assembly_preview(&view, &metadata, &mut cached, &[0x90]).unwrap_err();
+        assert!(error.contains("error 17"));
+
+        /*
+        The state section verifies the unsaved bytes, cursor, viewport, edit mode, and dirty flag.
+        No decoder or preview error changes the transaction.
+        */
+        assert_eq!(
+            (view.data.as_slice(), view.offset, view.top),
+            (&edited[..], 1, 0)
+        );
+        assert!(view.editing);
+        assert!(view.dirty);
+        /*
+        The history section verifies Undo and Redo after all error paths.
+        Explicit cancel finally restores the original bytes and closes edit mode.
+        */
+        assert!(view.undo().unwrap());
+        assert_eq!((view.data.as_slice(), view.offset), (&original[..], 0));
+        assert!(view.editing);
+        assert!(!view.dirty);
+        assert!(view.redo().unwrap());
+        assert_eq!((view.data.as_slice(), view.offset), (&edited[..], 1));
+        assert!(view.editing);
+        assert!(view.dirty);
+        view.cancel_edit();
+        assert_eq!(view.data, original);
+        assert!(!view.editing);
+        assert!(!view.dirty);
     }
 
     /*

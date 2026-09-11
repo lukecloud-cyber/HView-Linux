@@ -1,4 +1,114 @@
+/*
+This module maps file offsets and runtime addresses for supported executable formats.
+The shared architecture contract gives decoder and assembler callers one validated source of machine facts.
+*/
 const OUTSIDE: &str = "Offset is out of file";
+
+/*
+Architecture identifies the instruction family and the effective code width.
+Each engine validates a directly constructed x86 value before it uses the width.
+*/
+#[allow(
+    dead_code,
+    reason = "L07.1 defines ARM architecture domains before L07.2 adds their engines."
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Architecture {
+    X86(u32),
+    Arm,
+    Thumb,
+    Arm64,
+}
+
+impl Architecture {
+    /*
+    This constructor accepts only widths that the x86 engines support.
+    Callers can use the remaining methods for bounded instruction and alignment decisions.
+    */
+    pub fn x86(bits: u32) -> Result<Self, String> {
+        matches!(bits, 16 | 32 | 64)
+            .then_some(Self::X86(bits))
+            .ok_or_else(|| "The x86 code width must be 16, 32, or 64 bits.".into())
+    }
+
+    /*
+    This fact returns the compatibility width used by existing Code display and session data.
+    X86 stores its checked width, ARM and Thumb use 32, and ARM64 uses 64.
+    */
+    pub const fn bits(self) -> u32 {
+        match self {
+            Self::X86(bits) => bits,
+            Self::Arm | Self::Thumb => 32,
+            Self::Arm64 => 64,
+        }
+    }
+
+    /*
+    This fact gives the required instruction-start alignment for each architecture family.
+    X86 permits each byte, ARM and ARM64 use four bytes, and Thumb uses two bytes.
+    */
+    #[allow(
+        dead_code,
+        reason = "L07.1 defines alignment before L07.2 adds aligned ARM callers."
+    )]
+    pub const fn alignment(self) -> u64 {
+        match self {
+            Self::X86(_) => 1,
+            Self::Arm | Self::Arm64 => 4,
+            Self::Thumb => 2,
+        }
+    }
+
+    /*
+    This fact bounds one native decoder input without selecting an engine.
+    X86 permits 15 bytes, while the recorded ARM families need at most four bytes.
+    */
+    pub const fn max_instruction_bytes(self) -> usize {
+        match self {
+            Self::X86(_) => 15,
+            Self::Arm | Self::Thumb | Self::Arm64 => 4,
+        }
+    }
+
+    /*
+    This fact validates a returned instruction length for the checked architecture family.
+    X86 uses 1 through 15 bytes, ARM and ARM64 use four, and Thumb uses two or four.
+    */
+    pub const fn valid_instruction_bytes(self, size: usize) -> bool {
+        match self {
+            Self::X86(_) => size >= 1 && size <= 15,
+            Self::Arm | Self::Arm64 => size == 4,
+            Self::Thumb => size == 2 || size == 4,
+        }
+    }
+}
+
+/*
+AddressDomain states how a CodeLocation address relates to the source bytes.
+Raw models and mapped PE bytes use virtual addresses, while plain sources use file offsets.
+*/
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddressDomain {
+    File,
+    Va,
+}
+
+/*
+CodeLocation joins one mapped address with its compatibility width, checked architecture, and address domain.
+Callers can retain all four fields or use the older tuple wrapper.
+*/
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CodeLocation {
+    pub address: u64,
+    pub bits: u32,
+    pub architecture: Architecture,
+    pub domain: AddressDomain,
+}
+
+/*
+These readers decode fixed-width PE fields after they validate the requested source range.
+Malformed input produces the existing executable-header error.
+*/
 
 fn word(data: &[u8], at: usize) -> Result<u16, String> {
     Ok(u16::from_le_bytes(
@@ -18,6 +128,10 @@ fn dword(data: &[u8], at: usize) -> Result<u32, String> {
     ))
 }
 
+/*
+Section stores one PE section mapping between file bytes and virtual extent.
+Pe combines validated header fields and sections for later address conversion.
+*/
 struct Section {
     rva: u32,
     raw: u32,
@@ -37,26 +151,38 @@ struct Pe {
     sections: Vec<Section>,
 }
 
+/*
+Raw stores the explicit runtime base and validated x86 architecture.
+Checked conversions protect both the 64-bit range and the selected linear-address range.
+*/
 #[derive(Clone, Copy)]
 struct Raw {
     base: u64,
-    bits: u32,
+    architecture: Architecture,
 }
 
 impl Raw {
+    /*
+    This conversion adds a file offset to the configured runtime base.
+    The selected x86 width limits the resulting linear address.
+    */
     fn address(self, offset: u64) -> Result<u64, String> {
         let address = self
             .base
             .checked_add(offset)
             .ok_or("The raw address exceeds the 64-bit address range.")?;
-        if self.bits != 64 && address > u64::from(u32::MAX) {
+        if self.architecture.bits() != 64 && address > u64::from(u32::MAX) {
             return Err("The raw address exceeds the 32-bit linear address range.".into());
         }
         Ok(address)
     }
 
+    /*
+    This reverse conversion subtracts the runtime base after width validation.
+    An address below the base has no raw file offset.
+    */
     fn offset(self, address: u64) -> Result<u64, String> {
-        if self.bits != 64 && address > u64::from(u32::MAX) {
+        if self.architecture.bits() != 64 && address > u64::from(u32::MAX) {
             return Err("The raw address exceeds the 32-bit linear address range.".into());
         }
         address
@@ -65,12 +191,24 @@ impl Raw {
     }
 }
 
+/*
+Metadata selects either parsed PE mapping or an explicit raw x86 mapping.
+Callers reuse the value for code addresses, navigation, and address conversion.
+*/
 pub struct Metadata {
     pe: Option<Pe>,
     raw: Option<Raw>,
 }
 
+/*
+These methods construct metadata and expose checked mapping operations.
+Each operation preserves the error that identifies an unsupported machine or missing byte.
+*/
 impl Metadata {
+    /*
+    This parser accepts current PE data and preserves the existing raw ELF fallback.
+    A malformed executable header stops metadata construction.
+    */
     pub fn parse(data: &[u8]) -> Result<Self, String> {
         if data.starts_with(b"\x7fELF") {
             return Ok(Self {
@@ -84,11 +222,14 @@ impl Metadata {
         Ok(Self { pe, raw: None })
     }
 
+    /*
+    This constructor validates an explicit raw x86 base and width.
+    It stores no parsed PE mapping.
+    */
     pub fn raw(base: u64, bits: u32) -> Result<Self, String> {
-        if !matches!(bits, 16 | 32 | 64) {
-            return Err("Raw x86 code width must be 16, 32, or 64 bits.".into());
-        }
-        let raw = Raw { base, bits };
+        let architecture = Architecture::x86(bits)
+            .map_err(|_| "Raw x86 code width must be 16, 32, or 64 bits.".to_owned())?;
+        let raw = Raw { base, architecture };
         raw.address(0)?;
         Ok(Self {
             pe: None,
@@ -96,20 +237,52 @@ impl Metadata {
         })
     }
 
-    pub fn code_address(&self, file_offset: u64) -> Result<(u64, u32), String> {
+    /*
+    This query returns an address, architecture, and domain for one existing code mapping.
+    It preserves PE mapping failures and unsupported machine errors.
+    */
+    pub fn code_location(&self, file_offset: u64) -> Result<CodeLocation, String> {
         if let Some(raw) = self.raw {
-            return raw.address(file_offset).map(|address| (address, raw.bits));
+            return Ok(CodeLocation {
+                address: raw.address(file_offset)?,
+                bits: raw.architecture.bits(),
+                architecture: raw.architecture,
+                domain: AddressDomain::Va,
+            });
         }
         self.validate_code_machine()?;
         match &self.pe {
             Some(pe) => pe
                 .file_to_virtual(file_offset)
-                .map(|address| (address, pe.bits))
+                .map(|address| CodeLocation {
+                    address,
+                    bits: pe.bits,
+                    architecture: Architecture::X86(pe.bits),
+                    domain: AddressDomain::Va,
+                })
                 .ok_or_else(|| OUTSIDE.into()),
-            None => Ok((file_offset, 16)),
+            None => Ok(CodeLocation {
+                address: file_offset,
+                bits: 16,
+                architecture: Architecture::X86(16),
+                domain: AddressDomain::File,
+            }),
         }
     }
 
+    /*
+    This compatibility wrapper preserves the existing address and width tuple.
+    New callers can retain the address domain when their operation requires it.
+    */
+    pub fn code_address(&self, file_offset: u64) -> Result<(u64, u32), String> {
+        let location = self.code_location(file_offset)?;
+        Ok((location.address, location.bits))
+    }
+
+    /*
+    This navigation query validates a source file byte before returning its runtime address.
+    PE sources require a mapped virtual address.
+    */
     pub fn navigation_address(&self, data: &[u8], file_offset: u64) -> Result<u64, String> {
         if let Some(raw) = self.raw {
             let offset = usize::try_from(file_offset)
@@ -131,6 +304,10 @@ impl Metadata {
             .ok_or_else(|| "The branch source is outside the current buffer.".into())
     }
 
+    /*
+    This navigation query maps a runtime address back to one source file byte.
+    Raw, PE, and plain sources retain their established bounds.
+    */
     pub fn navigation_offset(&self, data: &[u8], address: u64) -> Result<u64, String> {
         if let Some(raw) = self.raw {
             let offset = raw.offset(address)?;
@@ -154,6 +331,10 @@ impl Metadata {
             .ok_or_else(|| "The branch target is outside the current buffer.".into())
     }
 
+    /*
+    This general conversion returns all available raw or PE address domains.
+    Raw models reject RVA requests because they define no image-relative base.
+    */
     pub fn convert_address(
         &self,
         data: &[u8],
@@ -191,6 +372,10 @@ impl Metadata {
         }
     }
 
+    /*
+    This validation accepts only the existing x86 PE machine identifiers.
+    Later architecture goals own additional executable-machine support.
+    */
     fn validate_code_machine(&self) -> Result<(), String> {
         if let Some(pe) = &self.pe
             && !matches!(pe.machine, 332 | 34404)
@@ -201,8 +386,21 @@ impl Metadata {
     }
 }
 
+/*
+These PE methods retain the legacy parser and mapping arithmetic for existing code paths.
+The parsed sections remain immutable after construction.
+*/
 impl Pe {
+    /*
+    This parser reads legacy PE headers and section records from the supplied bytes.
+    It normalizes alignments and rejects incomplete tables or the specific header and first-section overlap.
+    It does not reject all invalid alignments or ambiguous section ranges.
+    */
     fn read(data: &[u8], header: usize) -> Result<Self, String> {
+        /*
+        The first section validates the COFF and optional headers.
+        It derives image geometry before section-table reads begin.
+        */
         let file_size =
             u32::try_from(data.len()).map_err(|_| "PE files above 4 GB are unsupported.")?;
         let count = usize::from(word(data, header + 6)?);
@@ -249,6 +447,10 @@ impl Pe {
         if data.get(table..table + count * 40).is_none() {
             return Err("The PE section table is incomplete.".into());
         }
+        /*
+        The second section normalizes each section range to the loader alignment.
+        Available source bytes limit the virtual extent used for code mapping.
+        */
         for index in 0..count {
             let at = table + index * 40;
             let virtual_size = dword(data, at + 8)?;
@@ -305,6 +507,10 @@ impl Pe {
         Ok(pe)
     }
 
+    /*
+    This helper uses a direct mapping shortcut when the legacy layout permits one.
+    Other layouts use the retained section and header mapping arithmetic.
+    */
     fn rva_to_file(&self, rva: u32) -> Option<u32> {
         if self.direct {
             return Some(rva);
@@ -322,6 +528,10 @@ impl Pe {
         (rva < self.header_size).then_some(rva)
     }
 
+    /*
+    This helper first tries an image-relative candidate, and then it tries the supplied value as an RVA.
+    Each candidate uses the retained legacy RVA mapper.
+    */
     fn virtual_to_file(&self, address: u64) -> Option<u32> {
         let rva = if address != u64::MAX && address >= self.image_base {
             address - self.image_base
@@ -340,6 +550,10 @@ impl Pe {
         None
     }
 
+    /*
+    This helper preserves the legacy direct, section, and header arithmetic for file-to-virtual mapping.
+    The helper uses stored ranges and wrapping address operations.
+    */
     fn file_to_virtual(&self, offset: u64) -> Option<u64> {
         if self.direct {
             return (offset < u64::from(self.upper_rva))
@@ -362,6 +576,10 @@ impl Pe {
     }
 }
 
+/*
+These constants name PE directories and bound browser table and string reads.
+The table and string limits are separate from the caller's final row cap.
+*/
 const DIRECTORY_NAMES: [&str; 16] = [
     "Export",
     "Import",
@@ -383,6 +601,10 @@ const DIRECTORY_NAMES: [&str; 16] = [
 const MAX_BROWSER_ENTRIES: usize = 100_000;
 const MAX_NAME_BYTES: usize = 4_096;
 
+/*
+AddressKind identifies the user input domain for general address conversion.
+PeAddress returns every domain that the selected source location can represent.
+*/
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AddressKind {
     File,
@@ -390,6 +612,10 @@ pub enum AddressKind {
     Va,
 }
 
+/*
+PeAddress contains each available file, RVA, and virtual-address result.
+An absent field identifies a valid partial mapping.
+*/
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PeAddress {
     pub file_offset: Option<usize>,
@@ -397,6 +623,10 @@ pub struct PeAddress {
     pub va: Option<u64>,
 }
 
+/*
+These browser records retain validated PE directory and section data for structure rows.
+The browser keeps display limits separate from file mapping validation.
+*/
 #[derive(Clone, Copy)]
 struct BrowserDirectory {
     rva: u32,
@@ -421,6 +651,10 @@ struct BrowserPe {
     directories: [Option<BrowserDirectory>; 16],
 }
 
+/*
+These fixed-width helpers validate PE browser ranges before they read little-endian values.
+Later import and export readers use the same checked arithmetic.
+*/
 fn browser_range(data: &[u8], at: usize, size: usize, what: &str) -> Result<(), String> {
     at.checked_add(size)
         .filter(|&end| end <= data.len())
@@ -443,6 +677,10 @@ fn browser_qword(data: &[u8], at: usize, what: &str) -> Result<u64, String> {
     Ok(u64::from_le_bytes(data[at..at + 8].try_into().unwrap()))
 }
 
+/*
+This helper escapes control and non-ASCII bytes for browser row text.
+The output does not change the source name or its file offset.
+*/
 fn escaped(bytes: &[u8]) -> String {
     let mut text = String::new();
     for &byte in bytes {
@@ -453,6 +691,10 @@ fn escaped(bytes: &[u8]) -> String {
     text
 }
 
+/*
+This helper checks one table count against the browser entry cap and byte-size arithmetic.
+The returned byte count does not limit the final display row count.
+*/
 fn checked_count(count: u32, unit: usize, what: &str) -> Result<usize, String> {
     let count = usize::try_from(count).map_err(|_| format!("The {what} count is too large."))?;
     if count > MAX_BROWSER_ENTRIES {
@@ -465,8 +707,20 @@ fn checked_count(count: u32, unit: usize, what: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("The {what} range exceeds the address range."))
 }
 
+/*
+BrowserPe validates its own PE browser map from current source bytes.
+Its methods resolve source-backed ranges before they create user-visible structure rows.
+*/
 impl BrowserPe {
+    /*
+    This parser validates browser-specific PE fields and section records.
+    The resulting map supports later directory, import, and export rows.
+    */
     fn parse(data: &[u8]) -> Result<Self, String> {
+        /*
+        The first section validates the DOS, COFF, and optional headers.
+        It obtains the address width and table bounds for later records.
+        */
         if data.len() > u32::MAX as usize {
             return Err("PE files above 4 GB are unsupported.".into());
         }
@@ -532,6 +786,10 @@ impl BrowserPe {
             return Err("The section table exceeds the declared PE headers.".into());
         }
 
+        /*
+        The directory section records complete nonzero directory ranges.
+        A half-empty directory entry cannot continue to section parsing.
+        */
         let mut directories = [None; 16];
         for (index, slot) in directories
             .iter_mut()
@@ -553,6 +811,10 @@ impl BrowserPe {
             *slot = Some(BrowserDirectory { rva, size });
         }
 
+        /*
+        The section-table section validates names, raw bytes, and virtual spans.
+        The next overlap check receives only complete section records.
+        */
         let mut sections = Vec::with_capacity(section_count);
         for index in 0..section_count {
             let at = table + index * 40;
@@ -597,6 +859,10 @@ impl BrowserPe {
             });
         }
 
+        /*
+        The overlap section rejects ambiguous raw or virtual mappings.
+        The final directory check then uses one unambiguous BrowserPe map.
+        */
         for (index, left) in sections.iter().enumerate() {
             for right in &sections[index + 1..] {
                 if ranges_overlap(left.raw, left.raw_size, right.raw, right.raw_size) {
@@ -613,6 +879,10 @@ impl BrowserPe {
             }
         }
 
+        /*
+        The final section validates every directory against the completed map.
+        Security uses a file offset, while other directories use RVAs.
+        */
         let pe = Self {
             bits,
             image_base,
@@ -638,6 +908,10 @@ impl BrowserPe {
         Ok(pe)
     }
 
+    /*
+    This helper adds one RVA to the current image base with PE width checks.
+    The supplied name identifies the failed structure when overflow occurs.
+    */
     fn va(&self, rva: u32, what: &str) -> Result<u64, String> {
         let va = self
             .image_base
@@ -651,6 +925,10 @@ impl BrowserPe {
         Ok(va)
     }
 
+    /*
+    This helper resolves a complete RVA range to file bytes.
+    Partial, virtual-only, and out-of-file ranges return an error.
+    */
     fn map_range(&self, data: &[u8], rva: u32, size: u32, what: &str) -> Result<usize, String> {
         if size == 0 {
             return Err(format!("The {what} range is empty."));
@@ -685,6 +963,10 @@ impl BrowserPe {
         Ok(file)
     }
 
+    /*
+    This helper returns a file byte when an RVA has current source data.
+    A valid virtual-only address returns no file byte.
+    */
     fn virtual_file(&self, data: &[u8], rva: u32, what: &str) -> Result<Option<usize>, String> {
         let mut result = None;
         if rva < self.header_size {
@@ -715,6 +997,10 @@ impl BrowserPe {
         result.ok_or_else(|| format!("The {what} RVA is outside the PE image."))
     }
 
+    /*
+    This helper returns an RVA when a current file byte belongs to the PE image.
+    Overlays and valid gaps return no RVA.
+    */
     fn file_rva(&self, data: &[u8], file: usize, what: &str) -> Result<Option<u32>, String> {
         browser_range(data, file, 1, what)?;
         let mut result = (file < self.header_size as usize).then_some(file as u32);
@@ -738,6 +1024,10 @@ impl BrowserPe {
         Ok(result)
     }
 
+    /*
+    This helper reads one bounded NUL-terminated string through an RVA mapping.
+    Escaping produces safe structure-row text without changing source bytes.
+    */
     fn string_at_rva(
         &self,
         data: &[u8],
@@ -779,6 +1069,10 @@ impl BrowserPe {
     }
 }
 
+/*
+This helper reports whether two nonempty 32-bit source ranges overlap.
+PE parsing uses the result to reject ambiguous section mappings.
+*/
 fn ranges_overlap(left: u32, left_size: u32, right: u32, right_size: u32) -> bool {
     if left_size == 0 || right_size == 0 {
         return false;
@@ -788,12 +1082,20 @@ fn ranges_overlap(left: u32, left_size: u32, right: u32, right_size: u32) -> boo
     left.start < right.end && right.start < left.end
 }
 
+/*
+This helper alone applies the caller-supplied display row cap.
+It preserves each accepted source offset and text pair.
+*/
 fn add_row(rows: &mut Vec<(usize, String)>, limit: usize, offset: usize, text: String) {
     if rows.len() < limit {
         rows.push((offset, text));
     }
 }
 
+/*
+This helper calculates one indexed table RVA with checked multiplication and addition.
+It also rejects values outside the PE 32-bit RVA range.
+*/
 fn indexed_rva(base: u32, index: usize, width: usize, what: &str) -> Result<u32, String> {
     let delta = index
         .checked_mul(width)
@@ -804,12 +1106,20 @@ fn indexed_rva(base: u32, index: usize, width: usize, what: &str) -> Result<u32,
     u32::try_from(value).map_err(|_| format!("The {what} RVA exceeds the PE address range."))
 }
 
+/*
+This reader walks validated import descriptors and their name or ordinal entries.
+Each result carries the file offset that the structure browser can select.
+*/
 fn import_rows(
     pe: &BrowserPe,
     data: &[u8],
     rows: &mut Vec<(usize, String)>,
     limit: usize,
 ) -> Result<(), String> {
+    /*
+    The first section validates the import directory and selects the thunk width.
+    Empty directories return without changing the row list.
+    */
     let Some(directory) = pe.directories[1] else {
         return Ok(());
     };
@@ -830,6 +1140,10 @@ fn import_rows(
     let mut descriptor_index = 0usize;
     let mut thunk_count = 0usize;
     let mut terminated = false;
+    /*
+    The descriptor loop validates each DLL name and lookup-table source.
+    It adds the descriptor row before its individual thunk rows.
+    */
     while descriptor_file < directory_end {
         if descriptor_file + 20 > directory_end {
             return Err("The import descriptor table ends with a partial descriptor.".into());
@@ -866,6 +1180,10 @@ fn import_rows(
         let fallback = lookup_rva == 0;
         let lookup_rva = if fallback { iat_rva } else { lookup_rva };
         let mut thunk_terminated = false;
+        /*
+        The thunk loop resolves each ordinal or name through checked file ranges.
+        A zero entry terminates the current DLL table.
+        */
         for index in 0..=MAX_BROWSER_ENTRIES {
             let lookup_entry_rva =
                 indexed_rva(lookup_rva, index, thunk_width, "import lookup entry")?;
@@ -968,12 +1286,20 @@ fn import_rows(
     Ok(())
 }
 
+/*
+This reader joins export functions, names, ordinals, and forwarders.
+Malformed indexes or strings stop the complete structure request with an error.
+*/
 fn export_rows(
     pe: &BrowserPe,
     data: &[u8],
     rows: &mut Vec<(usize, String)>,
     limit: usize,
 ) -> Result<(), String> {
+    /*
+    The first section validates the export header and its three index tables.
+    It also reads the module name for all output rows.
+    */
     let Some(directory) = pe.directories[0] else {
         return Ok(());
     };
@@ -1022,6 +1348,10 @@ fn export_rows(
             "export ordinal table",
         )?)
     };
+    /*
+    The name section joins each name pointer to its validated ordinal index.
+    Unnamed address entries keep an empty name list.
+    */
     let mut names = vec![Vec::<u32>::new(); address_count];
     for index in 0..name_count {
         let name_rva = browser_dword(data, name_file.unwrap() + index * 4, "export name pointer")?;
@@ -1037,6 +1367,10 @@ fn export_rows(
         names[ordinal_index].push(name_rva);
     }
 
+    /*
+    The row section resolves each nonzero target and detects forwarder strings.
+    It creates one row for each name or one ordinal-only row.
+    */
     let directory_end = u64::from(directory.rva) + u64::from(directory.size);
     for (index, entry_names) in names.iter().enumerate() {
         let entry_file = address_file.unwrap() + index * 4;
@@ -1093,10 +1427,17 @@ fn export_rows(
     Ok(())
 }
 
-/// Return checked, file-backed PE structures for the analysis browser.
+/*
+This entry point creates PE structure rows from current source bytes and applies the caller's row cap.
+It adds rows by category: sections, directories, imports, exports, and overlay.
+*/
 pub fn structures(data: &[u8], limit: usize) -> Result<Vec<(usize, String)>, String> {
     let pe = BrowserPe::parse(data)?;
     let mut rows = Vec::with_capacity(limit.min(1_024));
+    /*
+    The first section creates one row for each mapped or virtual-only section.
+    Each row carries a selectable source offset when source bytes exist.
+    */
     for section in &pe.sections {
         let name = if section.name.is_empty() {
             "<unnamed>"
@@ -1130,6 +1471,10 @@ pub fn structures(data: &[u8], limit: usize) -> Result<Vec<(usize, String)>, Str
             );
         }
     }
+    /*
+    The directory section keeps Security in its file-offset domain.
+    All other directories use the PE virtual map.
+    */
     for (index, directory) in pe.directories.iter().enumerate() {
         let Some(directory) = directory else {
             continue;
@@ -1158,9 +1503,17 @@ pub fn structures(data: &[u8], limit: usize) -> Result<Vec<(usize, String)>, Str
             );
         }
     }
+    /*
+    The table section appends imports and exports within the same row limit.
+    A table error stops the complete browser request.
+    */
     import_rows(&pe, data, &mut rows, limit)?;
     export_rows(&pe, data, &mut rows, limit)?;
 
+    /*
+    The final section finds bytes after all source-backed image ranges.
+    One overlay row identifies the remaining file data.
+    */
     let disk_end = pe
         .sections
         .iter()
@@ -1186,7 +1539,10 @@ pub fn structures(data: &[u8], limit: usize) -> Result<Vec<(usize, String)>, Str
     Ok(rows)
 }
 
-/// Convert one checked PE file offset, RVA, or preferred-base VA.
+/*
+This entry point converts a checked PE address through current source bytes.
+Partial mappings identify file gaps and virtual-only bytes without inventing unavailable domains.
+*/
 pub fn convert_address(data: &[u8], kind: AddressKind, value: u64) -> Result<PeAddress, String> {
     let pe = BrowserPe::parse(data)?;
     match kind {
@@ -1230,6 +1586,10 @@ pub fn convert_address(data: &[u8], kind: AddressKind, value: u64) -> Result<PeA
     }
 }
 
+/*
+This helper finds a PE signature through a checked DOS header offset.
+Plain data returns no PE header, while malformed executable headers return an error.
+*/
 fn pe_header(data: &[u8]) -> Result<Option<usize>, String> {
     if data.starts_with(b"\x7fELF") || data.starts_with(b"NetWare Loadable Module\x1a") {
         return Err("This executable format is unsupported.".into());
@@ -1257,6 +1617,10 @@ fn pe_header(data: &[u8]) -> Result<Option<usize>, String> {
     Ok(None)
 }
 
+/*
+This standalone entry query maps the current PE entry RVA to a file offset.
+Plain sources retain their existing zero entry, and DOS files retain their legacy entry calculation.
+*/
 pub fn entry_point(data: &[u8]) -> Result<u64, String> {
     if let Some(header) = pe_header(data)? {
         let pe = Pe::read(data, header)?;
@@ -1273,6 +1637,10 @@ pub fn entry_point(data: &[u8]) -> Result<u64, String> {
     Ok(0)
 }
 
+/*
+This standalone navigation wrapper maps one PE virtual address or RVA to a file offset.
+Plain-source behavior and existing mapping errors remain unchanged.
+*/
 pub fn virtual_to_file(data: &[u8], address: u64) -> Result<u64, String> {
     match pe_header(data)? {
         Some(header) => Pe::read(data, header)?
@@ -1283,14 +1651,31 @@ pub fn virtual_to_file(data: &[u8], address: u64) -> Result<u64, String> {
     }
 }
 
+/*
+This standalone tuple wrapper returns one current code address and compatibility width.
+Callers that need the address domain use code_location instead.
+*/
 pub fn code_address(data: &[u8], file_offset: u64) -> Result<(u64, u32), String> {
-    Metadata::parse(data)?.code_address(file_offset)
+    let location = code_location(data, file_offset)?;
+    Ok((location.address, location.bits))
+}
+
+/*
+This standalone helper parses the source and returns its complete CodeLocation.
+Callers that retain the domain can distinguish file offsets from virtual addresses.
+*/
+pub fn code_location(data: &[u8], file_offset: u64) -> Result<CodeLocation, String> {
+    Metadata::parse(data)?.code_location(file_offset)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /*
+    These fixture writers place little-endian values into preallocated PE buffers.
+    Each test controls the destination range through fixed fixture offsets.
+    */
     fn put_word(data: &mut [u8], offset: usize, value: u16) {
         data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
     }
@@ -1303,6 +1688,10 @@ mod tests {
         data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
     }
 
+    /*
+    This fixture creates a minimal mapped PE32 or PE32+ source.
+    Tests adjust selected header fields to exercise mapping errors.
+    */
     fn fixture(plus: bool) -> Vec<u8> {
         let mut data = vec![0; 1024];
         data[..2].copy_from_slice(b"MZ");
@@ -1333,6 +1722,10 @@ mod tests {
         data
     }
 
+    /*
+    This fixture adds browser directories, imports, exports, names, and an overlay.
+    The source keeps stable offsets for exact structure-row assertions.
+    */
     fn browser_fixture(plus: bool) -> Vec<u8> {
         let mut data = fixture(plus);
         data.resize(0x810, 0);
@@ -1391,6 +1784,10 @@ mod tests {
         data
     }
 
+    /*
+    This helper adds one virtual-only section to an existing browser fixture.
+    The returned section-table offset lets tests modify its fields.
+    */
     fn add_zero_raw_section(data: &mut [u8], plus: bool) -> usize {
         put_word(data, 134, 2);
         let second = 152 + if plus { 240 } else { 224 } + 40;
@@ -1401,6 +1798,12 @@ mod tests {
         second
     }
 
+    /*
+    This test checks PE32 and PE32+ entry and mapping vectors.
+    Stale metadata remains usable after machine bytes change.
+    A mapping request from newly parsed metadata rejects the changed machine.
+    Incomplete data remains an error.
+    */
     #[test]
     fn pe_mapping_vectors() {
         for plus in [false, true] {
@@ -1414,6 +1817,15 @@ mod tests {
             assert_eq!(virtual_to_file(&data, base + 128), Ok(128));
             assert_eq!(metadata.code_address(528), Ok((base + 4096 + 16, bits)));
             assert_eq!(metadata.code_address(128), Ok((base + 128, bits)));
+            assert_eq!(
+                metadata.code_location(528),
+                Ok(CodeLocation {
+                    address: base + 4096 + 16,
+                    bits,
+                    architecture: Architecture::X86(bits),
+                    domain: AddressDomain::Va,
+                })
+            );
             assert!(metadata.code_address(1024).is_err());
             assert_eq!(virtual_to_file(&data, 4607), Ok(1023));
             assert!(virtual_to_file(&data, 4608).is_err());
@@ -1444,11 +1856,24 @@ mod tests {
         assert_eq!(entry_point(&data), Ok(4096));
     }
 
+    /*
+    This test checks plain-source file locations and legacy non-PE entry behavior.
+    Malformed executable headers remain errors.
+    */
     #[test]
     fn raw_and_invalid_vectors() {
         assert_eq!(entry_point(b"raw bytes"), Ok(0));
         assert_eq!(virtual_to_file(b"raw bytes", 16), Ok(16));
         assert_eq!(code_address(b"raw bytes", 16), Ok((16, 16)));
+        assert_eq!(
+            code_location(b"raw bytes", 16),
+            Ok(CodeLocation {
+                address: 16,
+                bits: 16,
+                architecture: Architecture::X86(16),
+                domain: AddressDomain::File,
+            })
+        );
         assert_eq!(code_address(b"\x7fELF raw x86", 4), Ok((4, 16)));
         assert!(entry_point(b"\x7fELF").is_err());
         assert!(entry_point(b"MZ").is_err());
@@ -1460,6 +1885,10 @@ mod tests {
         assert_eq!(entry_point(&dos), Ok(82));
     }
 
+    /*
+    This test checks explicit raw virtual addresses for every supported x86 width.
+    The raw model overrides PE metadata and has no RVA domain.
+    */
     #[test]
     fn explicit_raw_metadata_overrides_pe_and_maps_all_x86_widths() {
         let data = fixture(false);
@@ -1473,6 +1902,15 @@ mod tests {
         ] {
             let metadata = Metadata::raw(base, bits).unwrap();
             assert_eq!(metadata.code_address(0x210), Ok((base + 0x210, bits)));
+            assert_eq!(
+                metadata.code_location(0x210),
+                Ok(CodeLocation {
+                    address: base + 0x210,
+                    bits,
+                    architecture: Architecture::X86(bits),
+                    domain: AddressDomain::Va,
+                })
+            );
             assert_eq!(metadata.navigation_address(&data, 0), Ok(base));
             assert_eq!(metadata.navigation_offset(&data, base), Ok(0));
             assert_eq!(
@@ -1499,6 +1937,47 @@ mod tests {
         }
     }
 
+    /*
+    This test checks shared architecture widths, alignment, and instruction-size limits.
+    These facts do not enable the unsupported ARM decoder and assembler engines.
+    */
+    #[test]
+    fn architecture_contract_validates_widths_alignment_and_lengths() {
+        for bits in [16, 32, 64] {
+            let architecture = Architecture::x86(bits).unwrap();
+            assert_eq!(architecture.bits(), bits);
+            assert_eq!(architecture.alignment(), 1);
+            assert_eq!(architecture.max_instruction_bytes(), 15);
+            assert!(architecture.valid_instruction_bytes(1));
+            assert!(architecture.valid_instruction_bytes(15));
+            assert!(!architecture.valid_instruction_bytes(0));
+            assert!(!architecture.valid_instruction_bytes(16));
+        }
+        assert!(Architecture::x86(8).is_err());
+        assert_eq!(
+            (Architecture::Arm.bits(), Architecture::Arm.alignment()),
+            (32, 4)
+        );
+        assert_eq!(
+            (Architecture::Thumb.bits(), Architecture::Thumb.alignment()),
+            (32, 2)
+        );
+        assert_eq!(
+            (Architecture::Arm64.bits(), Architecture::Arm64.alignment()),
+            (64, 4)
+        );
+        assert!(Architecture::Arm.valid_instruction_bytes(4));
+        assert!(!Architecture::Arm.valid_instruction_bytes(2));
+        assert!(Architecture::Thumb.valid_instruction_bytes(2));
+        assert!(Architecture::Thumb.valid_instruction_bytes(4));
+        assert!(!Architecture::Thumb.valid_instruction_bytes(3));
+        assert!(Architecture::Arm64.valid_instruction_bytes(4));
+    }
+
+    /*
+    This test checks raw width validation, address overflow, and current file bounds.
+    Failed operations return before a caller can use an invalid model.
+    */
     #[test]
     fn explicit_raw_metadata_checks_width_overflow_and_file_bounds() {
         assert!(Metadata::raw(0, 8).is_err());
@@ -1542,6 +2021,10 @@ mod tests {
         );
     }
 
+    /*
+    This test maps equivalent file, RVA, and virtual addresses for PE32 and PE32+.
+    Boundary values outside the mapped section remain errors.
+    */
     #[test]
     fn checked_address_conversion_maps_pe32_and_pe32_plus() {
         for plus in [false, true] {
@@ -1596,6 +2079,10 @@ mod tests {
         }
     }
 
+    /*
+    This test checks navigation through mapped PE, raw, and current ELF-fallback sources.
+    It preserves source bounds and unsupported PE-machine errors.
+    */
     #[test]
     fn code_navigation_uses_checked_pe_raw_and_elf_mappings() {
         for plus in [false, true] {
@@ -1654,6 +2141,10 @@ mod tests {
         );
     }
 
+    /*
+    This test reports file gaps, overlays, and virtual-only PE bytes as partial mappings.
+    No unavailable address domain receives an invented value.
+    */
     #[test]
     fn checked_address_conversion_reports_partial_mappings() {
         let mut gap = fixture(false);
@@ -1714,6 +2205,10 @@ mod tests {
         assert!(convert_address(&zero_fill, AddressKind::Rva, 0x2200).is_err());
     }
 
+    /*
+    This test rejects offsets, counts, and overlapping ranges that make PE mappings ambiguous.
+    Each error identifies the invalid mapping class.
+    */
     #[test]
     fn checked_address_conversion_rejects_invalid_ranges() {
         let data = fixture(false);
@@ -1772,6 +2267,10 @@ mod tests {
         );
     }
 
+    /*
+    This test reads the current image base and checks virtual-address addition.
+    PE32 and PE32+ overflow returns an error.
+    */
     #[test]
     fn checked_address_conversion_uses_current_image_base_and_checks_va_overflow() {
         let mut changed = fixture(false);
@@ -1801,6 +2300,10 @@ mod tests {
         );
     }
 
+    /*
+    This test lists bounded PE32 and PE32+ browser rows with stable source offsets.
+    It checks sections, directories, imports, exports, forwarders, and overlays.
+    */
     #[test]
     fn pe_browser_lists_checked_pe32_and_pe32_plus_structures() {
         assert_eq!(escaped(b"A\n\x1b"), r"A\n\x1b");
@@ -1831,6 +2334,10 @@ mod tests {
         }
     }
 
+    /*
+    This test labels IAT fallback entries and sections without file bytes.
+    The browser retains source offsets for selectable records.
+    */
     #[test]
     fn pe_browser_labels_iat_fallback_and_virtual_only_bytes() {
         for plus in [false, true] {
@@ -1856,6 +2363,10 @@ mod tests {
         }
     }
 
+    /*
+    This test rejects malformed browser ranges, counts, ordinals, and strings.
+    The complete structure request stops at the first invalid record.
+    */
     #[test]
     fn pe_browser_rejects_malformed_ranges_counts_and_strings() {
         let mut cases = Vec::new();
@@ -1905,6 +2416,10 @@ mod tests {
         );
     }
 
+    /*
+    This test reads the tracked native DLL fixtures through the PE structure browser.
+    The expected Capstone and Keystone exports prove that import and export rows remain available.
+    */
     #[test]
     fn pe_browser_reads_tracked_native_dlls() {
         for (name, export) in [

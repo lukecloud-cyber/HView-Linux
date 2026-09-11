@@ -1,13 +1,50 @@
+/*
+This module validates one instruction and assembles it through the pinned Keystone interface.
+The architecture boundary rejects unsupported engines before the native library opens.
+*/
+use crate::format::Architecture;
 use crate::native::Library;
 use std::ffi::{CStr, CString, c_char, c_void};
 
+/*
+This compatibility wrapper converts an existing x86 width into the shared architecture contract.
+The architecture entry point performs the final engine-boundary validation.
+*/
+#[allow(
+    dead_code,
+    reason = "The x86 width wrapper remains for compatibility callers."
+)]
 pub fn assemble(text: &str, bits: u32, address: u64) -> Result<Vec<u8>, String> {
-    let mode = match bits {
-        16 => 2,
-        32 => 4,
-        64 => 8,
-        _ => return Err("The assembler supports only 16, 32, or 64 bits.".into()),
+    let architecture = Architecture::x86(bits)
+        .map_err(|_| "The assembler supports only 16, 32, or 64 bits.".to_owned())?;
+    assemble_architecture(text, architecture, address)
+}
+
+/*
+This entry point validates the architecture and prepares one x86 Keystone request.
+L07.2 owns ARM and Thumb engines, and ARM64 assembly remains unsupported.
+*/
+pub fn assemble_architecture(
+    text: &str,
+    architecture: Architecture,
+    address: u64,
+) -> Result<Vec<u8>, String> {
+    let (mode, bits) = match architecture {
+        Architecture::X86(16) => (2, 16),
+        Architecture::X86(32) => (4, 32),
+        Architecture::X86(64) => (8, 64),
+        Architecture::X86(_) => {
+            return Err("The assembler supports only 16, 32, or 64 bits.".into());
+        }
+        Architecture::Arm => return Err("ARM assembly is unsupported.".into()),
+        Architecture::Thumb => return Err("Thumb assembly is unsupported.".into()),
+        Architecture::Arm64 => return Err("ARM64 assembly is unsupported.".into()),
     };
+
+    /*
+    The input checks preserve the ASCII, length, and single-instruction contract.
+    Compatibility normalization happens before the text enters Keystone.
+    */
     let text = text.trim();
     if text.is_empty() || !text.is_ascii() || text.len() > 350 || text.contains(['\n', '\r', ';']) {
         return Err("Enter one ASCII instruction with no more than 350 characters.".into());
@@ -22,6 +59,10 @@ pub fn assemble(text: &str, bits: u32, address: u64) -> Result<Vec<u8>, String> 
     };
     let instruction =
         CString::new(normalized).map_err(|_| "The instruction contains a NUL byte.")?;
+    /*
+    The loader resolves the fixed Keystone 0.9.2 ABI from the normal Linux library path.
+    Each symbol keeps its native signature for the request below.
+    */
     let library = Library::open("libkeystone.so")?;
     macro_rules! symbol {
         ($name:literal, $kind:ty) => {{
@@ -69,6 +110,10 @@ pub fn assemble(text: &str, bits: u32, address: u64) -> Result<Vec<u8>, String> 
     if unsafe { open(4, mode, &mut engine) } != 0 {
         return Err("Cannot initialize the x86 assembler.".into());
     }
+    /*
+    Keystone assembles one instruction with Intel syntax and hexadecimal-number support.
+    Output validation rejects malformed native results before Rust copies the bytes.
+    */
     let mut bytes = std::ptr::null_mut();
     let (mut size, mut count) = (0, 0);
     let result = if unsafe { option(engine, 1, 33) } != 0 {
@@ -93,11 +138,14 @@ pub fn assemble(text: &str, bits: u32, address: u64) -> Result<Vec<u8>, String> 
                 unsafe { CStr::from_ptr(message) }.to_string_lossy()
             )
         })
-    } else if bytes.is_null() || count != 1 || !(1..=15).contains(&size) {
+    } else if bytes.is_null() || count != 1 || !architecture.valid_instruction_bytes(size) {
         Err("The assembler did not produce one valid x86 instruction.".into())
     } else {
         let mut output = unsafe { std::slice::from_raw_parts(bytes, size) }.to_vec();
-        // HView preserves the one-byte INT 3 encoding and the 16-bit near return.
+        /*
+        Compatibility normalization preserves one-byte INT 3 and the 16-bit near return.
+        These replacements happen after Keystone produces one valid x86 instruction.
+        */
         if output == [0xcd, 3] {
             output = vec![0xcc];
         }
@@ -106,6 +154,10 @@ pub fn assemble(text: &str, bits: u32, address: u64) -> Result<Vec<u8>, String> 
         }
         Ok(output)
     };
+    /*
+    Cleanup releases native output and the engine for all result paths.
+    The returned vector owns its bytes after cleanup completes.
+    */
     unsafe {
         if !bytes.is_null() {
             free(bytes);
@@ -118,6 +170,11 @@ pub fn assemble(text: &str, bits: u32, address: u64) -> Result<Vec<u8>, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /*
+    This test preserves established x86 vectors and input errors.
+    It also checks direct invalid variants and unsupported architecture families.
+    */
     #[test]
     fn assembler_vectors_and_errors() {
         assert_eq!(assemble("int 3", 16, 0).unwrap(), [0xcc]);
@@ -130,5 +187,9 @@ mod tests {
             assert!(assemble(text, 32, 0).is_err());
         }
         assert!(assemble("nop", 8, 0).is_err());
+        assert!(assemble_architecture("nop", Architecture::X86(8), 0).is_err());
+        for architecture in [Architecture::Arm, Architecture::Thumb, Architecture::Arm64] {
+            assert!(assemble_architecture("nop", architecture, 0).is_err());
+        }
     }
 }
