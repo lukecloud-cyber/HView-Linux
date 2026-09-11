@@ -8,6 +8,23 @@ const OUTSIDE: &str = "Offset is out of file";
 const IMAGE_FILE_MACHINE_ARM: u16 = 0x01c0;
 const IMAGE_FILE_MACHINE_THUMB: u16 = 0x01c2;
 const IMAGE_FILE_MACHINE_ARMNT: u16 = 0x01c4;
+const EM_ARM: u16 = 40;
+
+/*
+These ELF limits match the supported little-endian header forms and bound all metadata work.
+The entry limits protect allocation, and the byte limit protects paged program-table reads.
+*/
+const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
+const ELF32_HEADER_SIZE: usize = 52;
+const ELF64_HEADER_SIZE: usize = 64;
+const ELF32_PROGRAM_SIZE: usize = 32;
+const ELF64_PROGRAM_SIZE: usize = 56;
+const ELF32_SECTION_SIZE: usize = 40;
+const ELF64_SECTION_SIZE: usize = 64;
+const ELF_MAX_ENTRIES: usize = 100_000;
+const ELF_MAX_LOAD_SEGMENTS: usize = 256;
+const ELF_MAX_PROGRAM_BYTES: u64 = 8 * 1024 * 1024;
+const ELF_RESERVED_INDEX_START: usize = 0xff00;
 
 /*
 Architecture identifies the instruction family and the effective code width.
@@ -99,7 +116,7 @@ impl Architecture {
 
 /*
 AddressDomain states how a CodeLocation address relates to the source bytes.
-Raw models and mapped PE bytes use virtual addresses, while plain sources use file offsets.
+Raw models and mapped executable bytes use virtual addresses, while unmapped source bytes use file offsets.
 */
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AddressDomain {
@@ -120,7 +137,7 @@ pub struct CodeLocation {
 }
 
 /*
-These readers decode fixed-width PE fields after they validate the requested source range.
+These readers decode fixed-width executable fields after they validate the requested source range.
 Malformed input produces the existing executable-header error.
 */
 
@@ -149,6 +166,22 @@ fn dword(data: &[u8], at: usize) -> Result<u32, String> {
 }
 
 /*
+This reader decodes one little-endian 64-bit ELF or PE field after a checked range lookup.
+The later parser gives the field a format-specific error when the enclosing range is invalid.
+*/
+fn qword(data: &[u8], at: usize) -> Result<u64, String> {
+    let end = at
+        .checked_add(8)
+        .ok_or("The executable header range exceeds the address range.")?;
+    Ok(u64::from_le_bytes(
+        data.get(at..end)
+            .ok_or("The executable header is incomplete.")?
+            .try_into()
+            .unwrap(),
+    ))
+}
+
+/*
 Section stores exact PE file and virtual ranges from one section-table record.
 Pe combines validated header fields, sections, and logical file length for later address conversion.
 */
@@ -166,6 +199,47 @@ struct Pe {
     image_base: u64,
     header_size: u32,
     sections: Vec<Section>,
+    file_len: u64,
+}
+
+/*
+ElfHeader stores the resolved ELF header counts and table geometry.
+ElfSegment stores one PT_LOAD map or one browser program header with its original table location.
+*/
+#[derive(Clone, Copy)]
+struct ElfHeader {
+    bits: u32,
+    file_type: u16,
+    machine: u16,
+    entry: u64,
+    program_offset: u64,
+    section_offset: u64,
+    program_size: usize,
+    program_count: usize,
+    section_size: usize,
+    section_count: usize,
+    section_names: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ElfSegment {
+    header: u64,
+    segment_type: u32,
+    flags: u32,
+    offset: u64,
+    address: u64,
+    file_size: u64,
+    memory_size: u64,
+    align: u64,
+}
+
+/*
+Elf joins the checked header, PT_LOAD mappings, and logical file length.
+Buffered and paged constructors create the same record before address callers use it.
+*/
+struct Elf {
+    header: ElfHeader,
+    segments: Vec<ElfSegment>,
     file_len: u64,
 }
 
@@ -211,11 +285,12 @@ impl Raw {
 }
 
 /*
-Metadata selects either parsed PE mapping or an explicit raw architecture mapping.
+Metadata selects parsed ELF or PE mapping, plain-file behavior, or an explicit raw architecture mapping.
 Callers reuse the value for code addresses, navigation, and address conversion.
 */
 pub struct Metadata {
     pe: Option<Pe>,
+    elf: Option<Elf>,
     raw: Option<Raw>,
     file_len: Option<u64>,
     entry_offset: Option<u64>,
@@ -227,28 +302,35 @@ Each operation preserves the error that identifies an unsupported machine or mis
 */
 impl Metadata {
     /*
-    This parser accepts current PE data and preserves the existing raw ELF fallback.
+    This parser selects checked ELF or PE metadata from current buffered bytes.
     A malformed executable header stops metadata construction.
     */
     pub fn parse(data: &[u8]) -> Result<Self, String> {
-        if data.starts_with(b"\x7fELF") {
-            return Ok(Self {
-                pe: None,
-                raw: None,
-                file_len: Some(data.len() as u64),
-                entry_offset: Some(0),
-            });
-        }
-        let pe = pe_header(data)?
-            .map(|header| Pe::read(data, header))
+        let elf = data
+            .starts_with(ELF_MAGIC)
+            .then(|| Elf::read(data))
             .transpose()?;
-        let entry_offset = match &pe {
-            Some(pe) => pe.rva_to_file(pe.entry),
-            None if data.starts_with(b"MZ") || data.starts_with(b"ZM") => Some(dos_entry(data)?),
-            None => Some(0),
+        let pe = if elf.is_none() {
+            pe_header(data)?
+                .map(|header| Pe::read(data, header))
+                .transpose()?
+        } else {
+            None
+        };
+        let entry_offset = if let Some(elf) = &elf {
+            elf.entry_offset()?
+        } else {
+            match &pe {
+                Some(pe) => pe.rva_to_file(pe.entry),
+                None if data.starts_with(b"MZ") || data.starts_with(b"ZM") => {
+                    Some(dos_entry(data)?)
+                }
+                None => Some(0),
+            }
         };
         Ok(Self {
             pe,
+            elf,
             raw: None,
             file_len: Some(data.len() as u64),
             entry_offset,
@@ -256,16 +338,28 @@ impl Metadata {
     }
 
     /*
-    This parser reads only bounded PE header ranges from current paged logical bytes.
-    A distant header does not allocate or read the bytes between the prefix and that header.
+    This parser reads bounded ELF or PE metadata from current paged logical bytes.
+    Distant tables do not allocate or read the bytes before each requested range.
     */
     pub(crate) fn read_from(file: &PagedFile) -> Result<Self, String> {
         let prefix_len = usize::try_from(file.len().min(64)).unwrap();
         let prefix = file
             .read_window(0, prefix_len)
             .map_err(|error| error.to_string())?;
-        let header = paged_pe_header(file, &prefix.bytes)?;
-        if header.is_none() && !prefix.bytes.starts_with(b"MZ") && !prefix.bytes.starts_with(b"ZM")
+        let elf = prefix
+            .bytes
+            .starts_with(ELF_MAGIC)
+            .then(|| Elf::read_from(file, &prefix.bytes))
+            .transpose()?;
+        let header = if elf.is_none() {
+            paged_pe_header(file, &prefix.bytes)?
+        } else {
+            None
+        };
+        if elf.is_none()
+            && header.is_none()
+            && !prefix.bytes.starts_with(b"MZ")
+            && !prefix.bytes.starts_with(b"ZM")
         {
             return Err(
                 "Virtual and entry-point offsets are unavailable for large files. HView-Linux will use file offset zero."
@@ -275,16 +369,21 @@ impl Metadata {
         let pe = header
             .map(|offset| Pe::read_from(file, offset))
             .transpose()?;
-        let entry_offset = match &pe {
-            Some(pe) => pe.rva_to_file(pe.entry),
-            None if prefix.bytes.starts_with(b"MZ") || prefix.bytes.starts_with(b"ZM") => {
-                Some(dos_entry(&prefix.bytes)?)
+        let entry_offset = if let Some(elf) = &elf {
+            elf.entry_offset()?
+        } else {
+            match &pe {
+                Some(pe) => pe.rva_to_file(pe.entry),
+                None if prefix.bytes.starts_with(b"MZ") || prefix.bytes.starts_with(b"ZM") => {
+                    Some(dos_entry(&prefix.bytes)?)
+                }
+                None => Some(0),
             }
-            None => Some(0),
         };
         file.validate().map_err(|error| error.to_string())?;
         Ok(Self {
             pe,
+            elf,
             raw: None,
             file_len: Some(file.len()),
             entry_offset,
@@ -304,7 +403,7 @@ impl Metadata {
 
     /*
     This constructor validates one explicit raw architecture and its base address.
-    Raw metadata takes priority because the constructor stores no parsed PE mapping.
+    Raw metadata takes priority because the constructor stores no parsed executable mapping.
     */
     pub fn raw_architecture(base: u64, architecture: Architecture) -> Result<Self, String> {
         if let Architecture::X86(bits) = architecture {
@@ -314,6 +413,7 @@ impl Metadata {
         raw.address(0)?;
         Ok(Self {
             pe: None,
+            elf: None,
             raw: Some(raw),
             file_len: None,
             entry_offset: Some(0),
@@ -322,7 +422,7 @@ impl Metadata {
 
     /*
     This query returns an address, architecture, and domain for one existing code mapping.
-    PE gaps and overlays keep their file address so Code display can show each source byte.
+    ELF and PE gaps keep their file address so Code display can show each source byte.
     */
     pub fn code_location(&self, file_offset: u64) -> Result<CodeLocation, String> {
         if self.file_len.is_some_and(|len| file_offset >= len) {
@@ -339,6 +439,23 @@ impl Metadata {
         if let Some(pe) = &self.pe {
             let architecture = pe.architecture()?;
             return Ok(match pe.file_to_virtual(file_offset) {
+                Some(address) => CodeLocation {
+                    address,
+                    bits: architecture.bits(),
+                    architecture,
+                    domain: AddressDomain::Va,
+                },
+                None => CodeLocation {
+                    address: file_offset,
+                    bits: architecture.bits(),
+                    architecture,
+                    domain: AddressDomain::File,
+                },
+            });
+        }
+        if let Some(elf) = &self.elf {
+            let architecture = elf.architecture()?;
+            return Ok(match elf.file_to_virtual(file_offset)? {
                 Some(address) => CodeLocation {
                     address,
                     bits: architecture.bits(),
@@ -371,15 +488,26 @@ impl Metadata {
                 .address(file_offset)
                 .map(|address| (address, raw.architecture.bits()));
         }
-        match &self.pe {
-            Some(pe) => {
-                let architecture = pe.architecture()?;
-                pe.file_to_virtual(file_offset)
-                    .map(|address| (address, architecture.bits()))
-                    .ok_or_else(|| OUTSIDE.into())
-            }
-            None => Ok((file_offset, 16)),
+        if let Some(pe) = &self.pe {
+            let architecture = pe.architecture()?;
+            return pe
+                .file_to_virtual(file_offset)
+                .map(|address| (address, architecture.bits()))
+                .ok_or_else(|| OUTSIDE.into());
         }
+        if let Some(elf) = &self.elf {
+            let architecture = elf.architecture()?;
+            if elf.header.file_type == 1 {
+                return (file_offset < elf.file_len)
+                    .then_some((file_offset, architecture.bits()))
+                    .ok_or_else(|| OUTSIDE.into());
+            }
+            return elf
+                .file_to_virtual(file_offset)?
+                .map(|address| (address, architecture.bits()))
+                .ok_or_else(|| OUTSIDE.into());
+        }
+        Ok((file_offset, 16))
     }
 
     /*
@@ -401,12 +529,20 @@ impl Metadata {
                 Architecture::X86(_) => Architecture::x86(fallback_bits),
             };
         }
+        if let Some(elf) = &self.elf {
+            return match elf.architecture()? {
+                architecture @ (Architecture::Arm | Architecture::Thumb | Architecture::Arm64) => {
+                    Ok(architecture)
+                }
+                Architecture::X86(_) => Architecture::x86(fallback_bits),
+            };
+        }
         Architecture::x86(fallback_bits)
     }
 
     /*
     This navigation query validates a source file byte before returning its runtime address.
-    PE sources require a mapped virtual address.
+    Mapped executable sources require a virtual address, while ELF relocatable sources use file offsets.
     */
     #[cfg(test)]
     pub fn navigation_address(&self, data: &[u8], file_offset: u64) -> Result<u64, String> {
@@ -427,6 +563,18 @@ impl Metadata {
                 .file_to_virtual(file_offset)
                 .ok_or_else(|| "The branch source has no virtual address.".into());
         }
+        if let Some(elf) = &self.elf {
+            let offset = usize::try_from(file_offset)
+                .map_err(|_| "The branch source exceeds the address range.")?;
+            data.get(offset)
+                .ok_or("The branch source is outside the current buffer.")?;
+            if elf.header.file_type == 1 {
+                return Ok(file_offset);
+            }
+            return elf
+                .file_to_virtual(file_offset)?
+                .ok_or_else(|| "The branch source has no virtual address.".into());
+        }
         if data.starts_with(b"MZ") || data.starts_with(b"ZM") {
             return convert_address(data, AddressKind::File, file_offset)?
                 .va
@@ -441,7 +589,7 @@ impl Metadata {
 
     /*
     This navigation query maps a runtime address back to one source file byte.
-    Raw, PE, and plain sources retain their established bounds.
+    Raw, ELF, PE, and plain sources retain their established bounds.
     */
     #[cfg(test)]
     pub fn navigation_offset(&self, data: &[u8], address: u64) -> Result<u64, String> {
@@ -457,6 +605,23 @@ impl Metadata {
             pe.architecture()?;
             let offset = pe
                 .va_to_file(address)
+                .ok_or("The branch target has no file byte.")?;
+            let index = usize::try_from(offset)
+                .map_err(|_| "The branch target exceeds the address range.")?;
+            data.get(index)
+                .ok_or("The branch target is outside the current buffer.")?;
+            return Ok(offset);
+        }
+        if let Some(elf) = &self.elf {
+            if elf.header.file_type == 1 {
+                let index = usize::try_from(address)
+                    .map_err(|_| "The branch target exceeds the address range.")?;
+                data.get(index)
+                    .ok_or("The branch target is outside the current buffer.")?;
+                return Ok(address);
+            }
+            let offset = elf
+                .virtual_to_file(address)?
                 .ok_or("The branch target has no file byte.")?;
             let index = usize::try_from(offset)
                 .map_err(|_| "The branch target exceeds the address range.")?;
@@ -490,6 +655,8 @@ impl Metadata {
                     raw.offset(target)?
                 } else if let Some(pe) = &self.pe {
                     pe.va_to_file(target).ok_or(OUTSIDE)?
+                } else if let Some(elf) = &self.elf {
+                    elf.virtual_to_file(target)?.ok_or(OUTSIDE)?
                 } else {
                     return Err("The file has no virtual address mapping.".into());
                 }
@@ -503,7 +670,7 @@ impl Metadata {
 
     /*
     This compatibility conversion accepts either an RVA or a preferred-base VA for PE startup input.
-    Two different valid mappings make the input ambiguous and produce an error.
+    ELF accepts only a strict VA, while two different PE mappings produce an ambiguity error.
     */
     pub(crate) fn legacy_virtual_offset(&self, value: u64) -> Result<u64, String> {
         if self.raw.is_some() {
@@ -511,6 +678,9 @@ impl Metadata {
         }
         if let Some(pe) = &self.pe {
             return pe.legacy_virtual_to_file(value);
+        }
+        if let Some(elf) = &self.elf {
+            return elf.virtual_to_file(value)?.ok_or_else(|| OUTSIDE.into());
         }
         self.target_offset(AddressDomain::File, value)
     }
@@ -526,17 +696,35 @@ impl Metadata {
     }
 
     /*
-    This label identifies parsed PE metadata for paged startup and focused checks.
+    This label identifies parsed ELF or PE metadata for paged startup and focused checks.
     Raw and plain sources keep their existing display behavior.
     */
     pub(crate) fn format_label(&self) -> Option<&'static str> {
         self.raw
             .map(|_| "RAW")
             .or_else(|| self.pe.as_ref().map(|_| "PE"))
+            .or_else(|| self.elf.as_ref().map(|_| "ELF"))
     }
 
     /*
-    This general conversion returns all available raw or PE address domains.
+    These capability facts let the address tool offer only domains that the selected metadata supports.
+    ELF relocatable files have no VA, and all ELF forms have no RVA.
+    */
+    pub(crate) fn has_rva(&self) -> bool {
+        self.pe.is_some()
+    }
+
+    pub(crate) fn has_va(&self) -> bool {
+        self.raw.is_some()
+            || self.pe.is_some()
+            || self
+                .elf
+                .as_ref()
+                .is_some_and(|elf| elf.header.file_type != 1)
+    }
+
+    /*
+    This general conversion returns all available raw, ELF, or PE address domains.
     Raw models reject RVA requests because they define no image-relative base.
     */
     pub fn convert_address(
@@ -546,7 +734,11 @@ impl Metadata {
         value: u64,
     ) -> Result<PeAddress, String> {
         let Some(raw) = self.raw else {
-            return convert_address(data, kind, value);
+            return if let Some(elf) = &self.elf {
+                elf.convert_address(kind, value, Some(data.len() as u64))
+            } else {
+                convert_address(data, kind, value)
+            };
         };
         match kind {
             AddressKind::File => {
@@ -984,6 +1176,929 @@ fn dos_entry(data: &[u8]) -> Result<u64, String> {
 }
 
 /*
+ElfHeader parses the fixed ELF header and resolves standard or extended table counts.
+The resolved record gives both buffered and paged readers the same checked table geometry.
+*/
+impl ElfHeader {
+    fn parse(data: &[u8], file_len: u64) -> Result<Self, String> {
+        /*
+        The identification section selects a supported class, byte order, and ELF version.
+        The complete fixed header must exist before later fields are read.
+        */
+        if !data.starts_with(ELF_MAGIC) {
+            return Err("The file is not an ELF file.".into());
+        }
+        let bits = match data.get(4) {
+            Some(1) => 32,
+            Some(2) => 64,
+            Some(_) => return Err("The ELF class is unsupported.".into()),
+            None => return Err("The ELF identification is incomplete.".into()),
+        };
+        match data.get(5) {
+            Some(1) => {}
+            Some(2) => return Err("Big-endian ELF files are unsupported.".into()),
+            Some(_) => return Err("The ELF byte order is unsupported.".into()),
+            None => return Err("The ELF identification is incomplete.".into()),
+        }
+        if data.get(6) != Some(&1) {
+            return Err("The ELF identification version is unsupported.".into());
+        }
+        let expected_header = if bits == 32 {
+            ELF32_HEADER_SIZE
+        } else {
+            ELF64_HEADER_SIZE
+        };
+        if data.len() < expected_header || file_len < expected_header as u64 {
+            return Err("The ELF header is incomplete.".into());
+        }
+
+        /*
+        The common section accepts relocatable, executable, and shared-object images only.
+        Class-specific offsets then select the entry and table fields.
+        */
+        let file_type = word(data, 16)?;
+        if !matches!(file_type, 1..=3) {
+            return Err("The ELF file type is unsupported.".into());
+        }
+        if dword(data, 20)? != 1 {
+            return Err("The ELF header version is unsupported.".into());
+        }
+        let (
+            entry,
+            program_offset,
+            section_offset,
+            header_size_at,
+            program_size_at,
+            program_count_at,
+            section_size_at,
+            section_count_at,
+            section_names_at,
+        ) = if bits == 32 {
+            (
+                u64::from(dword(data, 24)?),
+                u64::from(dword(data, 28)?),
+                u64::from(dword(data, 32)?),
+                40,
+                42,
+                44,
+                46,
+                48,
+                50,
+            )
+        } else {
+            (
+                qword(data, 24)?,
+                qword(data, 32)?,
+                qword(data, 40)?,
+                52,
+                54,
+                56,
+                58,
+                60,
+                62,
+            )
+        };
+        if usize::from(word(data, header_size_at)?) != expected_header {
+            return Err("The ELF header size is invalid.".into());
+        }
+
+        /*
+        The table section checks required entry sizes and count-to-offset agreement.
+        Extended counts remain unresolved until a validated section header zero is available.
+        */
+        let expected_program = if bits == 32 {
+            ELF32_PROGRAM_SIZE
+        } else {
+            ELF64_PROGRAM_SIZE
+        };
+        let program_size = usize::from(word(data, program_size_at)?);
+        let program_count = usize::from(word(data, program_count_at)?);
+        let section_size = usize::from(word(data, section_size_at)?);
+        let section_count = usize::from(word(data, section_count_at)?);
+        let section_names = usize::from(word(data, section_names_at)?);
+        if program_count != 0 && program_size < expected_program {
+            return Err("The ELF program-header entry size is invalid.".into());
+        }
+        if program_count == 0 && program_offset != 0 {
+            return Err("The ELF program-header count is zero for a nonzero table offset.".into());
+        }
+        if program_count != 0 && program_offset == 0 {
+            return Err("The ELF program-header table has a zero file offset.".into());
+        }
+        if program_count != 0 && program_offset < expected_header as u64 {
+            return Err("The ELF program-header table overlaps the ELF header.".into());
+        }
+        Ok(Self {
+            bits,
+            file_type,
+            machine: word(data, 18)?,
+            entry,
+            program_offset,
+            section_offset,
+            program_size,
+            program_count,
+            section_size,
+            section_count,
+            section_names,
+        })
+    }
+
+    /*
+    This fact identifies each header value that uses canonical data from section header zero.
+    The buffered or paged constructor reads that section only when one value requires it.
+    */
+    fn needs_section_zero(self) -> bool {
+        self.program_count == 0xffff
+            || (self.section_count == 0 && self.section_offset != 0)
+            || self.section_names == 0xffff
+    }
+
+    fn resolve_counts(&mut self, section_zero: Option<&[u8]>) -> Result<(), String> {
+        /*
+        The extended-count section reads canonical values only from section header zero.
+        A nonzero section type or a short-form extended value is invalid.
+        */
+        let extended_programs = self.program_count == 0xffff;
+        let extended_sections = self.section_count == 0 && self.section_offset != 0;
+        let extended_names = self.section_names == 0xffff;
+        if self.needs_section_zero() {
+            let section =
+                section_zero.ok_or("The ELF extended counts require section header 0.")?;
+            if dword(section, 4)? != 0 {
+                return Err("ELF section header 0 has a nonzero type.".into());
+            }
+            let (size, link, info) = if self.bits == 32 {
+                (
+                    u64::from(dword(section, 20)?),
+                    dword(section, 24)?,
+                    dword(section, 28)?,
+                )
+            } else {
+                (
+                    qword(section, 32)?,
+                    dword(section, 40)?,
+                    dword(section, 44)?,
+                )
+            };
+            if extended_programs {
+                self.program_count = info as usize;
+                if self.program_count < 0xffff {
+                    return Err("The ELF extended program-header count is not canonical.".into());
+                }
+            }
+            if extended_sections {
+                self.section_count = usize::try_from(size)
+                    .map_err(|_| "The ELF section-header count is too large.")?;
+                if self.section_count == 0 {
+                    return Err("The ELF extended section-header count is zero.".into());
+                }
+                if self.section_count < ELF_RESERVED_INDEX_START {
+                    return Err("The ELF extended section-header count is not canonical.".into());
+                }
+            }
+            if extended_names {
+                self.section_names = link as usize;
+                if self.section_names < ELF_RESERVED_INDEX_START {
+                    return Err("The ELF extended section-name index is not canonical.".into());
+                }
+            }
+        }
+
+        /*
+        The final count section enforces allocation limits and complete table descriptions.
+        The next parser stage can calculate table ends without unbounded arithmetic.
+        */
+        if self.program_count > ELF_MAX_ENTRIES {
+            return Err(format!(
+                "The ELF program-header count exceeds the limit of {ELF_MAX_ENTRIES}."
+            ));
+        }
+        if self.section_count > ELF_MAX_ENTRIES {
+            return Err(format!(
+                "The ELF section-header count exceeds the limit of {ELF_MAX_ENTRIES}."
+            ));
+        }
+        let expected_program = if self.bits == 32 {
+            ELF32_PROGRAM_SIZE
+        } else {
+            ELF64_PROGRAM_SIZE
+        };
+        let expected_section = if self.bits == 32 {
+            ELF32_SECTION_SIZE
+        } else {
+            ELF64_SECTION_SIZE
+        };
+        if self.program_count != 0
+            && (self.program_offset == 0 || self.program_size < expected_program)
+        {
+            return Err("The ELF program-header table is invalid.".into());
+        }
+        if (self.program_count as u64)
+            .checked_mul(self.program_size as u64)
+            .is_none_or(|bytes| bytes > ELF_MAX_PROGRAM_BYTES)
+        {
+            return Err("The ELF program-header table exceeds the 8 MiB limit.".into());
+        }
+        if self.section_count == 0 {
+            if self.section_offset != 0 || self.section_names != 0 {
+                return Err("The ELF section-header table is invalid.".into());
+            }
+        } else {
+            if self.section_offset == 0 || self.section_size < expected_section {
+                return Err("The ELF section-header table is invalid.".into());
+            }
+            if self.section_names >= self.section_count && self.section_names != 0 {
+                return Err("The ELF section-name index is outside the section table.".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+/*
+This helper calculates one complete ELF table range inside the logical file.
+Zero-count tables keep their validated zero offsets, and nonzero tables use checked multiplication.
+*/
+fn checked_elf_table(
+    offset: u64,
+    count: usize,
+    size: usize,
+    file_len: u64,
+    what: &str,
+) -> Result<u64, String> {
+    let bytes = (count as u64)
+        .checked_mul(size as u64)
+        .ok_or_else(|| format!("The ELF {what} range exceeds the address range."))?;
+    offset
+        .checked_add(bytes)
+        .filter(|&end| end <= file_len)
+        .ok_or_else(|| format!("The ELF {what} range is outside the file."))
+}
+
+/*
+This helper validates one nonempty file-backed executable section range.
+The returned temporary range proves both checked ends without adding a stored section index.
+*/
+fn elf_executable_section(
+    data: &[u8],
+    header: &ElfHeader,
+    file_len: u64,
+) -> Result<Option<std::ops::Range<u64>>, String> {
+    let section_type = dword(data, 4)?;
+    let (flags, offset, size) = if header.bits == 32 {
+        (
+            u64::from(dword(data, 8)?),
+            u64::from(dword(data, 16)?),
+            u64::from(dword(data, 20)?),
+        )
+    } else {
+        (qword(data, 8)?, qword(data, 24)?, qword(data, 32)?)
+    };
+    if flags & 4 == 0 || section_type == 8 || size == 0 {
+        return Ok(None);
+    }
+    let end = offset
+        .checked_add(size)
+        .filter(|&end| end <= file_len)
+        .ok_or("An executable ELF section range is outside the file.")?;
+    Ok(Some(offset..end))
+}
+
+/*
+This helper returns a validated section header zero only when extended counts need it.
+The returned slice belongs to the current buffered source and contains one full declared entry.
+*/
+fn elf_section_zero<'a>(data: &'a [u8], header: &ElfHeader) -> Result<Option<&'a [u8]>, String> {
+    if !header.needs_section_zero() {
+        return Ok(None);
+    }
+    let expected = if header.bits == 32 {
+        ELF32_SECTION_SIZE
+    } else {
+        ELF64_SECTION_SIZE
+    };
+    if header.section_size < expected || header.section_offset == 0 {
+        return Err("The ELF extended counts require a valid section header 0.".into());
+    }
+    if header.section_offset
+        < if header.bits == 32 {
+            ELF32_HEADER_SIZE as u64
+        } else {
+            ELF64_HEADER_SIZE as u64
+        }
+    {
+        return Err("ELF section header 0 overlaps the ELF header.".into());
+    }
+    let start = usize::try_from(header.section_offset)
+        .map_err(|_| "The ELF section-header table offset exceeds the address range.")?;
+    let end = start
+        .checked_add(header.section_size)
+        .ok_or("The ELF section-header table range exceeds the address range.")?;
+    data.get(start..end)
+        .map(Some)
+        .ok_or_else(|| "The ELF section-header table is incomplete.".into())
+}
+
+/*
+ElfSegment reads one class-specific program entry and validates PT_LOAD geometry.
+Non-load entries remain available to the buffered structure browser.
+*/
+impl ElfSegment {
+    fn parse(data: &[u8], header: &ElfHeader, index: usize) -> Result<Self, String> {
+        /*
+        The location section calculates the original program-header file offset with checked arithmetic.
+        Structure rows later use this offset when a program has no file data.
+        */
+        let entry_offset = (index as u64)
+            .checked_mul(header.program_size as u64)
+            .and_then(|value| header.program_offset.checked_add(value))
+            .ok_or("The ELF program-header offset exceeds the address range.")?;
+        /*
+        The field section decodes the class-specific order into one common segment record.
+        The validator then applies PT_LOAD rules without class-specific branches.
+        */
+        let (segment_type, flags, offset, address, file_size, memory_size, align) =
+            if header.bits == 32 {
+                (
+                    dword(data, 0)?,
+                    dword(data, 24)?,
+                    u64::from(dword(data, 4)?),
+                    u64::from(dword(data, 8)?),
+                    u64::from(dword(data, 16)?),
+                    u64::from(dword(data, 20)?),
+                    u64::from(dword(data, 28)?),
+                )
+            } else {
+                (
+                    dword(data, 0)?,
+                    dword(data, 4)?,
+                    qword(data, 8)?,
+                    qword(data, 16)?,
+                    qword(data, 32)?,
+                    qword(data, 40)?,
+                    qword(data, 48)?,
+                )
+            };
+        Ok(Self {
+            header: entry_offset,
+            segment_type,
+            flags,
+            offset,
+            address,
+            file_size,
+            memory_size,
+            align,
+        })
+    }
+
+    fn validate(self, bits: u32, file_len: u64) -> Result<(), String> {
+        /*
+        The core mapping section ignores non-PT_LOAD programs after their fixed fields parse.
+        The buffered browser applies its separate rules to all visible programs.
+        */
+        if self.segment_type != 1 {
+            return Ok(());
+        }
+        /*
+        The range section checks exact file and virtual ends before later mapping arithmetic.
+        ELF32 permits an end equal to 2^32 but rejects a larger end.
+        */
+        let file_end = self
+            .offset
+            .checked_add(self.file_size)
+            .filter(|&end| end <= file_len)
+            .ok_or("An ELF segment file range is outside the file.")?;
+        let memory_end = self
+            .address
+            .checked_add(self.memory_size)
+            .ok_or("An ELF segment virtual range exceeds the address range.")?;
+        if bits == 32
+            && (file_end > u64::from(u32::MAX) + 1 || memory_end > u64::from(u32::MAX) + 1)
+        {
+            return Err("An ELF32 segment range exceeds the 32-bit address range.".into());
+        }
+        /*
+        The geometry section validates the declared alignment and file-to-memory size relation.
+        A successful segment can enter the bounded alias checks in the shared constructor.
+        */
+        if self.align > 1
+            && (!self.align.is_power_of_two()
+                || self.offset % self.align != self.address % self.align)
+        {
+            return Err("An ELF segment has invalid alignment.".into());
+        }
+        if self.file_size > self.memory_size {
+            return Err("An ELF PT_LOAD file size exceeds its memory size.".into());
+        }
+        Ok(())
+    }
+}
+
+/*
+This layout check prevents tables from covering the fixed header or each other.
+It runs after extended counts produce the final table ends.
+*/
+fn validate_elf_table_layout(
+    header: &ElfHeader,
+    program_end: u64,
+    section_end: u64,
+) -> Result<(), String> {
+    let header_size = if header.bits == 32 {
+        ELF32_HEADER_SIZE as u64
+    } else {
+        ELF64_HEADER_SIZE as u64
+    };
+    if header.section_count != 0 && header.section_offset < header_size {
+        return Err("The ELF section-header table overlaps the ELF header.".into());
+    }
+    if header.program_count != 0
+        && header.section_count != 0
+        && elf_ranges_overlap(
+            (header.section_offset, section_end),
+            (header.program_offset, program_end),
+        )
+    {
+        return Err("The ELF program-header and section-header tables overlap.".into());
+    }
+    Ok(())
+}
+
+/*
+Elf constructors collect checked load maps and validate executable section ranges from buffered or paged sources.
+Both paths pass the same parts to from_parts before metadata becomes visible.
+*/
+impl Elf {
+    fn read(data: &[u8]) -> Result<Self, String> {
+        /*
+        The header section resolves counts and validates both complete table ranges.
+        Later loops can index declared entries without partial slices.
+        */
+        let mut header = ElfHeader::parse(data, data.len() as u64)?;
+        let section_zero = elf_section_zero(data, &header)?;
+        header.resolve_counts(section_zero)?;
+        let program_end = checked_elf_table(
+            header.program_offset,
+            header.program_count,
+            header.program_size,
+            data.len() as u64,
+            "program-header table",
+        )?;
+        let section_end = checked_elf_table(
+            header.section_offset,
+            header.section_count,
+            header.section_size,
+            data.len() as u64,
+            "section-header table",
+        )?;
+        validate_elf_table_layout(&header, program_end, section_end)?;
+
+        /*
+        The program section keeps only PT_LOAD entries in the core map.
+        Each entry keeps its exact declared file and virtual ranges.
+        */
+        let mut segments = Vec::new();
+        segments
+            .try_reserve_exact(header.program_count.min(ELF_MAX_LOAD_SEGMENTS))
+            .map_err(|_| "Cannot allocate the ELF program headers.")?;
+        for index in 0..header.program_count {
+            let start =
+                usize::try_from(header.program_offset + index as u64 * header.program_size as u64)
+                    .map_err(|_| "The ELF program-header offset exceeds the address range.")?;
+            let entry = &data[start..start + header.program_size];
+            let segment = ElfSegment::parse(entry, &header, index)?;
+            if segment.segment_type == 1 {
+                segment.validate(header.bits, data.len() as u64)?;
+                if segments.len() >= ELF_MAX_LOAD_SEGMENTS {
+                    return Err(format!(
+                        "The ELF PT_LOAD count exceeds the limit of {ELF_MAX_LOAD_SEGMENTS}."
+                    ));
+                }
+                segments.push(segment);
+            }
+        }
+
+        /*
+        The section loop validates current file-backed executable sections.
+        The final constructor checks machine pairs and mapping aliases.
+        */
+        for index in 1..header.section_count {
+            let start =
+                usize::try_from(header.section_offset + index as u64 * header.section_size as u64)
+                    .map_err(|_| "The ELF section-header offset exceeds the address range.")?;
+            let _ = elf_executable_section(
+                &data[start..start + header.section_size],
+                &header,
+                data.len() as u64,
+            )?;
+        }
+        Self::from_parts(header, segments, data.len() as u64)
+    }
+
+    fn read_from(file: &PagedFile, prefix: &[u8]) -> Result<Self, String> {
+        /*
+        The paged header section reads section header zero only for extended counts.
+        The declared entry size remains below one 64 KiB logical read.
+        */
+        let mut header = ElfHeader::parse(prefix, file.len())?;
+        let needs_section_zero = header.needs_section_zero();
+        let expected_section = if header.bits == 32 {
+            ELF32_SECTION_SIZE
+        } else {
+            ELF64_SECTION_SIZE
+        };
+        if needs_section_zero
+            && (header.section_size < expected_section || header.section_offset == 0)
+        {
+            return Err("The ELF extended counts require a valid section header 0.".into());
+        }
+        if needs_section_zero
+            && header.section_offset
+                < if header.bits == 32 {
+                    ELF32_HEADER_SIZE as u64
+                } else {
+                    ELF64_HEADER_SIZE as u64
+                }
+        {
+            return Err("ELF section header 0 overlaps the ELF header.".into());
+        }
+        let mut section_zero = Vec::new();
+        section_zero
+            .try_reserve_exact(header.section_size.max(expected_section))
+            .map_err(|_| "Cannot allocate ELF section header 0.")?;
+        section_zero.resize(header.section_size.max(expected_section), 0);
+        let section_zero = if needs_section_zero {
+            read_paged_exact(
+                file,
+                header.section_offset,
+                &mut section_zero,
+                "ELF section header 0",
+            )?;
+            Some(section_zero.as_slice())
+        } else {
+            None
+        };
+        header.resolve_counts(section_zero)?;
+        let program_end = checked_elf_table(
+            header.program_offset,
+            header.program_count,
+            header.program_size,
+            file.len(),
+            "program-header table",
+        )?;
+        let section_end = checked_elf_table(
+            header.section_offset,
+            header.section_count,
+            header.section_size,
+            file.len(),
+            "section-header table",
+        )?;
+        validate_elf_table_layout(&header, program_end, section_end)?;
+
+        /*
+        The paged program loop groups complete entries into reads of at most 64 KiB.
+        Only validated PT_LOAD entries enter the shared map.
+        */
+        let mut segments = Vec::new();
+        segments
+            .try_reserve_exact(header.program_count.min(ELF_MAX_LOAD_SEGMENTS))
+            .map_err(|_| "Cannot allocate the ELF program headers.")?;
+        let entries_per_read = (crate::paged::MAX_READ_BYTES / header.program_size.max(1)).max(1);
+        let mut first = 0usize;
+        while first < header.program_count {
+            let count = entries_per_read.min(header.program_count - first);
+            let byte_count = count * header.program_size;
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(byte_count)
+                .map_err(|_| "Cannot allocate the ELF program-header window.")?;
+            bytes.resize(byte_count, 0);
+            let offset = header
+                .program_offset
+                .checked_add(first as u64 * header.program_size as u64)
+                .ok_or("The ELF program-header offset exceeds the address range.")?;
+            read_paged_exact(file, offset, &mut bytes, "ELF program-header table")?;
+            for local in 0..count {
+                let start = local * header.program_size;
+                let segment = ElfSegment::parse(
+                    &bytes[start..start + header.program_size],
+                    &header,
+                    first + local,
+                )?;
+                if segment.segment_type == 1 {
+                    segment.validate(header.bits, file.len())?;
+                    if segments.len() >= ELF_MAX_LOAD_SEGMENTS {
+                        return Err(format!(
+                            "The ELF PT_LOAD count exceeds the limit of {ELF_MAX_LOAD_SEGMENTS}."
+                        ));
+                    }
+                    segments.push(segment);
+                }
+            }
+            first += count;
+        }
+
+        /*
+        The paged section loop applies the same 64 KiB read rule to executable-section checks.
+        The shared constructor receives exact high offsets without a full-file allocation.
+        */
+        let entries_per_read = (crate::paged::MAX_READ_BYTES / header.section_size.max(1)).max(1);
+        let mut first = 1usize;
+        while first < header.section_count {
+            let count = entries_per_read.min(header.section_count - first);
+            let byte_count = count * header.section_size;
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(byte_count)
+                .map_err(|_| "Cannot allocate the ELF section-header window.")?;
+            bytes.resize(byte_count, 0);
+            let offset = header
+                .section_offset
+                .checked_add(first as u64 * header.section_size as u64)
+                .ok_or("The ELF section-header offset exceeds the address range.")?;
+            read_paged_exact(file, offset, &mut bytes, "ELF section-header table")?;
+            for local in 0..count {
+                let start = local * header.section_size;
+                let _ = elf_executable_section(
+                    &bytes[start..start + header.section_size],
+                    &header,
+                    file.len(),
+                )?;
+            }
+            first += count;
+        }
+        Self::from_parts(header, segments, file.len())
+    }
+
+    fn from_parts(
+        header: ElfHeader,
+        segments: Vec<ElfSegment>,
+        file_len: u64,
+    ) -> Result<Self, String> {
+        /*
+        This section rejects known machine and class mismatches before Code selection.
+        Unknown machines keep inspectable metadata and fail only at the Code capability boundary.
+        */
+        match (header.machine, header.bits) {
+            (3, 64) | (EM_ARM, 64) | (62 | 183, 32) => {
+                return Err("The ELF machine does not match the ELF class.".into());
+            }
+            _ => {}
+        }
+        if segments.len() > ELF_MAX_LOAD_SEGMENTS {
+            return Err(format!(
+                "The ELF PT_LOAD count exceeds the limit of {ELF_MAX_LOAD_SEGMENTS}."
+            ));
+        }
+        let elf = Self {
+            header,
+            segments,
+            file_len,
+        };
+        elf.validate_load_aliases()?;
+        Ok(elf)
+    }
+
+    fn architecture(&self) -> Result<Architecture, String> {
+        /*
+        This selector matches each supported machine with its required ELF class.
+        ARM also uses the checked entry-state bits to select ARM or Thumb decoding.
+        */
+        match (self.header.machine, self.header.bits) {
+            (3, 32) => Ok(Architecture::X86(32)),
+            (62, 64) => Ok(Architecture::X86(64)),
+            (183, 64) => Ok(Architecture::Arm64),
+            (EM_ARM, 32) if self.header.file_type == 1 || self.header.entry == 0 => Err(
+                "ELF ARM files without an entry point require an explicit ARM or Thumb raw model."
+                    .into(),
+            ),
+            (EM_ARM, 32) if self.header.entry & 1 != 0 => Ok(Architecture::Thumb),
+            (EM_ARM, 32) if self.header.entry & 3 == 0 => Ok(Architecture::Arm),
+            (EM_ARM, 32) => Err("The ELF ARM entry point has a reserved state value.".into()),
+            _ => Err("The ELF processor is unsupported for code decoding.".into()),
+        }
+    }
+
+    fn validate_load_aliases(&self) -> Result<(), String> {
+        /*
+        The bounded pair check compares file-to-VA and VA-to-file meanings for all PT_LOAD ranges.
+        Identical aliases remain valid, while file-backed and zero-fill conflicts fail.
+        */
+        // ponytail: The 256-load limit bounds this pair check. Use a sweep if that limit increases.
+        for (index, left) in self.segments.iter().enumerate() {
+            for right in &self.segments[index + 1..] {
+                /*
+                The file-overlap section requires equal virtual addresses for every shared file byte.
+                Checked deltas prevent high virtual addresses from overflowing before comparison.
+                */
+                let file_start = left.offset.max(right.offset);
+                let file_end = (left.offset + left.file_size).min(right.offset + right.file_size);
+                if file_start < file_end {
+                    let left_delta = file_start - left.offset;
+                    let right_delta = file_start - right.offset;
+                    let left_address = left
+                        .address
+                        .checked_add(left_delta)
+                        .ok_or("An ELF segment virtual range exceeds the address range.")?;
+                    let right_address = right
+                        .address
+                        .checked_add(right_delta)
+                        .ok_or("An ELF segment virtual range exceeds the address range.")?;
+                    if left_address != right_address {
+                        return Err("Two ELF PT_LOAD file ranges have ambiguous mappings.".into());
+                    }
+                }
+
+                /*
+                The virtual-overlap section divides the shared range at each file-backed boundary.
+                Each interval must map to the same file offset or to the same zero-fill state.
+                */
+                let virtual_start = left.address.max(right.address);
+                let virtual_end =
+                    (left.address + left.memory_size).min(right.address + right.memory_size);
+                if virtual_start >= virtual_end {
+                    continue;
+                }
+                let mut boundaries = [
+                    virtual_start,
+                    virtual_end,
+                    (left.address + left.file_size).clamp(virtual_start, virtual_end),
+                    (right.address + right.file_size).clamp(virtual_start, virtual_end),
+                ];
+                boundaries.sort_unstable();
+                for window in boundaries.windows(2).filter(|window| window[0] < window[1]) {
+                    let address = window[0];
+                    let left_delta = address - left.address;
+                    let left_file = if left_delta < left.file_size {
+                        Some(
+                            left.offset
+                                .checked_add(left_delta)
+                                .ok_or("An ELF segment file range exceeds the address range.")?,
+                        )
+                    } else {
+                        None
+                    };
+                    let right_delta = address - right.address;
+                    let right_file = if right_delta < right.file_size {
+                        Some(
+                            right
+                                .offset
+                                .checked_add(right_delta)
+                                .ok_or("An ELF segment file range exceeds the address range.")?,
+                        )
+                    } else {
+                        None
+                    };
+                    if left_file != right_file {
+                        return Err(
+                            "Two ELF PT_LOAD virtual ranges have ambiguous mappings.".into()
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn file_to_virtual(&self, offset: u64) -> Result<Option<u64>, String> {
+        /*
+        This forward conversion gives relocatable files no virtual mapping.
+        Mapped files compare all file-backed PT_LOAD results and reject different aliases.
+        */
+        if self.header.file_type == 1 {
+            return Ok(None);
+        }
+        let mut result = None;
+        for segment in &self.segments {
+            let Some(delta) = offset.checked_sub(segment.offset) else {
+                continue;
+            };
+            if delta >= segment.file_size {
+                continue;
+            }
+            let address = segment
+                .address
+                .checked_add(delta)
+                .ok_or("An ELF segment virtual range exceeds the address range.")?;
+            if result.is_some_and(|previous| previous != address) {
+                return Err("The ELF file offset has ambiguous virtual mappings.".into());
+            }
+            result = Some(address);
+        }
+        Ok(result)
+    }
+
+    fn virtual_to_file(&self, address: u64) -> Result<Option<u64>, String> {
+        /*
+        This strict reverse conversion rejects relocatable files and addresses outside all load ranges.
+        A valid memory-only address returns no file byte through the inner optional result.
+        */
+        if self.header.file_type == 1 {
+            return Err("ELF relocatable files have no virtual address mapping.".into());
+        }
+        self.virtual_mapping(address)?
+            .ok_or_else(|| "The virtual address is outside the ELF load image.".into())
+    }
+
+    fn virtual_mapping(&self, address: u64) -> Result<Option<Option<u64>>, String> {
+        /*
+        This mapping helper compares all PT_LOAD ranges that contain one virtual address.
+        File-backed ranges calculate offsets, while zero-fill ranges avoid unused offset arithmetic.
+        */
+        let mut result: Option<Option<u64>> = None;
+        for segment in &self.segments {
+            let Some(delta) = address.checked_sub(segment.address) else {
+                continue;
+            };
+            if delta >= segment.memory_size {
+                continue;
+            }
+            let file = if delta < segment.file_size {
+                Some(
+                    segment
+                        .offset
+                        .checked_add(delta)
+                        .ok_or("An ELF segment file range exceeds the address range.")?,
+                )
+            } else {
+                None
+            };
+            if result.is_some_and(|previous| previous != file) {
+                return Err("The ELF virtual address has ambiguous PT_LOAD mappings.".into());
+            }
+            result = Some(file);
+        }
+        Ok(result)
+    }
+
+    fn entry_offset(&self) -> Result<Option<u64>, String> {
+        /*
+        The availability section removes entries from relocatable files and files with a zero entry.
+        Other files continue to architecture-specific entry normalization.
+        */
+        if self.header.file_type == 1 || self.header.entry == 0 {
+            return Ok(None);
+        }
+        /*
+        The ARM section clears the Thumb state bit and rejects the reserved low-bit state.
+        The final mapping accepts the entry only when its VA identifies one file byte.
+        */
+        let entry = if self.header.machine == EM_ARM && self.header.bits == 32 {
+            if self.header.entry & 1 != 0 {
+                self.header.entry & !1
+            } else if self.header.entry & 3 == 0 {
+                self.header.entry
+            } else {
+                return Err("The ELF ARM entry point has a reserved state value.".into());
+            }
+        } else {
+            self.header.entry
+        };
+        Ok(self.virtual_mapping(entry)?.flatten())
+    }
+
+    fn convert_address(
+        &self,
+        kind: AddressKind,
+        value: u64,
+        file_len: Option<u64>,
+    ) -> Result<PeAddress, String> {
+        /*
+        This domain conversion rejects RVA because ELF defines no PE-style image-relative address.
+        File input can return a partial unmapped result, while VA input can return zero-fill without a file byte.
+        */
+        match kind {
+            AddressKind::Rva => Err("ELF files have no RVA.".into()),
+            AddressKind::File => {
+                if file_len.is_some_and(|len| value >= len) {
+                    return Err("The file offset has no file byte.".into());
+                }
+                let file_offset = usize::try_from(value)
+                    .map_err(|_| "The file offset exceeds the address range.")?;
+                Ok(PeAddress {
+                    file_offset: Some(file_offset),
+                    rva: None,
+                    va: self.file_to_virtual(value)?,
+                })
+            }
+            AddressKind::Va => {
+                let file = self.virtual_to_file(value)?;
+                let file_offset = file
+                    .map(|offset| {
+                        usize::try_from(offset)
+                            .map_err(|_| "The file offset exceeds the address range.")
+                    })
+                    .transpose()?;
+                Ok(PeAddress {
+                    file_offset,
+                    rva: None,
+                    va: Some(value),
+                })
+            }
+        }
+    }
+}
+
+/*
 These constants name PE directories and bound browser table and string reads.
 The table and string limits are separate from the caller's final row cap.
 */
@@ -1059,6 +2174,30 @@ struct BrowserPe {
 }
 
 /*
+BrowserElfSection retains validated section data and its resolved escaped name.
+BrowserElf keeps complete program and section rows beside the smaller shared ELF map.
+*/
+struct BrowserElfSection {
+    name: String,
+    name_offset: u32,
+    header: usize,
+    section_type: u32,
+    flags: u64,
+    address: u64,
+    offset: u64,
+    size: u64,
+    align: u64,
+    entry_size: u64,
+}
+
+struct BrowserElf {
+    header: ElfHeader,
+    segments: Vec<ElfSegment>,
+    sections: Vec<BrowserElfSection>,
+    mapping: Elf,
+}
+
+/*
 These fixed-width helpers validate PE browser ranges before they read little-endian values.
 Later import and export readers use the same checked arithmetic.
 */
@@ -1112,6 +2251,322 @@ fn checked_count(count: u32, unit: usize, what: &str) -> Result<usize, String> {
     count
         .checked_mul(unit)
         .ok_or_else(|| format!("The {what} range exceeds the address range."))
+}
+
+/*
+This helper converts one ELF file range into a buffered slice range.
+The browser uses the result for section data and the section-name string table.
+*/
+fn elf_range(
+    data: &[u8],
+    at: u64,
+    size: u64,
+    what: &str,
+) -> Result<std::ops::Range<usize>, String> {
+    let end = at
+        .checked_add(size)
+        .filter(|&end| end <= data.len() as u64)
+        .ok_or_else(|| format!("The ELF {what} range is outside the file."))?;
+    Ok(
+        usize::try_from(at).map_err(|_| format!("The ELF {what} offset is too large."))?
+            ..usize::try_from(end).map_err(|_| format!("The ELF {what} range is too large."))?,
+    )
+}
+
+/*
+This predicate compares two half-open ELF ranges.
+Empty ranges never overlap and adjacent ranges remain valid.
+*/
+fn elf_ranges_overlap(left: (u64, u64), right: (u64, u64)) -> bool {
+    left.0 < right.1 && right.0 < left.1
+}
+
+/*
+The browser validates all declared program segments, including entries that do not affect address mapping.
+PT_LOAD entries receive the stronger file-size and congruent-alignment checks.
+*/
+impl ElfSegment {
+    fn validate_browser(self, bits: u32, file_len: u64) -> Result<(), String> {
+        if self.segment_type == 0 {
+            return Ok(());
+        }
+        let file_end = self
+            .offset
+            .checked_add(self.file_size)
+            .filter(|&end| end <= file_len)
+            .ok_or("An ELF program segment file range is outside the file.")?;
+        let memory_end = self
+            .address
+            .checked_add(self.memory_size)
+            .ok_or("An ELF program segment virtual range exceeds the address range.")?;
+        if bits == 32
+            && (file_end > u64::from(u32::MAX) + 1 || memory_end > u64::from(u32::MAX) + 1)
+        {
+            return Err("An ELF32 program segment range exceeds the 32-bit address range.".into());
+        }
+        if self.align > 1
+            && (!self.align.is_power_of_two()
+                || (self.segment_type == 1
+                    && self.offset % self.align != self.address % self.align))
+        {
+            return Err("An ELF program segment has invalid alignment.".into());
+        }
+        if self.segment_type == 1 && self.file_size > self.memory_size {
+            return Err("An ELF PT_LOAD file size exceeds its memory size.".into());
+        }
+        Ok(())
+    }
+}
+
+/*
+BrowserElfSection parses one class-specific section entry and validates its declared data rules.
+Names remain unresolved until the complete section-name table passes validation.
+*/
+impl BrowserElfSection {
+    fn parse(data: &[u8], header: &ElfHeader, index: usize) -> Result<Self, String> {
+        /*
+        The location section calculates one declared section-header file offset.
+        NOBITS and empty rows later use this offset as their selectable source location.
+        */
+        let table_delta = (index as u64)
+            .checked_mul(header.section_size as u64)
+            .ok_or("The ELF section-header offset exceeds the address range.")?;
+        let header_offset = header
+            .section_offset
+            .checked_add(table_delta)
+            .ok_or("The ELF section-header offset exceeds the address range.")?;
+        /*
+        The field section converts either class layout into one common browser record.
+        Name bytes remain unresolved until the complete string table passes validation.
+        */
+        let (name_offset, section_type, flags, address, offset, size, align, entry_size) =
+            if header.bits == 32 {
+                (
+                    dword(data, 0)?,
+                    dword(data, 4)?,
+                    u64::from(dword(data, 8)?),
+                    u64::from(dword(data, 12)?),
+                    u64::from(dword(data, 16)?),
+                    u64::from(dword(data, 20)?),
+                    u64::from(dword(data, 32)?),
+                    u64::from(dword(data, 36)?),
+                )
+            } else {
+                (
+                    dword(data, 0)?,
+                    dword(data, 4)?,
+                    qword(data, 8)?,
+                    qword(data, 16)?,
+                    qword(data, 24)?,
+                    qword(data, 32)?,
+                    qword(data, 48)?,
+                    qword(data, 56)?,
+                )
+            };
+        Ok(Self {
+            name: String::new(),
+            name_offset,
+            header: usize::try_from(header_offset)
+                .map_err(|_| "The ELF section-header offset is too large.")?,
+            section_type,
+            flags,
+            address,
+            offset,
+            size,
+            align,
+            entry_size,
+        })
+    }
+
+    fn validate(&self, data: &[u8], bits: u32, index: usize) -> Result<(), String> {
+        /*
+        The identity section keeps section header zero canonical and checks the complete virtual end.
+        ELF32 permits a virtual end equal to 2^32.
+        */
+        if index == 0 && self.section_type != 0 {
+            return Err("ELF section header 0 has a nonzero type.".into());
+        }
+        let memory_end = self
+            .address
+            .checked_add(self.size)
+            .ok_or("An ELF section address range exceeds the address range.")?;
+        if bits == 32 && memory_end > u64::from(u32::MAX) + 1 {
+            return Err("An ELF32 section range exceeds the 32-bit address range.".into());
+        }
+        /*
+        The geometry section checks power-of-two alignment and declared record division.
+        File-backed nonzero sections must also own their complete current source range.
+        */
+        if self.align > 1 && !self.align.is_power_of_two() {
+            return Err("An ELF section has invalid alignment.".into());
+        }
+        if self.entry_size != 0 && !self.size.is_multiple_of(self.entry_size) {
+            return Err("An ELF section size is not a multiple of its entry size.".into());
+        }
+        if index != 0 && self.section_type != 8 && self.size != 0 {
+            elf_range(data, self.offset, self.size, "section data")?;
+        }
+        Ok(())
+    }
+}
+
+/*
+BrowserElf validates complete buffered program, section, and section-name tables before it exposes rows.
+The parser reuses the shared mapping constructor after browser-specific checks pass.
+*/
+impl BrowserElf {
+    fn parse(data: &[u8]) -> Result<Self, String> {
+        /*
+        The header section resolves extended counts and checks both table ranges.
+        The program and section tables cannot overlap the fixed header or each other.
+        */
+        let mut header = ElfHeader::parse(data, data.len() as u64)?;
+        let expected_section = if header.bits == 32 {
+            ELF32_SECTION_SIZE
+        } else {
+            ELF64_SECTION_SIZE
+        };
+        let section_zero = if header.needs_section_zero() {
+            if header.section_offset == 0 || header.section_size < expected_section {
+                return Err("The ELF extended counts require a valid section header 0.".into());
+            }
+            let range = elf_range(
+                data,
+                header.section_offset,
+                header.section_size as u64,
+                "section header 0",
+            )?;
+            Some(&data[range])
+        } else {
+            None
+        };
+        header.resolve_counts(section_zero)?;
+        let program_end = checked_elf_table(
+            header.program_offset,
+            header.program_count,
+            header.program_size,
+            data.len() as u64,
+            "program-header table",
+        )?;
+        let section_end = checked_elf_table(
+            header.section_offset,
+            header.section_count,
+            header.section_size,
+            data.len() as u64,
+            "section-header table",
+        )?;
+        validate_elf_table_layout(&header, program_end, section_end)?;
+
+        /*
+        The program section keeps every row and a separate bounded PT_LOAD list.
+        The shared map receives only the load entries after complete validation.
+        */
+        let mut segments = Vec::new();
+        segments
+            .try_reserve_exact(header.program_count)
+            .map_err(|_| "Cannot allocate the ELF program headers.")?;
+        let mut loads = Vec::new();
+        loads
+            .try_reserve_exact(header.program_count.min(ELF_MAX_LOAD_SEGMENTS))
+            .map_err(|_| "Cannot allocate the ELF load segments.")?;
+        for index in 0..header.program_count {
+            let start =
+                usize::try_from(header.program_offset + index as u64 * header.program_size as u64)
+                    .map_err(|_| "The ELF program-header offset is too large.")?;
+            let segment =
+                ElfSegment::parse(&data[start..start + header.program_size], &header, index)?;
+            segment.validate_browser(header.bits, data.len() as u64)?;
+            if segment.segment_type == 1 {
+                if loads.len() >= ELF_MAX_LOAD_SEGMENTS {
+                    return Err(format!(
+                        "The ELF PT_LOAD count exceeds the limit of {ELF_MAX_LOAD_SEGMENTS}."
+                    ));
+                }
+                loads.push(segment);
+            }
+            segments.push(segment);
+        }
+
+        /*
+        The section section validates all entries and rejects overlapping file-backed data.
+        NOBITS sections keep virtual size but do not create raw navigation.
+        */
+        let mut sections = Vec::new();
+        sections
+            .try_reserve_exact(header.section_count)
+            .map_err(|_| "Cannot allocate the ELF section headers.")?;
+        for index in 0..header.section_count {
+            let start =
+                usize::try_from(header.section_offset + index as u64 * header.section_size as u64)
+                    .map_err(|_| "The ELF section-header offset is too large.")?;
+            let section = BrowserElfSection::parse(
+                &data[start..start + header.section_size],
+                &header,
+                index,
+            )?;
+            section.validate(data, header.bits, index)?;
+            sections.push(section);
+        }
+        let mut section_ranges: Vec<_> = sections
+            .iter()
+            .skip(1)
+            .filter(|section| section.section_type != 8 && section.size != 0)
+            .map(|section| (section.offset, section.offset + section.size))
+            .collect();
+        section_ranges.sort_unstable();
+        if section_ranges.windows(2).any(|pair| pair[1].0 < pair[0].1) {
+            return Err("Two ELF section file ranges overlap.".into());
+        }
+
+        /*
+        The name section validates the string table and resolves each bounded null-terminated name.
+        The final map then rechecks PT_LOAD aliases before the browser exposes rows.
+        */
+        if header.section_names == 0 {
+            if sections.iter().any(|section| section.name_offset != 0) {
+                return Err("An ELF section name exists without a section-name table.".into());
+            }
+        } else {
+            let names = &sections[header.section_names];
+            if names.section_type != 3 || names.size == 0 {
+                return Err("The ELF section-name table is invalid.".into());
+            }
+            let range = elf_range(data, names.offset, names.size, "section-name table")?;
+            let table = &data[range];
+            if table.first() != Some(&0) || table.last() != Some(&0) {
+                return Err(
+                    "The ELF section-name table must start and end with a null byte.".into(),
+                );
+            }
+            for section in &mut sections {
+                let offset = section.name_offset as usize;
+                if offset >= table.len() {
+                    return Err("An ELF section-name offset is outside the string table.".into());
+                }
+                let available = table.len() - offset;
+                let scan = available.min(MAX_NAME_BYTES + 1);
+                let Some(length) = table[offset..offset + scan]
+                    .iter()
+                    .position(|&byte| byte == 0)
+                else {
+                    if available > MAX_NAME_BYTES {
+                        return Err(format!(
+                            "An ELF section name exceeds the limit of {MAX_NAME_BYTES} bytes."
+                        ));
+                    }
+                    return Err("An ELF section name is not null-terminated.".into());
+                };
+                section.name = escaped(&table[offset..offset + length]);
+            }
+        }
+        let mapping = Elf::from_parts(header, loads, data.len() as u64)?;
+        Ok(Self {
+            header,
+            segments,
+            sections,
+            mapping,
+        })
+    }
 }
 
 /*
@@ -1835,10 +3290,183 @@ fn export_rows(
 }
 
 /*
-This entry point creates PE structure rows from current source bytes and applies the caller's row cap.
-It adds rows by category: sections, directories, imports, exports, and overlay.
+These helpers give known ELF program and section values stable structure-row names.
+Unknown values keep their numeric type, and program permissions use the standard RWX order.
+*/
+fn elf_segment_name(segment_type: u32) -> String {
+    match segment_type {
+        0 => "PT_NULL".into(),
+        1 => "PT_LOAD".into(),
+        2 => "PT_DYNAMIC".into(),
+        3 => "PT_INTERP".into(),
+        4 => "PT_NOTE".into(),
+        5 => "PT_SHLIB".into(),
+        6 => "PT_PHDR".into(),
+        7 => "PT_TLS".into(),
+        value => format!("type {value:#X}"),
+    }
+}
+
+fn elf_section_name(section_type: u32) -> String {
+    match section_type {
+        0 => "SHT_NULL".into(),
+        1 => "SHT_PROGBITS".into(),
+        2 => "SHT_SYMTAB".into(),
+        3 => "SHT_STRTAB".into(),
+        4 => "SHT_RELA".into(),
+        5 => "SHT_HASH".into(),
+        6 => "SHT_DYNAMIC".into(),
+        7 => "SHT_NOTE".into(),
+        8 => "SHT_NOBITS".into(),
+        9 => "SHT_REL".into(),
+        11 => "SHT_DYNSYM".into(),
+        value => format!("type {value:#X}"),
+    }
+}
+
+fn elf_flags(flags: u32) -> String {
+    [(4, 'R'), (2, 'W'), (1, 'X')]
+        .into_iter()
+        .map(|(mask, name)| if flags & mask != 0 { name } else { '-' })
+        .collect()
+}
+
+/*
+This browser converts one fully validated ELF model into selectable header, entry, program, and section rows.
+Rows without source data use their table entry as the navigation location.
+*/
+fn elf_structures(data: &[u8], limit: usize) -> Result<Vec<(usize, String)>, String> {
+    let elf = BrowserElf::parse(data)?;
+    let mut rows = Vec::with_capacity(limit.min(1_024));
+
+    /*
+    The first section adds the fixed header and an optional file-backed entry row.
+    A Thumb entry row displays the original state bit from the ELF header.
+    */
+    add_row(
+        &mut rows,
+        limit,
+        0,
+        format!(
+            "ELF{} header | Type={} Machine={:#06X} Entry={:016X}",
+            elf.header.bits, elf.header.file_type, elf.header.machine, elf.header.entry
+        ),
+    );
+    if let Some(entry_file) = elf.mapping.entry_offset()? {
+        add_row(
+            &mut rows,
+            limit,
+            usize::try_from(entry_file).map_err(|_| "The ELF entry file offset is too large.")?,
+            format!(
+                "Entry | File={entry_file:016X} VA={:016X}",
+                elf.header.entry
+            ),
+        );
+    }
+
+    /*
+    The program section adds all declared entries, including unknown types and PT_NULL records.
+    File-backed records navigate to their source bytes, while empty records navigate to their headers.
+    */
+    for (index, segment) in elf.segments.iter().enumerate() {
+        let file = if segment.segment_type == 0 || segment.file_size == 0 {
+            "-".into()
+        } else {
+            format!("{:016X}", segment.offset)
+        };
+        let navigation = if segment.segment_type == 0 || segment.file_size == 0 {
+            segment.header
+        } else {
+            segment.offset
+        };
+        let address = if elf.header.file_type == 1 {
+            format!("Address={:016X}", segment.address)
+        } else {
+            format!("VA={:016X}", segment.address)
+        };
+        add_row(
+            &mut rows,
+            limit,
+            usize::try_from(navigation)
+                .map_err(|_| "The ELF program-header navigation offset is too large.")?,
+            format!(
+                "Program[{index}] {} | File={file} {address} FileSize={:016X} MemorySize={:016X} Flags={} Align={:X} HeaderFile={:016X}",
+                elf_segment_name(segment.segment_type),
+                segment.file_size,
+                segment.memory_size,
+                elf_flags(segment.flags),
+                segment.align,
+                segment.header
+            ),
+        );
+    }
+
+    /*
+    The section section omits section zero and gives NOBITS or empty sections header navigation.
+    The completed rows retain the caller limit after the parser validates all declared data.
+    */
+    for (index, section) in elf.sections.iter().enumerate().skip(1) {
+        let name = if section.name.is_empty() {
+            "<unnamed>"
+        } else {
+            &section.name
+        };
+        let has_bytes = section.section_type != 8 && section.size != 0;
+        let file = if has_bytes {
+            format!("{:016X}", section.offset)
+        } else {
+            "-".into()
+        };
+        let navigation = if has_bytes {
+            section.offset
+        } else {
+            section.header as u64
+        };
+        let address = if elf.header.file_type == 1 {
+            "-".into()
+        } else {
+            format!("{:016X}", section.address)
+        };
+        add_row(
+            &mut rows,
+            limit,
+            usize::try_from(navigation)
+                .map_err(|_| "The ELF section navigation offset is too large.")?,
+            format!(
+                "Section[{index}] {name} {} | File={file} VA={address} Size={:016X} Flags={:X} Align={:X} HeaderFile={:016X}",
+                elf_section_name(section.section_type),
+                section.size,
+                section.flags,
+                section.align,
+                section.header
+            ),
+        );
+    }
+    debug_assert!(rows.len() <= limit);
+    debug_assert!(rows.iter().all(|(offset, _)| *offset < data.len()));
+    Ok(rows)
+}
+
+/*
+This title helper identifies the active buffered structure parser before the workbench opens its row list.
+Malformed ELF input keeps the ELF title while the parser reports its exact error.
+*/
+pub(crate) fn structure_title(data: &[u8]) -> &'static str {
+    if data.starts_with(ELF_MAGIC) {
+        "ELF structures"
+    } else {
+        "PE structures"
+    }
+}
+
+/*
+This entry point creates ELF or PE structure rows from current source bytes.
+The selected parser validates all format records before it applies the caller's row cap.
 */
 pub fn structures(data: &[u8], limit: usize) -> Result<Vec<(usize, String)>, String> {
+    if data.starts_with(ELF_MAGIC) {
+        return elf_structures(data, limit);
+    }
     let pe = BrowserPe::parse(data)?;
     let mut rows = Vec::with_capacity(limit.min(1_024));
     /*
@@ -1947,10 +3575,13 @@ pub fn structures(data: &[u8], limit: usize) -> Result<Vec<(usize, String)>, Str
 }
 
 /*
-This entry point converts a checked PE address through current source bytes.
-Partial mappings identify file gaps and virtual-only bytes without inventing unavailable domains.
+This entry point converts a checked ELF or PE address through current source bytes.
+Each format returns only declared domains and file-backed locations.
 */
 pub fn convert_address(data: &[u8], kind: AddressKind, value: u64) -> Result<PeAddress, String> {
+    if data.starts_with(ELF_MAGIC) {
+        return Elf::read(data)?.convert_address(kind, value, Some(data.len() as u64));
+    }
     let pe = BrowserPe::parse(data)?;
     match kind {
         AddressKind::File => {
@@ -2025,10 +3656,15 @@ fn pe_header(data: &[u8]) -> Result<Option<usize>, String> {
 }
 
 /*
-This standalone entry query maps the current PE entry RVA to a file offset.
-Plain sources retain their existing zero entry, and DOS files retain their legacy entry calculation.
+This standalone entry query maps an ELF or PE entry to a file byte.
+Plain sources retain zero, and DOS files retain their legacy entry calculation.
 */
 pub fn entry_point(data: &[u8]) -> Result<u64, String> {
+    if data.starts_with(ELF_MAGIC) {
+        return Elf::read(data)?
+            .entry_offset()?
+            .ok_or_else(|| OUTSIDE.into());
+    }
     if let Some(header) = pe_header(data)? {
         let pe = Pe::read(data, header)?;
         return pe.rva_to_file(pe.entry).ok_or_else(|| OUTSIDE.into());
@@ -2040,10 +3676,15 @@ pub fn entry_point(data: &[u8]) -> Result<u64, String> {
 }
 
 /*
-This standalone navigation wrapper maps one PE virtual address or RVA to a file offset.
+This standalone navigation wrapper maps one ELF VA or one compatible PE virtual value to a file byte.
 Plain-source behavior and existing mapping errors remain unchanged.
 */
 pub fn virtual_to_file(data: &[u8], address: u64) -> Result<u64, String> {
+    if data.starts_with(ELF_MAGIC) {
+        return Elf::read(data)?
+            .virtual_to_file(address)?
+            .ok_or_else(|| OUTSIDE.into());
+    }
     match pe_header(data)? {
         Some(header) => Pe::read(data, header)?.legacy_virtual_to_file(address),
         None => Ok(address),
@@ -2101,6 +3742,166 @@ mod tests {
 
     fn put_qword(data: &mut [u8], offset: usize, value: u64) {
         data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    /*
+    This fixture creates one independent ELF32 or ELF64 image with optional section records.
+    The normal PT_LOAD maps file 0x100 through 0x1FF to VA 0x400000 through 0x4000FF.
+    */
+    fn elf_fixture(bits: u32, machine: u16, file_type: u16, with_sections: bool) -> Vec<u8> {
+        let mut data = vec![0; 0x500];
+        data[..4].copy_from_slice(ELF_MAGIC);
+        data[4] = if bits == 32 { 1 } else { 2 };
+        data[5] = 1;
+        data[6] = 1;
+        put_word(&mut data, 16, file_type);
+        put_word(&mut data, 18, machine);
+        put(&mut data, 20, 1);
+        let header_size = if bits == 32 {
+            ELF32_HEADER_SIZE
+        } else {
+            ELF64_HEADER_SIZE
+        };
+        let program_size = if bits == 32 {
+            ELF32_PROGRAM_SIZE
+        } else {
+            ELF64_PROGRAM_SIZE
+        };
+        let section_size = if bits == 32 {
+            ELF32_SECTION_SIZE
+        } else {
+            ELF64_SECTION_SIZE
+        };
+        let has_program = file_type != 1;
+
+        /*
+        This section writes class-specific header offsets and table counts.
+        ET_REL omits the program table and keeps a file-relative entry value.
+        */
+        if bits == 32 {
+            put(&mut data, 24, if has_program { 0x400010 } else { 7 });
+            put(
+                &mut data,
+                28,
+                if has_program { header_size as u32 } else { 0 },
+            );
+            put(&mut data, 32, if with_sections { 0x300 } else { 0 });
+            put_word(&mut data, 40, header_size as u16);
+            put_word(
+                &mut data,
+                42,
+                if has_program { program_size as u16 } else { 0 },
+            );
+            put_word(&mut data, 44, u16::from(has_program));
+            put_word(
+                &mut data,
+                46,
+                if with_sections {
+                    section_size as u16
+                } else {
+                    0
+                },
+            );
+            put_word(&mut data, 48, if with_sections { 4 } else { 0 });
+            put_word(&mut data, 50, if with_sections { 3 } else { 0 });
+        } else {
+            put_qword(&mut data, 24, if has_program { 0x400010 } else { 7 });
+            put_qword(
+                &mut data,
+                32,
+                if has_program { header_size as u64 } else { 0 },
+            );
+            put_qword(&mut data, 40, if with_sections { 0x300 } else { 0 });
+            put_word(&mut data, 52, header_size as u16);
+            put_word(
+                &mut data,
+                54,
+                if has_program { program_size as u16 } else { 0 },
+            );
+            put_word(&mut data, 56, u16::from(has_program));
+            put_word(
+                &mut data,
+                58,
+                if with_sections {
+                    section_size as u16
+                } else {
+                    0
+                },
+            );
+            put_word(&mut data, 60, if with_sections { 4 } else { 0 });
+            put_word(&mut data, 62, if with_sections { 3 } else { 0 });
+        }
+
+        /*
+        This section writes one executable PT_LOAD with a 0x80-byte zero-fill tail.
+        The final section table adds .text, .bss, and the section-name table when requested.
+        */
+        if has_program {
+            let at = header_size;
+            put(&mut data, at, 1);
+            if bits == 32 {
+                put(&mut data, at + 4, 0x100);
+                put(&mut data, at + 8, 0x400000);
+                put(&mut data, at + 16, 0x100);
+                put(&mut data, at + 20, 0x180);
+                put(&mut data, at + 24, 5);
+                put(&mut data, at + 28, 0x100);
+            } else {
+                put(&mut data, at + 4, 5);
+                put_qword(&mut data, at + 8, 0x100);
+                put_qword(&mut data, at + 16, 0x400000);
+                put_qword(&mut data, at + 32, 0x100);
+                put_qword(&mut data, at + 40, 0x180);
+                put_qword(&mut data, at + 48, 0x100);
+            }
+        }
+        if with_sections {
+            let names = b"\0.text\0.bss\0.shstrtab\0";
+            data[0x280..0x280 + names.len()].copy_from_slice(names);
+            let mut section = |index: usize,
+                               name: u32,
+                               section_type: u32,
+                               address: u64,
+                               offset: u64,
+                               size: u64| {
+                let at = 0x300 + index * section_size;
+                put(&mut data, at, name);
+                put(&mut data, at + 4, section_type);
+                if bits == 32 {
+                    put(&mut data, at + 8, u32::from(index != 3) * 2);
+                    put(&mut data, at + 12, address as u32);
+                    put(&mut data, at + 16, offset as u32);
+                    put(&mut data, at + 20, size as u32);
+                    put(&mut data, at + 32, 1);
+                } else {
+                    put_qword(&mut data, at + 8, u64::from(index != 3) * 2);
+                    put_qword(&mut data, at + 16, address);
+                    put_qword(&mut data, at + 24, offset);
+                    put_qword(&mut data, at + 32, size);
+                    put_qword(&mut data, at + 48, 1);
+                }
+            };
+            section(
+                1,
+                1,
+                1,
+                if file_type == 1 { 0 } else { 0x400000 },
+                0x100,
+                0x100,
+            );
+            section(
+                2,
+                7,
+                8,
+                if file_type == 1 { 0 } else { 0x400100 },
+                0x200,
+                0x80,
+            );
+            section(3, 12, 3, 0, 0x280, names.len() as u64);
+        }
+        data[0x110..0x115].copy_from_slice(&[0xe8, 0x0b, 0, 0, 0]);
+        data[0x120] = 0xc3;
+        data
     }
 
     /*
@@ -2718,27 +4519,31 @@ mod tests {
     }
 
     /*
-    This test keeps the established large-file notice for plain data and raw ELF data.
-    A paged DOS source still uses its bounded segment and instruction entry calculation.
+    This test keeps the established large-file notice for plain data.
+    Paged malformed ELF and valid DOS sources retain their separate format results.
     */
     #[test]
     fn paged_metadata_preserves_plain_limits_and_dos_entry() {
-        for (label, data) in [
-            ("plain", b"plain".as_slice()),
-            ("elf", b"\x7fELF".as_slice()),
-        ] {
-            let path = temp_path(label);
-            std::fs::write(&path, data).unwrap();
-            let source = PagedFile::open(&path).unwrap();
-            assert!(
-                Metadata::read_from(&source)
-                    .err()
-                    .unwrap()
-                    .contains("Virtual and entry-point offsets are unavailable")
-            );
-            drop(source);
-            std::fs::remove_file(path).unwrap();
-        }
+        let path = temp_path("plain");
+        std::fs::write(&path, b"plain").unwrap();
+        let source = PagedFile::open(&path).unwrap();
+        assert!(
+            Metadata::read_from(&source)
+                .err()
+                .unwrap()
+                .contains("Virtual and entry-point offsets are unavailable")
+        );
+        drop(source);
+        std::fs::remove_file(path).unwrap();
+
+        let path = temp_path("malformed-elf");
+        let data = b"\x7fELF";
+        let buffered = Metadata::parse(data).err().unwrap();
+        std::fs::write(&path, data).unwrap();
+        let source = PagedFile::open(&path).unwrap();
+        assert_eq!(Metadata::read_from(&source).err().unwrap(), buffered);
+        drop(source);
+        std::fs::remove_file(path).unwrap();
 
         let path = temp_path("dos");
         let mut data = vec![0_u8; 128];
@@ -2754,8 +4559,8 @@ mod tests {
     }
 
     /*
-    This test checks plain-source file locations and legacy non-PE entry behavior.
-    Malformed executable headers remain errors.
+    This test checks plain-source locations, explicit raw selection, and legacy non-PE entries.
+    Malformed executable headers remain errors until an explicit raw model takes ownership.
     */
     #[test]
     fn raw_and_invalid_vectors() {
@@ -2763,7 +4568,8 @@ mod tests {
         assert_eq!(virtual_to_file(b"raw bytes", 16), Ok(16));
         assert_eq!(code_address(b"raw bytes", 16), Ok((16, 16)));
         assert!(code_location(b"raw bytes", 16).is_err());
-        assert_eq!(code_address(b"\x7fELF raw x86", 4), Ok((4, 16)));
+        assert!(code_address(b"\x7fELF raw x86", 4).is_err());
+        assert_eq!(Metadata::raw(0, 16).unwrap().code_address(4), Ok((4, 16)));
         assert!(entry_point(b"\x7fELF").is_err());
         assert!(entry_point(b"MZ").is_err());
         let mut dos = vec![0; 64];
@@ -3063,7 +4869,7 @@ mod tests {
     }
 
     /*
-    This test checks navigation through mapped PE, raw, and current ELF-fallback sources.
+    This test checks navigation through mapped PE, explicit raw data, and supported ELF sources.
     It preserves source bounds and unsupported PE-machine errors.
     */
     #[test]
@@ -3082,17 +4888,23 @@ mod tests {
             assert!(metadata.navigation_offset(&data, base + 0x1200).is_err());
         }
 
-        for data in [&b"raw code"[..], &b"\x7fELF raw code"[..]] {
-            let metadata = Metadata::parse(data).unwrap();
-            assert_eq!(metadata.navigation_address(data, 4), Ok(4));
-            assert_eq!(metadata.navigation_offset(data, 4), Ok(4));
-            assert!(
-                metadata
-                    .navigation_address(data, data.len() as u64)
-                    .is_err()
-            );
-            assert!(metadata.navigation_offset(data, data.len() as u64).is_err());
-        }
+        let data = b"raw code";
+        let metadata = Metadata::parse(data).unwrap();
+        assert_eq!(metadata.navigation_address(data, 4), Ok(4));
+        assert_eq!(metadata.navigation_offset(data, 4), Ok(4));
+        assert!(
+            metadata
+                .navigation_address(data, data.len() as u64)
+                .is_err()
+        );
+        assert!(metadata.navigation_offset(data, data.len() as u64).is_err());
+
+        let elf = elf_fixture(64, 62, 2, false);
+        let metadata = Metadata::parse(&elf).unwrap();
+        assert_eq!(metadata.navigation_address(&elf, 0x110), Ok(0x400010));
+        assert_eq!(metadata.navigation_offset(&elf, 0x400020), Ok(0x120));
+        assert!(metadata.navigation_address(&elf, 0x450).is_err());
+        assert!(metadata.navigation_offset(&elf, 0x400110).is_err());
 
         let overlay = browser_fixture(false);
         let metadata = Metadata::parse(&overlay).unwrap();
@@ -3422,5 +5234,706 @@ mod tests {
                     .any(|(_, text)| { text.starts_with("Export ") && text.contains(export) })
             );
         }
+    }
+
+    /*
+    This test compares ELF32, ELF64, and ARM64 mapping results across every public metadata route.
+    It also checks ET_REL file domains and the absence of an RVA domain.
+    */
+    #[test]
+    fn elf32_elf64_and_arm64_use_checked_load_mappings() {
+        for (bits, machine, file_type, architecture) in [
+            (32, 3, 2, Architecture::X86(32)),
+            (64, 62, 3, Architecture::X86(64)),
+            (64, 183, 2, Architecture::Arm64),
+        ] {
+            let data = elf_fixture(bits, machine, file_type, true);
+            let metadata = Metadata::parse(&data).unwrap();
+            assert_eq!(metadata.format_label(), Some("ELF"));
+            assert!(!metadata.has_rva());
+            assert!(metadata.has_va());
+            assert_eq!(metadata.entry_offset(), Ok(0x110));
+            assert_eq!(entry_point(&data), Ok(0x110));
+            assert_eq!(virtual_to_file(&data, 0x400020), Ok(0x120));
+            assert_eq!(
+                metadata.code_location(0x110),
+                Ok(CodeLocation {
+                    address: 0x400010,
+                    bits,
+                    architecture,
+                    domain: AddressDomain::Va,
+                })
+            );
+            assert_eq!(
+                metadata.target_offset(AddressDomain::Va, 0x400020),
+                Ok(0x120)
+            );
+            assert_eq!(metadata.navigation_address(&data, 0x110), Ok(0x400010));
+            assert_eq!(metadata.navigation_offset(&data, 0x400020), Ok(0x120));
+            assert_eq!(
+                metadata.convert_address(&data, AddressKind::File, 0x120),
+                Ok(PeAddress {
+                    file_offset: Some(0x120),
+                    rva: None,
+                    va: Some(0x400020),
+                })
+            );
+            assert_eq!(
+                metadata.convert_address(&data, AddressKind::Va, 0x400110),
+                Ok(PeAddress {
+                    file_offset: None,
+                    rva: None,
+                    va: Some(0x400110),
+                })
+            );
+            assert_eq!(
+                metadata.convert_address(&data, AddressKind::Rva, 0),
+                Err("ELF files have no RVA.".into())
+            );
+            assert_eq!(
+                metadata.code_location(0x450),
+                Ok(CodeLocation {
+                    address: 0x450,
+                    bits,
+                    architecture,
+                    domain: AddressDomain::File,
+                })
+            );
+        }
+
+        let data = elf_fixture(32, 3, 1, true);
+        let metadata = Metadata::parse(&data).unwrap();
+        assert!(!metadata.has_va());
+        assert!(metadata.entry_offset().is_err());
+        assert_eq!(metadata.code_address(0x110), Ok((0x110, 32)));
+        assert_eq!(metadata.navigation_address(&data, 0x110), Ok(0x110));
+        assert_eq!(metadata.navigation_offset(&data, 0x120), Ok(0x120));
+        assert_eq!(
+            metadata.code_location(0x110).unwrap().domain,
+            AddressDomain::File
+        );
+        assert!(metadata.convert_address(&data, AddressKind::Va, 0).is_err());
+    }
+
+    /*
+    This test selects ARM or Thumb only from the supported ARM entry-state rules.
+    Missing and reserved states keep metadata inspectable only when no invalid entry mapping is requested.
+    */
+    #[test]
+    fn elf_arm_entry_state_selects_arm_or_thumb() {
+        let arm = elf_fixture(32, EM_ARM, 2, true);
+        let metadata = Metadata::parse(&arm).unwrap();
+        assert_eq!(metadata.entry_offset(), Ok(0x110));
+        assert_eq!(metadata.decoder_architecture(64), Ok(Architecture::Arm));
+
+        let mut thumb = arm.clone();
+        put(&mut thumb, 24, 0x400011);
+        let metadata = Metadata::parse(&thumb).unwrap();
+        assert_eq!(metadata.entry_offset(), Ok(0x110));
+        assert_eq!(metadata.decoder_architecture(64), Ok(Architecture::Thumb));
+
+        put(&mut thumb, 24, 0x400013);
+        let metadata = Metadata::parse(&thumb).unwrap();
+        assert_eq!(metadata.entry_offset(), Ok(0x112));
+        assert_eq!(metadata.decoder_architecture(32), Ok(Architecture::Thumb));
+
+        let mut reserved = arm;
+        put(&mut reserved, 24, 0x400012);
+        assert_eq!(
+            Metadata::parse(&reserved).err().unwrap(),
+            "The ELF ARM entry point has a reserved state value."
+        );
+
+        for mut missing in [
+            elf_fixture(32, EM_ARM, 1, true),
+            elf_fixture(32, EM_ARM, 2, true),
+        ] {
+            if word(&missing, 16).unwrap() != 1 {
+                put(&mut missing, 24, 0);
+            }
+            let metadata = Metadata::parse(&missing).unwrap();
+            assert!(metadata.decoder_architecture(32).is_err());
+        }
+    }
+
+    /*
+    This test validates ELF structure rows, optional sections, and canonical extended-count rules.
+    The core parser accepts an invalid name offset until the separate structure browser checks it.
+    */
+    #[test]
+    fn elf_structure_browser_validates_sections_and_extended_counts() {
+        for bits in [32, 64] {
+            let data = elf_fixture(bits, if bits == 32 { 3 } else { 62 }, 2, true);
+            assert_eq!(structure_title(&data), "ELF structures");
+            let rows = structures(&data, 100).unwrap();
+            assert!(rows.iter().any(|(_, text)| text.contains("ELF")));
+            assert!(rows.iter().any(|(_, text)| text.contains("PT_LOAD")));
+            assert!(rows.iter().any(|(_, text)| text.contains(".text")));
+            let bss = rows.iter().find(|(_, text)| text.contains(".bss")).unwrap();
+            let section_size = if bits == 32 {
+                ELF32_SECTION_SIZE
+            } else {
+                ELF64_SECTION_SIZE
+            };
+            assert_eq!(bss.0, 0x300 + 2 * section_size);
+            assert!(bss.1.contains("File=-"));
+
+            let mut bad_name = data.clone();
+            put(&mut bad_name, 0x300 + section_size, 0xffff);
+            assert!(Metadata::parse(&bad_name).is_ok());
+            assert!(structures(&bad_name, 100).is_err());
+
+            let stripped = elf_fixture(bits, if bits == 32 { 3 } else { 62 }, 2, false);
+            let rows = structures(&stripped, 100).unwrap();
+            assert!(rows.iter().any(|(_, text)| text.contains("PT_LOAD")));
+            assert!(!rows.iter().any(|(_, text)| text.contains("Section[")));
+
+            let mut no_load = stripped;
+            let program = if bits == 32 {
+                ELF32_HEADER_SIZE
+            } else {
+                ELF64_HEADER_SIZE
+            };
+            put(&mut no_load, program, 0);
+            no_load[program + 4..program + if bits == 32 { 32 } else { 56 }].fill(0xff);
+            let rows = structures(&no_load, 100).unwrap();
+            let null = rows
+                .iter()
+                .find(|(_, text)| text.contains("PT_NULL"))
+                .unwrap();
+            assert_eq!(null.0, program);
+            assert!(null.1.contains("File=-"));
+        }
+
+        let base = elf_fixture(64, 62, 2, true);
+        let mut program_header = ElfHeader::parse(&base, base.len() as u64).unwrap();
+        program_header.program_count = 0xffff;
+        let mut program_zero = vec![0; ELF64_SECTION_SIZE];
+        put(&mut program_zero, 44, 0xffff);
+        program_header.resolve_counts(Some(&program_zero)).unwrap();
+        assert_eq!(program_header.program_count, 0xffff);
+        put(&mut program_zero, 44, 1);
+        let mut low_program = ElfHeader::parse(&base, base.len() as u64).unwrap();
+        low_program.program_count = 0xffff;
+        assert!(low_program.resolve_counts(Some(&program_zero)).is_err());
+
+        let mut section_header = ElfHeader::parse(&base, base.len() as u64).unwrap();
+        section_header.section_count = 0;
+        section_header.section_names = 0xffff;
+        let mut section_zero = vec![0; ELF64_SECTION_SIZE];
+        put_qword(&mut section_zero, 32, 0xff01);
+        put(&mut section_zero, 40, 0xff00);
+        section_header.resolve_counts(Some(&section_zero)).unwrap();
+        assert_eq!(section_header.section_count, 0xff01);
+        assert_eq!(section_header.section_names, 0xff00);
+        put_qword(&mut section_zero, 32, 4);
+        put(&mut section_zero, 40, 3);
+        let mut low_sections = ElfHeader::parse(&base, base.len() as u64).unwrap();
+        low_sections.section_count = 0;
+        low_sections.section_names = 0xffff;
+        assert!(low_sections.resolve_counts(Some(&section_zero)).is_err());
+    }
+
+    /*
+    This test rejects malformed ELF headers, load ranges, limits, and mapping aliases.
+    An unknown machine remains inspectable and returns a Code capability error.
+    */
+    #[test]
+    fn elf_rejects_invalid_headers_loads_and_ambiguous_aliases() {
+        let valid = elf_fixture(64, 62, 2, false);
+        let mut cases = Vec::new();
+        let mut big_endian = valid.clone();
+        big_endian[5] = 2;
+        cases.push(big_endian);
+        let mut bad_version = valid.clone();
+        bad_version[6] = 0;
+        cases.push(bad_version);
+        let mut bad_type = valid.clone();
+        put_word(&mut bad_type, 16, 4);
+        cases.push(bad_type);
+        let mut mismatch = valid.clone();
+        put_word(&mut mismatch, 18, 3);
+        cases.push(mismatch);
+        let mut bad_class = valid.clone();
+        bad_class[4] = 3;
+        cases.push(bad_class);
+        let mut bad_header_size = valid.clone();
+        put_word(&mut bad_header_size, 52, 63);
+        cases.push(bad_header_size);
+        let mut bad_program_size = valid.clone();
+        put_word(&mut bad_program_size, 54, 55);
+        cases.push(bad_program_size);
+        for data in cases {
+            assert!(Metadata::parse(&data).is_err());
+        }
+
+        let program = ELF64_HEADER_SIZE;
+        let mut too_large = valid.clone();
+        put_qword(&mut too_large, program + 32, 0x181);
+        assert!(Metadata::parse(&too_large).is_err());
+        let mut bad_align = valid.clone();
+        put_qword(&mut bad_align, program + 48, 3);
+        assert!(Metadata::parse(&bad_align).is_err());
+        let mut outside = valid.clone();
+        put_qword(&mut outside, program + 8, 0x480);
+        put_qword(&mut outside, program + 32, 0x100);
+        assert!(Metadata::parse(&outside).is_err());
+        let mut overflow = valid.clone();
+        put_qword(&mut overflow, program + 16, u64::MAX - 0x7f);
+        put_qword(&mut overflow, program + 48, 1);
+        assert!(Metadata::parse(&overflow).is_err());
+        let mut elf32_overflow = elf_fixture(32, 3, 2, false);
+        put(&mut elf32_overflow, ELF32_HEADER_SIZE + 8, 0xffff_ff80);
+        put(&mut elf32_overflow, ELF32_HEADER_SIZE + 28, 1);
+        assert!(Metadata::parse(&elf32_overflow).is_err());
+
+        let mut table_limit = valid.clone();
+        put_word(&mut table_limit, 54, u16::MAX);
+        put_word(&mut table_limit, 56, 200);
+        assert!(
+            Metadata::parse(&table_limit)
+                .err()
+                .unwrap()
+                .contains("8 MiB")
+        );
+
+        let mut same = valid.clone();
+        put_word(&mut same, 56, 2);
+        let second = program + ELF64_PROGRAM_SIZE;
+        put(&mut same, second, 1);
+        put(&mut same, second + 4, 5);
+        put_qword(&mut same, second + 8, 0x180);
+        put_qword(&mut same, second + 16, 0x400080);
+        put_qword(&mut same, second + 32, 0x80);
+        put_qword(&mut same, second + 40, 0x80);
+        put_qword(&mut same, second + 48, 0x100);
+        assert!(Metadata::parse(&same).is_ok());
+
+        let mut file_alias = same.clone();
+        put_qword(&mut file_alias, second + 16, 0x500080);
+        assert!(Metadata::parse(&file_alias).is_err());
+        let mut virtual_alias = same;
+        put_qword(&mut virtual_alias, second + 8, 0x280);
+        assert!(Metadata::parse(&virtual_alias).is_err());
+
+        let mut zero_fill_alias = valid.clone();
+        put_word(&mut zero_fill_alias, 56, 2);
+        put(&mut zero_fill_alias, second, 1);
+        put(&mut zero_fill_alias, second + 4, 5);
+        put_qword(&mut zero_fill_alias, second + 8, 0x280);
+        put_qword(&mut zero_fill_alias, second + 16, 0x400100);
+        put_qword(&mut zero_fill_alias, second + 32, 0x40);
+        put_qword(&mut zero_fill_alias, second + 40, 0x40);
+        put_qword(&mut zero_fill_alias, second + 48, 1);
+        assert!(Metadata::parse(&zero_fill_alias).is_err());
+
+        let mut unknown = valid;
+        put_word(&mut unknown, 18, 0x7777);
+        let metadata = Metadata::parse(&unknown).unwrap();
+        assert_eq!(metadata.format_label(), Some("ELF"));
+        assert_eq!(
+            metadata.decoder_architecture(32),
+            Err("The ELF processor is unsupported for code decoding.".into())
+        );
+    }
+
+    /*
+    This test proves that high virtual aliases and zero-fill deltas avoid eager overflow arithmetic.
+    Equivalent mappings remain valid, and a large zero-fill address returns no file byte.
+    */
+    #[test]
+    fn elf_high_aliases_and_zero_fill_use_checked_arithmetic() {
+        let header = ElfHeader {
+            bits: 64,
+            file_type: 2,
+            machine: 62,
+            entry: 0,
+            program_offset: 0,
+            section_offset: 0,
+            program_size: 0,
+            program_count: 0,
+            section_size: 0,
+            section_count: 0,
+            section_names: 0,
+        };
+        let left = ElfSegment {
+            header: 0,
+            segment_type: 1,
+            flags: 5,
+            offset: 0x100,
+            address: u64::MAX - 0x1ff,
+            file_size: 0x100,
+            memory_size: 0x100,
+            align: 1,
+        };
+        let right = ElfSegment {
+            header: 0,
+            segment_type: 1,
+            flags: 5,
+            offset: 0x180,
+            address: u64::MAX - 0x17f,
+            file_size: 0x80,
+            memory_size: 0x80,
+            align: 1,
+        };
+        let aliases = Elf::from_parts(header, vec![left, right], 0x300).unwrap();
+        assert_eq!(aliases.file_to_virtual(0x180), Ok(Some(u64::MAX - 0x17f)));
+
+        let zero = ElfSegment {
+            header: 0,
+            segment_type: 1,
+            flags: 6,
+            offset: u64::MAX,
+            address: 0,
+            file_size: 0,
+            memory_size: u64::MAX,
+            align: 1,
+        };
+        let zero_alias = ElfSegment {
+            offset: u64::MAX - 1,
+            ..zero
+        };
+        let zero_fill = Elf::from_parts(header, vec![zero, zero_alias], u64::MAX).unwrap();
+        assert_eq!(zero_fill.virtual_mapping(u64::MAX - 1), Ok(Some(None)));
+        assert_eq!(zero_fill.virtual_to_file(u64::MAX - 1), Ok(None));
+    }
+
+    /*
+    This test compares buffered and paged ELF metadata and preserves sparse offsets above 4 GiB.
+    The paged parser reads only the fixed header and declared table windows.
+    */
+    #[test]
+    fn paged_elf_matches_buffered_and_maps_sparse_high_offsets() {
+        let ordinary_path = temp_path("elf-ordinary");
+        let ordinary = elf_fixture(64, 62, 3, true);
+        std::fs::write(&ordinary_path, &ordinary).unwrap();
+        let buffered = Metadata::parse(&ordinary).unwrap();
+        let ordinary_file = PagedFile::open(&ordinary_path).unwrap();
+        let paged = Metadata::read_from(&ordinary_file).unwrap();
+        assert_eq!(buffered.entry_offset(), paged.entry_offset());
+        assert_eq!(buffered.code_location(0x110), paged.code_location(0x110));
+        assert_eq!(buffered.code_location(0x450), paged.code_location(0x450));
+        assert_eq!(
+            buffered.target_offset(AddressDomain::Va, 0x400020),
+            paged.target_offset(AddressDomain::Va, 0x400020)
+        );
+        drop(ordinary_file);
+        std::fs::remove_file(&ordinary_path).unwrap();
+
+        let path = temp_path("elf-sparse-high");
+        let mut data = elf_fixture(64, 62, 2, false);
+        let high = 4 * 1024 * 1024 * 1024u64 + 0x100;
+        put_qword(&mut data, 24, 0x1_4000_0010);
+        put_qword(&mut data, ELF64_HEADER_SIZE + 8, high);
+        put_qword(&mut data, ELF64_HEADER_SIZE + 16, 0x1_4000_0000);
+        let source = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        source
+            .write_all_at(&data[..ELF64_HEADER_SIZE + ELF64_PROGRAM_SIZE], 0)
+            .unwrap();
+        source.set_len(high + 0x100).unwrap();
+        source
+            .write_all_at(&[0xe8, 0x0b, 0, 0, 0], high + 0x10)
+            .unwrap();
+        source.sync_all().unwrap();
+        drop(source);
+
+        let file = PagedFile::open(&path).unwrap();
+        let metadata = Metadata::read_from(&file).unwrap();
+        assert_eq!(metadata.entry_offset(), Ok(high + 0x10));
+        assert_eq!(
+            metadata.legacy_virtual_offset(0x1_4000_0020),
+            Ok(high + 0x20)
+        );
+        assert_eq!(
+            metadata.code_location(high + 0x10).unwrap().address,
+            0x1_4000_0010
+        );
+        assert_eq!(
+            metadata.code_location(high + 0x100 - 1).unwrap().domain,
+            AddressDomain::Va
+        );
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /*
+    This test checks ELF entry availability, table limits, table overlap, and exact 32-bit ends.
+    Executable sections must keep their declared file bytes inside the current source.
+    */
+    #[test]
+    fn elf_entries_tables_counts_and_boundaries_are_checked() {
+        /*
+        The first section keeps missing or non-file-backed entries unavailable without losing metadata.
+        A missing section header zero cannot supply an extended program count.
+        */
+        let valid = elf_fixture(64, 62, 2, false);
+        for entry in [0, 0x400100, 0x900000] {
+            let mut data = valid.clone();
+            put_qword(&mut data, 24, entry);
+            let metadata = Metadata::parse(&data).unwrap();
+            assert!(metadata.entry_offset().is_err());
+            assert!(metadata.code_location(0x110).is_ok());
+        }
+        let mut missing_section_zero = valid.clone();
+        put_word(&mut missing_section_zero, 56, 0xffff);
+        assert!(Metadata::parse(&missing_section_zero).is_err());
+
+        /*
+        The count section accepts each exact entry limit and rejects the next count before allocation.
+        Direct header checks avoid construction of large synthetic tables.
+        */
+        let mut programs = ElfHeader::parse(&valid, valid.len() as u64).unwrap();
+        programs.program_count = ELF_MAX_ENTRIES;
+        programs.resolve_counts(None).unwrap();
+        programs.program_count += 1;
+        assert!(programs.resolve_counts(None).is_err());
+
+        let mut sections = ElfHeader::parse(&valid, valid.len() as u64).unwrap();
+        sections.section_offset = 0x100;
+        sections.section_size = ELF64_SECTION_SIZE;
+        sections.section_count = ELF_MAX_ENTRIES;
+        sections.resolve_counts(None).unwrap();
+        sections.section_count += 1;
+        assert!(sections.resolve_counts(None).is_err());
+
+        /*
+        The table section rejects overlapping tables and incomplete declared bytes.
+        The executable-section check rejects a current executable range outside the file.
+        */
+        let mut overlap = elf_fixture(64, 62, 2, true);
+        put_qword(&mut overlap, 40, ELF64_HEADER_SIZE as u64);
+        assert!(Metadata::parse(&overlap).is_err());
+        assert!(Metadata::parse(&valid[..ELF64_HEADER_SIZE + 20]).is_err());
+
+        let mut executable_outside = elf_fixture(64, 62, 2, true);
+        let text = 0x300 + ELF64_SECTION_SIZE;
+        put_qword(&mut executable_outside, text + 8, 6);
+        put_qword(&mut executable_outside, text + 24, 0x4f0);
+        put_qword(&mut executable_outside, text + 32, 0x20);
+        assert!(Metadata::parse(&executable_outside).is_err());
+
+        /*
+        The final section permits an ELF32 file and virtual range that ends at 2^32.
+        One additional virtual byte exceeds the supported class range.
+        */
+        let exact = ElfSegment {
+            header: 0,
+            segment_type: 1,
+            flags: 5,
+            offset: 0xffff_fff0,
+            address: 0xffff_fff0,
+            file_size: 0x10,
+            memory_size: 0x10,
+            align: 1,
+        };
+        exact.validate(32, 0x1_0000_0000).unwrap();
+        assert!(
+            ElfSegment {
+                file_size: 0,
+                memory_size: 0x11,
+                ..exact
+            }
+            .validate(32, 0x1_0000_0000)
+            .is_err()
+        );
+    }
+
+    /*
+    This test checks browser-only section geometry and section-name rules.
+    Core metadata stays separate from the stricter buffered structure browser.
+    */
+    #[test]
+    fn elf_structure_browser_rejects_malformed_section_details() {
+        let valid = elf_fixture(64, 62, 2, true);
+        let text = 0x300 + ELF64_SECTION_SIZE;
+        let bss = text + ELF64_SECTION_SIZE;
+        let names = bss + ELF64_SECTION_SIZE;
+
+        /*
+        The geometry section rejects invalid alignment, entry-size division, and raw overlap.
+        NOBITS data does not create a raw overlap until its type changes.
+        */
+        let mut bad_align = valid.clone();
+        put_qword(&mut bad_align, text + 48, 3);
+        assert!(structures(&bad_align, 100).is_err());
+        let mut bad_entry_size = valid.clone();
+        put_qword(&mut bad_entry_size, text + 56, 3);
+        assert!(structures(&bad_entry_size, 100).is_err());
+        let mut overlap = valid.clone();
+        put(&mut overlap, bss + 4, 1);
+        put_qword(&mut overlap, bss + 24, 0x180);
+        assert!(structures(&overlap, 100).is_err());
+
+        /*
+        The name section requires a string-table section with bounded null-terminated names.
+        Each failure remains a browser error after core metadata succeeds.
+        */
+        let mut wrong_name_type = valid.clone();
+        put(&mut wrong_name_type, names + 4, 1);
+        assert!(Metadata::parse(&wrong_name_type).is_ok());
+        assert!(structures(&wrong_name_type, 100).is_err());
+        let mut bad_name_start = valid.clone();
+        bad_name_start[0x280] = b'X';
+        assert!(structures(&bad_name_start, 100).is_err());
+        let mut bad_name_end = valid;
+        bad_name_end[0x280 + 21] = b'X';
+        assert!(structures(&bad_name_end, 100).is_err());
+    }
+
+    /*
+    This test reparses current ELF paged edits and preserves the owner through metadata errors.
+    Undo and Redo restore the matching machine, source length, and metadata result.
+    */
+    #[test]
+    fn paged_elf_reparses_edits_and_preserves_source_errors() {
+        let path = temp_path("elf-edits");
+        std::fs::write(&path, elf_fixture(64, 62, 2, true)).unwrap();
+        let mut source = PagedFile::open(&path).unwrap();
+        source.begin_edit().unwrap();
+        let cursor = crate::paged::PagedEditCursor {
+            offset: 18,
+            top: 0,
+            low_nibble: false,
+        };
+        source
+            .replace_bytes(18, &183_u16.to_le_bytes(), cursor, cursor, false)
+            .unwrap();
+        assert_eq!(
+            Metadata::read_from(&source)
+                .unwrap()
+                .decoder_architecture(16),
+            Ok(Architecture::Arm64)
+        );
+        source.undo().unwrap();
+        assert_eq!(
+            Metadata::read_from(&source)
+                .unwrap()
+                .decoder_architecture(64),
+            Ok(Architecture::X86(64))
+        );
+        source.redo().unwrap();
+        assert_eq!(
+            Metadata::read_from(&source)
+                .unwrap()
+                .decoder_architecture(16),
+            Ok(Architecture::Arm64)
+        );
+
+        /*
+        The truncation section creates a short program and section table through logical spans.
+        Metadata failure keeps the edit owner, and Undo restores a fresh successful parse.
+        */
+        let before = crate::paged::PagedEditCursor {
+            offset: 100,
+            top: 0,
+            low_nibble: false,
+        };
+        source
+            .splice_bytes(100, source.len() - 100, &[], before, before, false)
+            .unwrap();
+        assert!(Metadata::read_from(&source).is_err());
+        assert_eq!(source.len(), 100);
+        source.undo().unwrap();
+        assert!(Metadata::read_from(&source).is_ok());
+        drop(source);
+        std::fs::remove_file(&path).unwrap();
+
+        /*
+        The replacement section proves that the ELF path preserves the PagedFile validation error.
+        The bounded reader must not replace the source error with an ELF truncation message.
+        */
+        let old = path.with_extension("old");
+        std::fs::write(&path, elf_fixture(64, 62, 2, false)).unwrap();
+        let source = PagedFile::open(&path).unwrap();
+        std::fs::rename(&path, &old).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(
+            Metadata::read_from(&source).err().unwrap(),
+            "The source path is not a regular file. Reopen the source."
+        );
+        drop(source);
+        std::fs::remove_dir(path).unwrap();
+        std::fs::remove_file(old).unwrap();
+    }
+
+    /*
+    This test reads maximum-size ELF table strides from sparse offsets above 4 GiB.
+    Each paged batch stays within 64 KiB, and exact high mappings survive both table scans.
+    */
+    #[test]
+    fn paged_elf_reads_distant_tables_with_bounded_maximum_strides() {
+        let path = temp_path("elf-distant-tables");
+        let program_offset = 0x1_0000_1000_u64;
+        let stride = u64::from(u16::MAX);
+        let section_offset = program_offset + 2 * stride + 0x1000;
+        let data_offset = section_offset + 2 * stride + 0x1000;
+        let address = 0x2_4000_0000_u64;
+        let mut header = elf_fixture(64, 62, 2, false);
+        put_qword(&mut header, 24, address + 0x10);
+        put_qword(&mut header, 32, program_offset);
+        put_qword(&mut header, 40, section_offset);
+        put_word(&mut header, 54, u16::MAX);
+        put_word(&mut header, 56, 2);
+        put_word(&mut header, 58, u16::MAX);
+        put_word(&mut header, 60, 2);
+        put_word(&mut header, 62, 0);
+
+        /*
+        The program section writes one load entry and leaves one sparse PT_NULL entry.
+        The section table keeps section zero sparse and places one executable section in entry one.
+        */
+        let mut program = vec![0_u8; ELF64_PROGRAM_SIZE];
+        put(&mut program, 0, 1);
+        put(&mut program, 4, 5);
+        put_qword(&mut program, 8, data_offset);
+        put_qword(&mut program, 16, address);
+        put_qword(&mut program, 32, 0x20);
+        put_qword(&mut program, 40, 0x20);
+        put_qword(&mut program, 48, 1);
+        let mut section = vec![0_u8; ELF64_SECTION_SIZE];
+        put(&mut section, 4, 1);
+        put_qword(&mut section, 8, 4);
+        put_qword(&mut section, 16, address);
+        put_qword(&mut section, 24, data_offset);
+        put_qword(&mut section, 32, 0x20);
+        put_qword(&mut section, 48, 1);
+
+        /*
+        The final section creates the sparse source and checks exact high entry and address conversion.
+        No read allocates the holes before either table or data range.
+        */
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(data_offset + 0x20).unwrap();
+        file.write_all_at(&header[..ELF64_HEADER_SIZE], 0).unwrap();
+        file.write_all_at(&program, program_offset).unwrap();
+        file.write_all_at(&section, section_offset + stride)
+            .unwrap();
+        file.write_all_at(&[0x90], data_offset + 0x10).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let source = PagedFile::open(&path).unwrap();
+        let metadata = Metadata::read_from(&source).unwrap();
+        assert_eq!(metadata.entry_offset(), Ok(data_offset + 0x10));
+        assert_eq!(
+            metadata.code_location(data_offset + 0x10).unwrap().address,
+            address + 0x10
+        );
+        assert_eq!(
+            metadata.target_offset(AddressDomain::Va, address + 0x1f),
+            Ok(data_offset + 0x1f)
+        );
+        drop(source);
+        std::fs::remove_file(path).unwrap();
     }
 }

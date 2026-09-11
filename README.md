@@ -4,7 +4,7 @@ HView-Linux is a terminal hex editor and binary analysis tool for Linux x86-64.
 
 The application provides Text and Hex views. Code supports x86, ARM, Thumb, and ARM64 instructions.
 
-The application also provides safe editing, sessions, macros, and PE analysis tools.
+The application also provides safe editing, sessions, macros, and executable analysis tools.
 
 ## Requirements
 
@@ -81,13 +81,15 @@ The application also accepts the verified legacy `/O`, `/SAV`, `/INI`, `/MACRO0`
 
 For PE files, `--virtual` accepts an RVA or preferred ImageBase VA. Different valid RVA and VA results cause an error.
 
-Large PE files use bounded metadata reads for `--virtual` and `--entry-point`. These reads do not load the complete file.
+For mapped ELF files, `--virtual` accepts a link-time VA. ELF relocatable files have no virtual-address mapping.
 
-For buffered ordinary files, `--virtual` uses the value as a file offset. Raw ELF files reject startup virtual-address mapping.
+Large PE and ELF files use bounded metadata reads for `--virtual` and `--entry-point`. These reads do not load the complete file.
 
-Large plain and raw ELF files show the existing format limit and use file offset zero.
+For buffered plain files, `--virtual` uses the value as a file offset.
 
-`--entry-point` also supports the retained DOS executable calculation.
+Large plain files show the existing format limit and use file offset zero.
+
+`--entry-point` supports mapped ELF entries and the retained DOS executable calculation.
 
 ## Main keys
 
@@ -155,7 +157,7 @@ Copy `hview-linux.ini.example` to an applicable `hview-linux.ini` path. Change o
 | `Wrap` | `Auto`, `On`, or `Off` controls Text wrapping. |
 | `Tab` | `Auto`, `On`, or `Off` controls Text tab expansion. |
 | `LineFeed` | `Auto`, `CRLF`, `CR`, or `LF` selects Text line separation. |
-| `AutoCodeSize` | `On` uses the detected PE width for automatic x86 Code. |
+| `AutoCodeSize` | `On` uses the detected executable width for automatic x86 Code. |
 | `DefaultCodeSize` | `16`, `32`, or `64` selects the other default code size. |
 | `DisassemblySyntax` | `Intel` or `ATT` selects the x86 Code display syntax. |
 | `InvalidCode` | `Error` stops at invalid input. `Byte` shows one x86 byte or one ARM-family unit. |
@@ -167,7 +169,7 @@ Copy `hview-linux.ini.example` to an applicable `hview-linux.ini` path. Change o
 | `SaveFileAtExit` | `On` or `Off` controls automatic session saving. |
 | `SaveFile` | A quoted path selects the automatic session file. |
 
-Automatic ARM-family PE selection does not depend on `AutoCodeSize`.
+Automatic ARM-family PE and ELF selection does not depend on `AutoCodeSize`.
 
 The native x86 default is Intel disassembly syntax. Select `DisassemblySyntax=ATT` only when you need x86 AT&T display syntax.
 
@@ -193,10 +195,10 @@ Press `Ctrl+T`, and then select one tool:
 
 | Key | Tool |
 | --- | --- |
-| `A` | The tool converts a checked PE file offset, RVA, or preferred ImageBase VA. |
+| `A` | The tool converts supported file and virtual addresses. PE also supports RVA. |
 | `R` | The tool selects an explicit raw address model or restores `AUTO`. |
 | `S` | The tool finds printable ASCII and ASCII encoded as UTF-16LE or UTF-16BE. |
-| `P` | The tool browses PE sections, directories, imports, exports, security data, and overlay data. |
+| `P` | The tool browses supported executable structures. |
 | `E` | The tool shows an entropy map in bits per byte. Press `Escape` to cancel its work. |
 | `D` | The tool compares the current buffer with another file at equal offsets. |
 | `I` | The tool shows signed and unsigned integers at the cursor. |
@@ -213,7 +215,19 @@ Automatic PE Code supports x86, x64, ARM, Thumb, and ARM64 machine and class pai
 
 Virtual-only section tails have no file bytes. The PE browser limits output to 10,000 rows.
 
-Code mode can decode raw x86, ARM, Thumb, and ARM64 bytes. Raw ELF files do not receive ELF headers, symbols, or virtual-address mapping.
+ELF parsing supports little-endian ELF32 and ELF64 ET_REL, ET_EXEC, and ET_DYN files.
+
+Mapped PT_LOAD bytes use declared link-time VAs. File gaps use file offsets, and zero-fill tails have no file bytes.
+
+Automatic ELF Code supports i386, x86-64, AArch64, and ARM. An ARM entry selects ARM or Thumb from its entry-state bits.
+
+ELF relocatable files use file offsets and have no automatic ARM state. Select an explicit ARM or Thumb raw model when necessary.
+
+The ELF browser shows headers, entries, program records, and section records. The browser does not inspect symbols or relocations.
+
+HView-Linux does not apply runtime rebasing to ELF addresses. The ELF browser limits output to 10,000 rows.
+
+Code mode can also decode raw x86, ARM, Thumb, and ARM64 bytes.
 
 ### Raw address model
 
@@ -225,7 +239,9 @@ Press `Ctrl+T`, and then press `R`. Enter one complete raw model:
 
 For example, `X86 64 LE 140000000` maps file offset zero to hexadecimal address `140000000`.
 
-The raw model overrides PE metadata for addresses, architecture, decoding, assembly, and branch navigation. The address tool converts file offsets and virtual addresses.
+The raw model overrides executable metadata for addresses, architecture, decoding, assembly, and branch navigation.
+
+The address tool converts file offsets and virtual addresses.
 
 The raw model rejects RVA conversion. The selected byte order controls integer inspection. All instruction engines use little-endian bytes.
 
@@ -353,13 +369,17 @@ Press `Esc` to discard those edits and restore source bytes.
 
 Large-file Text, Code display, format tools, structural edit controls, search, and analysis remain pending parity work.
 
-Large-file PE startup can select a checked entry point or virtual address through bounded metadata reads.
+Large-file PE and ELF startup can select a checked entry point or virtual address through bounded metadata reads.
 
 For buffered files, comparison also reads the other file into memory. Select file sizes that fit available memory with these copies.
 
 Text mode supports byte-oriented text. Text mode reports UTF-16 text and directs the user to Hex or Code mode.
 
-The structure browser and address conversion support PE files. HView-Linux does not provide ELF structure browsing or ELF address conversion.
+The structure browser and address conversion support PE and ELF files.
+
+ELF support is limited to little-endian ELF32 and ELF64 files without runtime rebasing.
+
+Large-file structure browsing and Code display remain pending work.
 
 ## Native components and licenses
 

@@ -144,11 +144,11 @@ fn apply_code_header(
             architecture.label()
         },
     );
-    if format_label == Some("PE") {
+    if let Some(format_label) = format_label {
         let (label_column, label) = if location.domain == format::AddressDomain::File {
             (width.saturating_sub(38), "FILE")
         } else {
-            (width.saturating_sub(31), "PE")
+            (width.saturating_sub(31), format_label)
         };
         put(header, label_column, label);
     }
@@ -3231,8 +3231,8 @@ mod tests {
     use super::*;
 
     /*
-    These writers build one small PE fixture for connected Code caller tests.
-    Each caller test changes only the machine, mapping, or instruction bytes that it needs.
+    These writers build small PE and ELF fixtures for connected Code caller tests.
+    Each test changes only the machine, mapping, or instruction bytes that it needs.
     */
     fn put_test_word(data: &mut [u8], offset: usize, value: u16) {
         data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
@@ -3240,6 +3240,10 @@ mod tests {
 
     fn put_test_dword(data: &mut [u8], offset: usize, value: u32) {
         data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_test_qword(data: &mut [u8], offset: usize, value: u64) {
+        data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
     }
 
     fn pe_code_fixture(plus: bool, machine: u16) -> Vec<u8> {
@@ -3268,6 +3272,67 @@ mod tests {
         put_test_dword(&mut data, section + 12, 0x1000);
         put_test_dword(&mut data, section + 16, 0x200);
         put_test_dword(&mut data, section + 20, 0x200);
+        data
+    }
+
+    /*
+    This fixture creates one mapped ELF image or one ELF relocatable source for Code caller tests.
+    Mapped images use exact file bytes from 0x100 through 0x1FF at VA 0x400000.
+    */
+    fn elf_code_fixture(bits: u32, machine: u16, file_type: u16, entry: u64) -> Vec<u8> {
+        let mut data = vec![0; 0x600];
+        data[..4].copy_from_slice(b"\x7fELF");
+        data[4] = if bits == 32 { 1 } else { 2 };
+        data[5] = 1;
+        data[6] = 1;
+        put_test_word(&mut data, 16, file_type);
+        put_test_word(&mut data, 18, machine);
+        put_test_dword(&mut data, 20, 1);
+        let header_size = if bits == 32 { 52 } else { 64 };
+        let program_size = if bits == 32 { 32 } else { 56 };
+        let mapped = file_type != 1;
+
+        /*
+        The header section selects class-specific entry and program-table fields.
+        Relocatable sources omit the program table and keep only File-domain Code locations.
+        */
+        if bits == 32 {
+            put_test_dword(&mut data, 24, entry as u32);
+            put_test_dword(&mut data, 28, if mapped { header_size as u32 } else { 0 });
+            put_test_word(&mut data, 40, header_size as u16);
+            put_test_word(&mut data, 42, if mapped { program_size as u16 } else { 0 });
+            put_test_word(&mut data, 44, u16::from(mapped));
+        } else {
+            put_test_qword(&mut data, 24, entry);
+            put_test_qword(&mut data, 32, if mapped { header_size as u64 } else { 0 });
+            put_test_word(&mut data, 52, header_size as u16);
+            put_test_word(&mut data, 54, if mapped { program_size as u16 } else { 0 });
+            put_test_word(&mut data, 56, u16::from(mapped));
+        }
+
+        /*
+        The mapped section writes one executable PT_LOAD with a 0x80-byte zero-fill tail.
+        Later tests place architecture instructions in the declared file-backed range or a file gap.
+        */
+        if mapped {
+            let at = header_size;
+            put_test_dword(&mut data, at, 1);
+            if bits == 32 {
+                put_test_dword(&mut data, at + 4, 0x100);
+                put_test_dword(&mut data, at + 8, 0x400000);
+                put_test_dword(&mut data, at + 16, 0x100);
+                put_test_dword(&mut data, at + 20, 0x180);
+                put_test_dword(&mut data, at + 24, 5);
+                put_test_dword(&mut data, at + 28, 0x100);
+            } else {
+                put_test_dword(&mut data, at + 4, 5);
+                put_test_qword(&mut data, at + 8, 0x100);
+                put_test_qword(&mut data, at + 16, 0x400000);
+                put_test_qword(&mut data, at + 32, 0x100);
+                put_test_qword(&mut data, at + 40, 0x180);
+                put_test_qword(&mut data, at + 48, 0x100);
+            }
+        }
         data
     }
 
@@ -3916,33 +3981,45 @@ mod tests {
     }
 
     /*
-    This test resolves direct targets from current raw and ELF bytes.
+    This test resolves direct targets from current plain and supported ELF bytes.
     Indirect, truncated, and invalid instructions must not produce a target.
     */
     #[test]
     fn direct_navigation_uses_current_raw_and_elf_bytes() {
         for syntax in [decoder::Syntax::Intel, decoder::Syntax::Att] {
-            for prefix in [&[][..], &b"\x7fELF"[..]] {
-                let start = prefix.len();
-                let mut data = prefix.to_vec();
-                data.extend_from_slice(&[0xe8, 5, 0, 0x90, 0x90, 0x90, 0x90, 0x90, 0xeb, 0xf6]);
-                let mut view = Editor::new(data, Mode::Code, start as u64);
-                view.code_bits = 16;
-                view.syntax = syntax;
-                let mut decoder = None;
-                let metadata = format::Metadata::parse(&view.data);
-                assert_eq!(
-                    direct_target_offset(&view, &metadata, &mut decoder),
-                    Ok((start + 8) as u64)
-                );
+            let mut data = vec![0xe8, 5, 0, 0, 0, 0x90, 0x90, 0x90, 0x90, 0xeb, 0xf6];
+            let mut view = Editor::new(data.clone(), Mode::Code, 0);
+            view.code_bits = 16;
+            view.syntax = syntax;
+            let mut decoder = None;
+            let metadata = format::Metadata::parse(&view.data);
+            assert_eq!(direct_target_offset(&view, &metadata, &mut decoder), Ok(8));
 
-                view.data[start + 1] = 2;
-                let metadata = format::Metadata::parse(&view.data);
-                assert_eq!(
-                    direct_target_offset(&view, &metadata, &mut decoder),
-                    Ok((start + 5) as u64)
-                );
-            }
+            data[1] = 2;
+            view.data = data;
+            let metadata = format::Metadata::parse(&view.data);
+            assert_eq!(direct_target_offset(&view, &metadata, &mut decoder), Ok(5));
+
+            /*
+            The ELF section checks mapped VA navigation and File-domain gap navigation.
+            Both targets retain the domain of their selected source instruction.
+            */
+            let mut elf = elf_code_fixture(32, 3, 2, 0x400010);
+            elf[0x110..0x115].copy_from_slice(&[0xe8, 3, 0, 0, 0]);
+            elf[0x250..0x255].copy_from_slice(&[0xe8, 3, 0, 0, 0]);
+            let mut view = Editor::new(elf, Mode::Code, 0x110);
+            view.code_bits = 32;
+            view.syntax = syntax;
+            let metadata = format::Metadata::parse(&view.data);
+            assert_eq!(
+                direct_target_offset(&view, &metadata, &mut decoder),
+                Ok(0x118)
+            );
+            view.offset = 0x250;
+            assert_eq!(
+                direct_target_offset(&view, &metadata, &mut decoder),
+                Ok(0x258)
+            );
         }
 
         let mut view = Editor::new(vec![0xff, 0xd0], Mode::Code, 0);
@@ -4119,6 +4196,71 @@ mod tests {
     }
 
     /*
+    This test ignores stored Real16 state for automatic ARM-family ELF decoders.
+    Manual x86 width and syntax settings remain effective for supported ELF x86 metadata.
+    */
+    #[test]
+    fn automatic_elf_decoders_preserve_architecture_and_x86_settings() {
+        /*
+        The ARM section selects ARM, Thumb, and ARM64 only from checked ELF header facts.
+        The x86 Real16 flag cannot enter any ARM-family native decoder.
+        */
+        for (bits, machine, entry, architecture, instruction) in [
+            (
+                32,
+                40,
+                0x400010,
+                format::Architecture::Arm,
+                &[0x00, 0x00, 0xa0, 0xe1][..],
+            ),
+            (
+                32,
+                40,
+                0x400011,
+                format::Architecture::Thumb,
+                &[0x01, 0x20][..],
+            ),
+            (
+                64,
+                183,
+                0x400010,
+                format::Architecture::Arm64,
+                &[0x1f, 0x20, 0x03, 0xd5][..],
+            ),
+        ] {
+            let mut data = elf_code_fixture(bits, machine, 2, entry);
+            data[0x110..0x110 + instruction.len()].copy_from_slice(instruction);
+            let mut view = Editor::new(data, Mode::Code, 0x110);
+            view.code_bits = 16;
+            view.real_mode = true;
+            let metadata = view.metadata();
+            let mut decoder = None;
+            decode_at(&view, 0x110, &metadata, &mut decoder).unwrap();
+            assert_eq!(decoder.as_ref().unwrap().architecture(), architecture);
+            assert!(!decoder.as_ref().unwrap().real_mode());
+            assert!(cycle_code_mode(&mut view).is_err());
+        }
+
+        /*
+        The x86 section keeps manual width, Real16, and explicit AT&T display configuration.
+        ELF class does not replace the current automatic x86 width setting.
+        */
+        let mut data = elf_code_fixture(64, 62, 2, 0x400010);
+        data[0x110] = 0x90;
+        let mut view = Editor::new(data, Mode::Code, 0x110);
+        view.code_bits = 16;
+        view.real_mode = true;
+        view.syntax = decoder::Syntax::Att;
+        let metadata = view.metadata();
+        let mut decoder = None;
+        decode_at(&view, 0x110, &metadata, &mut decoder).unwrap();
+        let decoder = decoder.unwrap();
+        assert_eq!(decoder.architecture(), format::Architecture::X86(16));
+        assert!(decoder.real_mode());
+        assert_eq!(decoder.syntax(), decoder::Syntax::Att);
+    }
+
+    /*
     This test checks exact x86 and ARM64 PE gap header fields at the standard width.
     Architecture and FILE labels must not cover each other or the file offset.
     */
@@ -4140,6 +4282,41 @@ mod tests {
             apply_code_header(
                 &mut header,
                 0x250,
+                location,
+                architecture,
+                false,
+                metadata.format_label(),
+                false,
+            );
+            let header: String = header.into_iter().collect();
+            assert!(header.contains(expected), "{header}");
+        }
+    }
+
+    /*
+    This test places ELF and FILE labels in mapped and gap Code headers.
+    The architecture label and displayed address remain visible in both domains.
+    */
+    #[test]
+    fn elf_code_headers_show_mapped_and_file_domains() {
+        for (offset, expected) in [
+            (0x110, "a32    00ELF.00400010"),
+            (0x250, "a32   FILE 00000250│"),
+        ] {
+            let data = elf_code_fixture(32, 3, 2, 0x400010);
+            let metadata = format::Metadata::parse(&data).unwrap();
+            let location = metadata.code_location(offset).unwrap();
+            let architecture = metadata.decoder_architecture(32).unwrap();
+            let width = 80;
+            let mut header = vec![' '; width];
+            put(
+                &mut header,
+                width - 33,
+                &format!("{offset:08X}│HView-Linux 0.1.0"),
+            );
+            apply_code_header(
+                &mut header,
+                offset,
                 location,
                 architecture,
                 false,

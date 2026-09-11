@@ -180,14 +180,14 @@ pub fn help(console: &Console) -> io::Result<()> {
         "   A  Convert a file offset, RVA, or VA",
         "   R  Set AUTO or an x86, ARM, Thumb, or ARM64 raw model",
         "   S  Browse ASCII and UTF-16 ASCII strings",
-        "   P  Browse PE structures and jump to their bytes",
+        "   P  Browse executable structures and jump to their bytes",
         "   E  Browse the entropy map; Escape cancels its work",
         "   D  Compare the current buffer with another file",
         "   I  Inspect integers at the cursor",
         "   X  Apply a repeating XOR mask in edit mode",
         "   F  Fill a range with a repeating pattern in edit mode",
         " Tools use the current editor buffer, including unsaved edits.",
-        " AUTO uses PE metadata. A raw model uses its runtime base.",
+        " AUTO uses executable metadata. A raw model uses its runtime base.",
         " Range offsets and lengths use hexadecimal numbers.",
     ];
     loop {
@@ -334,20 +334,34 @@ fn set_raw_model(console: &Console, view: &mut Editor, base: &[String]) -> io::R
 }
 
 /*
-This tool converts one file, RVA, or virtual address through the current Editor model.
+This tool converts one supported address domain through the current Editor model.
 Mapped file bytes enter the common result browser and can move the active view.
 */
 fn convert_address(console: &Console, view: &mut Editor, base: &[String]) -> io::Result<()> {
-    let raw = view.raw_model.is_some();
-    let Some(input) = console.prompt(
-        base,
-        if raw {
-            "RAW address: F file or V VA (hex)"
-        } else {
-            "PE address: F file, R RVA, or V VA (hex)"
-        },
-    )?
-    else {
+    /*
+    The metadata section selects a format label and offers only valid input domains.
+    A parser error returns through the current modal without changing the Editor.
+    */
+    let metadata = match view.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            console.modal(base, &error)?;
+            return Ok(());
+        }
+    };
+    let label = metadata.format_label().unwrap_or("File");
+    let prompt = if label == "RAW" {
+        "RAW address: F file or V VA (hex)".into()
+    } else if metadata.has_rva() {
+        format!("{label} address: F file, R RVA, or V VA (hex)")
+    } else if metadata.has_va() {
+        format!("{label} address: F file or V VA (hex)")
+    } else if label == "ELF" {
+        "ELF relocatable address: F file (hex)".into()
+    } else {
+        format!("{label} address: F file (hex)")
+    };
+    let Some(input) = console.prompt(base, &prompt)? else {
         return Ok(());
     };
     let address = address_input(&input).and_then(|(kind, value)| view.convert_address(kind, value));
@@ -374,18 +388,23 @@ fn convert_address(console: &Console, view: &mut Editor, base: &[String]) -> io:
         .va
         .map(|value| format!("{value:016X}"))
         .unwrap_or_else(|| "-".into());
-    let text = format!("File={file} RVA={rva} VA={va}");
+    let text = if metadata.has_rva() || label == "RAW" {
+        format!("File={file} RVA={rva} VA={va}")
+    } else if metadata.has_va() {
+        format!("File={file} VA={va}")
+    } else {
+        format!("File={file}")
+    };
     match address.file_offset {
         Some(offset) if view.data.get(offset).is_some() => {
-            if let Some(offset) = browse(
-                console,
-                if raw {
-                    "RAW address | current buffer, runtime base"
-                } else {
-                    "PE address | current buffer, preferred ImageBase"
-                },
-                &[(offset, text)],
-            )? {
+            let title = match label {
+                "RAW" => "RAW address | current buffer, runtime base".into(),
+                "PE" => "PE address | current buffer, preferred ImageBase".into(),
+                "ELF" if metadata.has_va() => "ELF address | current buffer, link-time VA".into(),
+                "ELF" => "ELF relocatable address | current buffer, file only".into(),
+                _ => format!("{label} address | current buffer, file only"),
+            };
+            if let Some(offset) = browse(console, &title, &[(offset, text)])? {
                 jump(view, offset, console.height().saturating_sub(2));
             }
         }
@@ -499,7 +518,7 @@ pub fn tools(console: &Console, view: &mut Editor, base: &[String]) -> io::Resul
             " A  Address: convert a file offset, RVA, or VA",
             " R  Raw model: AUTO, X86 16|32|64 LE|BE HEXBASE, or ARM|THUMB|ARM64 LE|BE HEXBASE",
             " S  Strings: ASCII and UTF-16 ASCII, minimum 4 characters",
-            " P  PE structures: sections, directories, imports, exports, overlay",
+            " P  Executable structures",
             " E  Entropy map: cancellable bounded analysis",
             " D  Compare: browse changed ranges against another file",
             " I  Integers: signed and unsigned, little and big endian",
@@ -521,7 +540,7 @@ pub fn tools(console: &Console, view: &mut Editor, base: &[String]) -> io::Resul
 
     /*
     This dispatch runs one address, model, inspection, comparison, or range-edit action.
-    Strings, PE structures, and comparisons keep their 10,000-row limit.
+    Strings, executable structures, and comparisons keep their 10,000-row limit.
     Entropy and integer results keep their separate natural bounds.
     */
     let mut clear_return_history = false;
@@ -557,16 +576,20 @@ pub fn tools(console: &Console, view: &mut Editor, base: &[String]) -> io::Resul
             Some((title, items))
         }
         /*
-        The PE tool parses bounded format structures from the current buffer.
+        The executable tool parses bounded format structures from the current buffer.
         Parser errors become modal notices, and valid rows use the common display limit.
         */
         'P' => match format::structures(&view.data, 10001) {
             Ok(mut items) => {
+                let base_title = format::structure_title(&view.data);
                 let title = if items.len() > 10000 {
                     items.truncate(10000);
-                    "PE structures | truncated at 10000 results"
+                    match base_title {
+                        "ELF structures" => "ELF structures | truncated at 10000 results",
+                        _ => "PE structures | truncated at 10000 results",
+                    }
                 } else {
-                    "PE structures"
+                    base_title
                 };
                 Some((title, items))
             }
